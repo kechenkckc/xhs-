@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>有道答疑笔5-6月合作 - 达人筛选工作台</title>
+  <link rel="stylesheet" href="/screening-workbench.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">达人筛选工作台</p>
+        <h1>有道答疑笔5-6月合作</h1>
+      </div>
+      <a class="admin-link" href="/workbench/admin/api-settings">API 配置</a>
+    </section>
+
+    <section class="grid">
+      <article class="card">
+        <h2>飞书配置</h2>
+        <label>飞书链接<input id="feishu_url" placeholder="https://...feishu.cn/wiki/..." /></label>
+        <label>App ID<input id="app_id" placeholder="cli_xxx" /></label>
+        <label>App Secret<input id="app_secret" type="password" placeholder="保存后不回显" /></label>
+        <div class="actions">
+          <button id="save_feishu">保存配置</button>
+          <button id="test_feishu" class="secondary">测试连接</button>
+        </div>
+        <pre id="feishu_result">等待配置</pre>
+      </article>
+
+      <article class="card">
+        <h2>项目指标</h2>
+        <div class="metric"><span>总合格达人数</span><strong id="qualified">0</strong></div>
+        <div class="metric"><span>现有达人池</span><strong id="pool">0</strong></div>
+        <div class="metric"><span>目标合格达人数</span><strong>200</strong></div>
+      </article>
+
+      <article class="card wide">
+        <h2>恢复状态</h2>
+        <p>旧源码已按聊天记录重建为最小可运行版本：飞书配置、API 配置、项目概览接口已恢复。浏览器采集和完整达人池写入仍需继续补齐。</p>
+      </article>
+    </section>
+  </main>
+  <script src="/screening-workbench.js"></script>
+</body>
+</html>
