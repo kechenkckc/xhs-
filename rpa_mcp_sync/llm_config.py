@@ -58,7 +58,10 @@ def write_ai_config(payload: dict[str, Any], path: Path = AI_PROVIDER_PATH) -> d
 
 
 def test_ai_config(payload: dict[str, Any]) -> dict[str, Any]:
-    config = {**DEFAULT_CONFIG, **payload}
+    saved_config = _private_ai_config()
+    config = {**saved_config, **payload}
+    if not payload.get("api_key") and saved_config.get("api_key"):
+        config["api_key"] = saved_config["api_key"]
     api_key = config.get("api_key") or os.getenv(config.get("api_key_env") or "")
     if not api_key:
         return {"ok": False, "error": "未配置 API Key 或环境变量"}

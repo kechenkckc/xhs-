@@ -1,0 +1,1106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>达人筛选工作台</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --muted: #66758a;
+      --subtle: #eef4f8;
+      --line: #d8e3ee;
+      --panel: #ffffff;
+      --blue: #2f80ed;
+      --green: #18a77a;
+      --amber: #e99a20;
+      --red: #df5b57;
+      --navy: #102033;
+      --mint: #e2f7ee;
+      --paper: #f7fafc;
+      --shadow: 0 18px 42px rgba(31, 47, 70, 0.12);
+      --small-shadow: 0 8px 24px rgba(31, 47, 70, 0.08);
+      font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(180deg, #eef4f8 0, #f8fbfd 340px),
+        #f8fbfd;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      border: 0;
+      cursor: pointer;
+    }
+
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 248px minmax(0, 1fr);
+    }
+
+    .sidebar {
+      background: #101820;
+      color: #dce5ee;
+      padding: 24px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 26px;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 6px;
+    }
+
+    .brand-mark {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, #4e8cff, #7568ff);
+      font-weight: 800;
+      color: #fff;
+    }
+
+    .brand-title {
+      font-size: 16px;
+      font-weight: 800;
+      line-height: 1.2;
+    }
+
+    .brand-sub {
+      color: #3ed19a;
+      font-size: 12px;
+      margin-top: 3px;
+    }
+
+    .nav {
+      display: grid;
+      gap: 7px;
+    }
+
+    .nav-item {
+      height: 42px;
+      border-radius: 10px;
+      padding: 0 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: #aeb9c6;
+      font-size: 14px;
+      background: transparent;
+      text-align: left;
+    }
+
+    .nav-item.active {
+      color: #58a0ff;
+      background: rgba(47, 128, 237, 0.15);
+      box-shadow: inset 3px 0 0 #2f80ed;
+    }
+
+    .nav-icon {
+      width: 18px;
+      height: 18px;
+      border: 1.8px solid currentColor;
+      border-radius: 5px;
+      flex: 0 0 auto;
+    }
+
+    main {
+      min-width: 0;
+      padding: 28px 40px 56px;
+    }
+
+    .topbar {
+      height: 46px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 28px;
+    }
+
+    .crumb {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .search-input {
+      width: 300px;
+      height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0 14px;
+      color: var(--ink);
+      background: #fff;
+      outline: none;
+    }
+
+    .avatar {
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: #16b77e;
+      color: #fff;
+      font-weight: 800;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 420px;
+      gap: 24px;
+      align-items: stretch;
+      margin-bottom: 22px;
+    }
+
+    .hero-card {
+      padding: 30px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--small-shadow);
+    }
+
+    .eyebrow {
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 800;
+      margin-bottom: 10px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 34px;
+      letter-spacing: 0;
+      line-height: 1.16;
+    }
+
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .chip {
+      min-height: 28px;
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 4px 10px;
+      background: var(--subtle);
+      color: #415066;
+      font-size: 13px;
+      border: 1px solid #dbe7f1;
+    }
+
+    .chip.ok {
+      color: #087a5b;
+      background: var(--mint);
+      border-color: #bcebd7;
+    }
+
+    .status-board {
+      position: relative;
+      overflow: hidden;
+      border-radius: 18px;
+      border: 1px solid #bad2ea;
+      background:
+        linear-gradient(135deg, rgba(47, 128, 237, 0.18), rgba(24, 167, 122, 0.12)),
+        #ffffff;
+      box-shadow: var(--small-shadow);
+      padding: 24px;
+      min-height: 208px;
+    }
+
+    .hero-number {
+      font-size: 54px;
+      font-weight: 900;
+      color: var(--navy);
+      line-height: 1;
+    }
+
+    .hero-label {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .journey {
+      position: absolute;
+      inset: auto 24px 24px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .journey-row {
+      display: grid;
+      grid-template-columns: 88px 1fr 48px;
+      align-items: center;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .journey-track,
+    .progress-track {
+      overflow: hidden;
+      border-radius: 999px;
+      background: #dbe7f2;
+    }
+
+    .journey-track {
+      height: 8px;
+    }
+
+    .journey-fill,
+    .progress-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--green), var(--blue));
+      transition: width 0.2s ease;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 22px;
+    }
+
+    .summary-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 20px;
+      box-shadow: var(--small-shadow);
+    }
+
+    .summary-card strong {
+      display: block;
+      font-size: 26px;
+      margin-bottom: 6px;
+    }
+
+    .summary-card span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.65fr);
+      gap: 22px;
+      align-items: start;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      min-height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 18px 22px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfdff;
+    }
+
+    .panel-head h2 {
+      margin: 0;
+      font-size: 20px;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .tab {
+      height: 32px;
+      padding: 0 12px;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .tab.active {
+      color: #fff;
+      background: var(--blue);
+    }
+
+    .project-list {
+      padding: 20px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .project-card {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 220px;
+      gap: 20px;
+      padding: 22px;
+      border: 1px solid #cfe0ef;
+      border-radius: 16px;
+      background: linear-gradient(180deg, #fff, #f8fbfd);
+      cursor: pointer;
+      transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+    }
+
+    .project-card:hover {
+      transform: translateY(-2px);
+      border-color: #95bce8;
+      box-shadow: var(--small-shadow);
+    }
+
+    .project-card::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 5px;
+      border-radius: 16px 0 0 16px;
+      background: linear-gradient(180deg, var(--blue), var(--green));
+    }
+
+    .project-card h3 {
+      margin: 0 0 6px;
+      font-size: 22px;
+      line-height: 1.25;
+    }
+
+    .product {
+      color: var(--muted);
+      font-size: 14px;
+      margin-bottom: 14px;
+    }
+
+    .plain-brief {
+      margin: 0 0 18px;
+      color: #39485c;
+      font-size: 15px;
+      line-height: 1.8;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .card-side {
+      display: grid;
+      gap: 12px;
+    }
+
+    .status-pill {
+      justify-self: end;
+      height: 30px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 12px;
+      border-radius: 999px;
+      color: #1268ce;
+      background: #e5f1ff;
+      border: 1px solid #bdd8fb;
+      font-weight: 800;
+      font-size: 13px;
+    }
+
+    .metric-pair {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .metric {
+      border: 1px solid #dce8f3;
+      border-radius: 12px;
+      padding: 12px;
+      background: #fff;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 3px;
+    }
+
+    .metric strong {
+      font-size: 20px;
+    }
+
+    .next-action {
+      border: 1px solid #bee4d4;
+      background: #edf9f4;
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    .next-action span {
+      color: #17765a;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .next-action strong {
+      display: block;
+      margin-top: 4px;
+      font-size: 15px;
+    }
+
+    .progress-track {
+      height: 8px;
+      margin-top: 8px;
+    }
+
+    .primary-action,
+    .secondary-action {
+      height: 42px;
+      border-radius: 12px;
+      font-weight: 800;
+    }
+
+    .primary-action {
+      color: #fff;
+      background: linear-gradient(180deg, #3e8df6, #2f73df);
+      box-shadow: 0 10px 20px rgba(47, 128, 237, 0.22);
+    }
+
+    .secondary-action {
+      color: var(--ink);
+      background: #eef4f8;
+      border: 1px solid var(--line);
+    }
+
+    .side-body {
+      padding: 20px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .side-card {
+      padding: 18px;
+      border-radius: 16px;
+      border: 1px solid #cfe0ef;
+      background: #fff;
+    }
+
+    .side-card h3 {
+      margin: 0 0 12px;
+      font-size: 18px;
+    }
+
+    .checklist {
+      display: grid;
+      gap: 10px;
+    }
+
+    .check-item {
+      display: grid;
+      grid-template-columns: 22px 1fr;
+      gap: 10px;
+      align-items: start;
+      color: #34465d;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .check {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      color: #fff;
+      background: var(--green);
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .check.wait {
+      background: #d7e1eb;
+      color: #5c6d80;
+    }
+
+    .decision-box {
+      padding: 18px;
+      border-radius: 16px;
+      background: #102033;
+      color: #fff;
+    }
+
+    .decision-box h3 {
+      margin: 0 0 14px;
+      font-size: 18px;
+    }
+
+    .decision-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .decision-actions button {
+      height: 38px;
+      border-radius: 10px;
+      font-weight: 800;
+    }
+
+    .light-btn {
+      background: #fff;
+      color: #102033;
+    }
+
+    .dark-btn {
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+    }
+
+    .content-view {
+      display: none;
+    }
+
+    .content-view.active {
+      display: block;
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    .table th,
+    .table td {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+    }
+
+    .table th {
+      color: var(--muted);
+      background: #fbfdff;
+      font-size: 13px;
+    }
+
+    .score {
+      font-weight: 900;
+      color: var(--green);
+    }
+
+    .risk-low {
+      color: #087a5b;
+      background: var(--mint);
+      border: 1px solid #bcebd7;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 12px;
+    }
+
+    .timeline {
+      padding: 20px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .timeline-item {
+      display: grid;
+      grid-template-columns: 36px 1fr;
+      gap: 12px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+    }
+
+    .timeline-dot {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: var(--mint);
+      color: var(--green);
+      font-weight: 900;
+    }
+
+    .timeline-item h3 {
+      margin: 0 0 4px;
+      font-size: 16px;
+    }
+
+    .timeline-item span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .settings-grid {
+      padding: 20px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .field {
+      display: grid;
+      gap: 7px;
+    }
+
+    .field label {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .field input,
+    .field select {
+      height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0 12px;
+      outline: none;
+      background: #fff;
+    }
+
+    .toast {
+      position: fixed;
+      right: 28px;
+      bottom: 28px;
+      min-width: 220px;
+      padding: 13px 16px;
+      border-radius: 12px;
+      color: #fff;
+      background: #102033;
+      box-shadow: var(--shadow);
+      transform: translateY(16px);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.18s ease, transform 0.18s ease;
+      z-index: 20;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .drawer {
+      position: fixed;
+      inset: 0;
+      display: none;
+      z-index: 30;
+    }
+
+    .drawer.open {
+      display: block;
+    }
+
+    .drawer-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(16, 32, 51, 0.28);
+    }
+
+    .drawer-panel {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 520px;
+      height: 100%;
+      background: #fff;
+      box-shadow: -18px 0 40px rgba(16, 32, 51, 0.16);
+      padding: 26px;
+      overflow: auto;
+    }
+
+    .drawer-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 22px;
+    }
+
+    .drawer-head h2 {
+      margin: 0;
+      font-size: 24px;
+    }
+
+    .close-btn {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: var(--subtle);
+      color: var(--ink);
+      font-size: 20px;
+    }
+
+    .empty {
+      padding: 40px;
+      color: var(--muted);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">AF</div>
+        <div>
+          <div class="brand-title">AdFlow AI</div>
+          <div class="brand-sub">达人筛选</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-view="overview"><span class="nav-icon"></span>项目总览</button>
+        <button class="nav-item" data-view="progress"><span class="nav-icon"></span>筛选进度</button>
+        <button class="nav-item" data-view="creators"><span class="nav-icon"></span>达人清单</button>
+        <button class="nav-item" data-view="confirm"><span class="nav-icon"></span>需要确认</button>
+        <button class="nav-item" data-view="settings"><span class="nav-icon"></span>项目设置</button>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="topbar">
+        <div class="crumb" id="crumb">达人筛选 / 项目总览</div>
+        <div class="top-actions">
+          <input class="search-input" id="searchInput" placeholder="搜索项目、达人或任务" />
+          <div class="avatar">U</div>
+        </div>
+      </div>
+
+      <section class="hero">
+        <div class="hero-card">
+          <div class="eyebrow">有道答疑笔 5-6 月合作</div>
+          <h1>达人筛选执行工作台</h1>
+          <div class="hero-meta">
+            <span class="chip ok">进行中</span>
+            <span class="chip ok">已连接飞书</span>
+            <span class="chip">2026-05-07 至 2026-05-19</span>
+            <span class="chip">预算 60 万</span>
+          </div>
+        </div>
+        <div class="status-board">
+          <div class="hero-number">7 / 10</div>
+          <div class="hero-label">合格达人</div>
+          <div class="journey">
+            <div class="journey-row"><span>达人筛选</span><div class="journey-track"><div class="journey-fill" style="width:70%"></div></div><strong>70%</strong></div>
+            <div class="journey-row"><span>人工确认</span><div class="journey-track"><div class="journey-fill" style="width:42%"></div></div><strong>42%</strong></div>
+            <div class="journey-row"><span>飞书同步</span><div class="journey-track"><div class="journey-fill" style="width:18%"></div></div><strong>18%</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="summary-grid">
+        <button class="summary-card" data-view="overview"><strong>1</strong><span>进行中的项目</span></button>
+        <button class="summary-card" data-view="confirm"><strong>3</strong><span>需要确认</span></button>
+        <button class="summary-card" data-view="creators"><strong>7</strong><span>合格达人</span></button>
+        <button class="summary-card" data-view="progress"><strong>70%</strong><span>筛选进度</span></button>
+      </section>
+
+      <section class="workspace">
+        <div class="panel">
+          <div class="panel-head">
+            <h2 id="mainTitle">项目总览</h2>
+            <div class="tabs" id="tabs">
+              <button class="tab active" data-filter="全部">全部</button>
+              <button class="tab" data-filter="待我处理">待我处理</button>
+              <button class="tab" data-filter="已完成">已完成</button>
+            </div>
+          </div>
+
+          <div class="content-view active" id="view-overview">
+            <div class="project-list" id="projectList"></div>
+          </div>
+
+          <div class="content-view" id="view-progress">
+            <div class="timeline">
+              <div class="timeline-item"><div class="timeline-dot">✓</div><div><h3>立项</h3><span>已完成</span></div></div>
+              <div class="timeline-item"><div class="timeline-dot">✓</div><div><h3>绑定飞书</h3><span>已完成</span></div></div>
+              <div class="timeline-item"><div class="timeline-dot">✓</div><div><h3>量化标准</h3><span>已完成</span></div></div>
+              <div class="timeline-item"><div class="timeline-dot">4</div><div><h3>蒲公英初筛</h3><span>进行中</span></div></div>
+              <div class="timeline-item"><div class="timeline-dot">5</div><div><h3>人工确认</h3><span>3 位待确认</span></div></div>
+            </div>
+          </div>
+
+          <div class="content-view" id="view-creators">
+            <table class="table" id="creatorTable">
+              <thead><tr><th>达人</th><th>类型</th><th>粉丝</th><th>报价</th><th>评分</th><th>风险</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+
+          <div class="content-view" id="view-confirm">
+            <table class="table" id="confirmTable">
+              <thead><tr><th>达人</th><th>状态</th><th>评分</th><th>报价</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+
+          <div class="content-view" id="view-settings">
+            <div class="settings-grid">
+              <div class="field"><label>项目名称</label><input value="有道答疑笔 5-6 月合作" /></div>
+              <div class="field"><label>产品名称</label><input value="有道答疑笔 Pro" /></div>
+              <div class="field"><label>预算</label><input value="600000" /></div>
+              <div class="field"><label>目标达人</label><input value="10" /></div>
+              <div class="field"><label>达人池</label><select><option>共享池</option><option>独立池</option></select></div>
+              <div class="field"><label>状态</label><select><option>进行中</option><option>已完成</option><option>待启动</option></select></div>
+              <button class="primary-action" id="saveSettings">保存</button>
+              <button class="secondary-action" id="resetSettings">重置</button>
+            </div>
+          </div>
+        </div>
+
+        <aside class="panel">
+          <div class="panel-head">
+            <h2 id="sideTitle">待办</h2>
+          </div>
+          <div class="side-body" id="sideBody"></div>
+        </aside>
+      </section>
+    </main>
+  </div>
+
+  <div class="drawer" id="drawer">
+    <div class="drawer-backdrop" data-close="true"></div>
+    <div class="drawer-panel">
+      <div class="drawer-head">
+        <h2 id="drawerTitle">项目详情</h2>
+        <button class="close-btn" data-close="true">×</button>
+      </div>
+      <div id="drawerBody"></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast">已更新</div>
+
+  <script>
+    const project = {
+      name: '有道答疑笔 5-6 月合作',
+      product: '有道答疑笔 Pro',
+      brief: '教育/母婴类达人，小学 1-6 年级学生家长，30-40 岁宝妈粉丝占比较高。',
+      budget: '60万',
+      target: '10人',
+      status: '进行中',
+      period: '2026-05-07 至 2026-05-19',
+      progress: 70,
+    };
+
+    const creators = [
+      ['高中陪跑老爸', '教育垂类', '8.70万', '¥11,200', 97, '低'],
+      ['北京海淀安安妈', '母婴教育', '18.6万', '¥16,800', 95, '低'],
+      ['胡同里养娃的林老师', '教育垂类', '9.80万', '¥12,600', 95, '低'],
+      ['升学政策研究员Grace', '教育垂类', '20.5万', '¥17,800', 95, '低'],
+      ['陪娃刷题的陈博士', '教育垂类', '11.9万', '¥16,500', 95, '低'],
+      ['教辅工具测评小乔', '教育垂类', '6.80万', '¥8,200', 94, '低'],
+      ['上海中产陪读日记', '母婴教育', '14.2万', '¥14,000', 92, '低'],
+    ];
+
+    const viewTitles = {
+      overview: '项目总览',
+      progress: '筛选进度',
+      creators: '达人清单',
+      confirm: '需要确认',
+      settings: '项目设置',
+    };
+
+    let currentView = 'overview';
+    let currentFilter = '全部';
+
+    const $ = (selector) => document.querySelector(selector);
+    const $$ = (selector) => [...document.querySelectorAll(selector)];
+
+    function showToast(text) {
+      const toast = $('#toast');
+      toast.textContent = text;
+      toast.classList.add('show');
+      clearTimeout(showToast.timer);
+      showToast.timer = setTimeout(() => toast.classList.remove('show'), 1600);
+    }
+
+    function switchView(view) {
+      currentView = view;
+      $$('.nav-item').forEach(item => item.classList.toggle('active', item.dataset.view === view));
+      $$('.content-view').forEach(item => item.classList.toggle('active', item.id === `view-${view}`));
+      $('#crumb').textContent = `达人筛选 / ${viewTitles[view]}`;
+      $('#mainTitle').textContent = viewTitles[view];
+      renderSide(view);
+    }
+
+    function renderProjectList() {
+      const q = $('#searchInput').value.trim();
+      const visible = !q || [project.name, project.product, project.brief].some(text => text.includes(q));
+      const filtered = currentFilter === '全部' || currentFilter === '待我处理';
+      $('#projectList').innerHTML = visible && filtered ? `
+        <article class="project-card" id="projectCard">
+          <div>
+            <h3>${project.name}</h3>
+            <div class="product">产品：${project.product}</div>
+            <p class="plain-brief">${project.brief}</p>
+            <div class="chips">
+              <span class="chip ok">共享达人池</span>
+              <span class="chip">${project.period}</span>
+              <span class="chip ok">已连接飞书</span>
+            </div>
+          </div>
+          <div class="card-side">
+            <div class="status-pill">${project.status}</div>
+            <div class="metric-pair">
+              <div class="metric"><span>项目预算</span><strong>${project.budget}</strong></div>
+              <div class="metric"><span>目标达人</span><strong>${project.target}</strong></div>
+            </div>
+            <div class="next-action">
+              <span>下一步</span>
+              <strong>确认 3 位候选达人</strong>
+              <div class="progress-track"><div class="progress-fill" style="width:${project.progress}%"></div></div>
+            </div>
+            <button class="primary-action" id="enterProject">进入项目</button>
+          </div>
+        </article>
+      ` : '<div class="empty">暂无项目</div>';
+
+      $('#projectCard')?.addEventListener('click', openProjectDrawer);
+      $('#enterProject')?.addEventListener('click', (event) => {
+        event.stopPropagation();
+        switchView('progress');
+      });
+    }
+
+    function renderCreators() {
+      const q = $('#searchInput').value.trim();
+      const rows = creators.filter(row => !q || row.join('').includes(q));
+      $('#creatorTable tbody').innerHTML = rows.map(row => `
+        <tr>
+          <td>${row[0]}</td>
+          <td>${row[1]}</td>
+          <td>${row[2]}</td>
+          <td>${row[3]}</td>
+          <td class="score">${row[4]}</td>
+          <td><span class="risk-low">${row[5]}</span></td>
+        </tr>
+      `).join('') || '<tr><td colspan="6" class="empty">暂无达人</td></tr>';
+    }
+
+    function renderConfirm() {
+      $('#confirmTable tbody').innerHTML = creators.slice(0, 3).map(row => `
+        <tr>
+          <td>${row[0]}</td>
+          <td>待确认</td>
+          <td class="score">${row[4]}</td>
+          <td>${row[3]}</td>
+          <td><button class="secondary-action confirm-btn" data-name="${row[0]}">确认</button></td>
+        </tr>
+      `).join('');
+      $$('.confirm-btn').forEach(btn => btn.addEventListener('click', () => showToast(`${btn.dataset.name} 已确认`)));
+    }
+
+    function renderSide(view) {
+      const sideTitle = $('#sideTitle');
+      const sideBody = $('#sideBody');
+      if (view === 'settings') {
+        sideTitle.textContent = '字段';
+        sideBody.innerHTML = `
+          <div class="side-card"><h3>飞书状态</h3><div class="checklist"><div class="check-item"><span class="check">✓</span><span>已绑定达人池表</span></div><div class="check-item"><span class="check">✓</span><span>字段映射已完成</span></div></div></div>
+        `;
+        return;
+      }
+      sideTitle.textContent = '待办';
+      sideBody.innerHTML = `
+        <div class="side-card">
+          <h3>今日</h3>
+          <div class="checklist">
+            <div class="check-item"><span class="check">✓</span><span>Brief 已整理</span></div>
+            <div class="check-item"><span class="check">✓</span><span>候选达人已评分</span></div>
+            <div class="check-item"><span class="check wait">3</span><span>达人待确认</span></div>
+          </div>
+        </div>
+        <div class="decision-box">
+          <h3>快捷操作</h3>
+          <div class="decision-actions">
+            <button class="light-btn" id="quickCreators">查看候选</button>
+            <button class="dark-btn" id="quickSettings">调整标准</button>
+          </div>
+        </div>
+      `;
+      $('#quickCreators').addEventListener('click', () => switchView('confirm'));
+      $('#quickSettings').addEventListener('click', () => switchView('settings'));
+    }
+
+    function openProjectDrawer() {
+      $('#drawerTitle').textContent = project.name;
+      $('#drawerBody').innerHTML = `
+        <div class="side-card"><h3>项目</h3><div class="checklist"><div class="check-item"><span class="check">✓</span><span>${project.product}</span></div><div class="check-item"><span class="check">✓</span><span>${project.period}</span></div><div class="check-item"><span class="check wait">3</span><span>候选达人待确认</span></div></div></div>
+        <div class="side-card" style="margin-top:16px"><h3>进度</h3><div class="progress-track"><div class="progress-fill" style="width:${project.progress}%"></div></div></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:16px">
+          <button class="primary-action" id="drawerProgress">筛选进度</button>
+          <button class="secondary-action" id="drawerConfirm">需要确认</button>
+        </div>
+      `;
+      $('#drawer').classList.add('open');
+      $('#drawerProgress').addEventListener('click', () => { closeDrawer(); switchView('progress'); });
+      $('#drawerConfirm').addEventListener('click', () => { closeDrawer(); switchView('confirm'); });
+    }
+
+    function closeDrawer() {
+      $('#drawer').classList.remove('open');
+    }
+
+    $$('.nav-item').forEach(item => item.addEventListener('click', () => switchView(item.dataset.view)));
+    $$('.summary-card').forEach(item => item.addEventListener('click', () => switchView(item.dataset.view)));
+    $$('.tab').forEach(tab => tab.addEventListener('click', () => {
+      currentFilter = tab.dataset.filter;
+      $$('.tab').forEach(item => item.classList.toggle('active', item === tab));
+      renderProjectList();
+    }));
+    $('#searchInput').addEventListener('input', () => {
+      renderProjectList();
+      renderCreators();
+    });
+    $('#saveSettings').addEventListener('click', () => showToast('已保存'));
+    $('#resetSettings').addEventListener('click', () => showToast('已重置'));
+    $$('[data-close="true"]').forEach(item => item.addEventListener('click', closeDrawer));
+
+    renderProjectList();
+    renderCreators();
+    renderConfirm();
+    renderSide('overview');
+  </script>
+</body>
+</html>

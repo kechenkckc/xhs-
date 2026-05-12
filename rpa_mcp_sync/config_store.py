@@ -39,5 +39,6 @@ def feishu_connection_path(project_id: str) -> Path:
 def public_feishu_config(config: dict[str, Any]) -> dict[str, Any]:
     result = dict(config)
     result.pop("app_secret", None)
+    result.pop("field_mapping_cache", None)
     result["app_secret_configured"] = bool(config.get("app_secret"))
     return result

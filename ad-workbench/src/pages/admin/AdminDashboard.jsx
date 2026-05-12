@@ -28,6 +28,24 @@ const tabs = [
   { key: 'audit', label: '审计日志', icon: <FileText size={14} /> },
 ];
 
+function formatApiErrorMessage(payload, fallback = '请求失败') {
+  if (!payload) return fallback;
+  if (typeof payload === 'string') return payload;
+  if (payload instanceof Error) return payload.message || fallback;
+
+  const detail = payload.detail && typeof payload.detail === 'object' ? payload.detail : payload;
+  const directMessage = detail.message || detail.error || payload.message || payload.error;
+  if (typeof directMessage === 'string') return directMessage;
+  if (directMessage && typeof directMessage === 'object') {
+    return formatApiErrorMessage(directMessage, fallback);
+  }
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return fallback;
+  }
+}
+
 // Tab 1 - 系统概览：系统事件数据
 const systemEventsData = [
   { id: 1, time: '2026-04-13 14:32:05', event: 'Agent 调度异常', level: 'error', source: 'Budget Agent', detail: 'API 连接超时，已自动重试 3 次' },
@@ -831,8 +849,8 @@ function TabApiSettings() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      if (!response.ok) throw new Error((await response.json()).error || '保存 API 配置失败');
       const result = await response.json();
+      if (!response.ok) throw new Error(formatApiErrorMessage(result, '保存 API 配置失败'));
       applyRemoteConfig(result);
       setFeedback(result.message || 'API 配置已保存');
     } catch (error) {
@@ -842,7 +860,7 @@ function TabApiSettings() {
         api_key_configured: prev.api_key_configured || Boolean(config.api_key || config.api_key_env),
         api_key_source: config.api_key ? 'inline' : (config.api_key_env ? 'env' : 'none'),
       }));
-      setFeedback(`${error.message || '后端暂不可用'}，已先保存到本地工作台配置。`);
+      setFeedback(`${formatApiErrorMessage(error, '后端暂不可用')}，已先保存到本地工作台配置。`);
     } finally {
       setConfig((prev) => ({ ...prev, api_key: '' }));
       setBusy(false);
@@ -859,10 +877,10 @@ function TabApiSettings() {
         body: JSON.stringify(config),
       });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'API 连接测试失败');
+      if (!response.ok || result.ok === false) throw new Error(formatApiErrorMessage(result, 'API 连接测试失败'));
       setFeedback(result.message || 'API 连接测试成功');
     } catch (error) {
-      setFeedback(error.message || 'API 连接测试失败');
+      setFeedback(formatApiErrorMessage(error, 'API 连接测试失败'));
     } finally {
       setBusy(false);
     }

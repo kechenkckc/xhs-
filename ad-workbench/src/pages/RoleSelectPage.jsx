@@ -1,6 +1,6 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Lightbulb, Zap, Radio, BarChart3, Shield, ArrowRight } from 'lucide-react';
+import { Lightbulb, Zap, Radio, BarChart3, Shield, ArrowRight, Filter } from 'lucide-react';
 
 const roles = [
   {
@@ -43,6 +43,14 @@ const roles = [
     color: '#F59E0B',
     subtleBg: 'rgba(245, 158, 11, 0.12)',
   },
+  {
+    key: 'screening',
+    name: '达人筛选',
+    icon: Filter,
+    description: '项目预览、采集工作台、达人池评分',
+    color: '#10B981',
+    subtleBg: 'rgba(16, 185, 129, 0.12)',
+  },
 ];
 
 export default function RoleSelectPage() {
@@ -60,12 +68,11 @@ export default function RoleSelectPage() {
         不同岗位看到不同视图，但共享同一份项目数据
       </p>
 
-      {/* 角色卡片网格：前 3 个一行，后 2 个居中 */}
+      {/* 角色卡片网格 */}
       <div
         style={{
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
+          display: 'grid',
+          gridTemplateColumns: 'repeat(3, 1fr)',
           gap: 'var(--space-5)',
           maxWidth: 960,
           width: '100%',
@@ -73,157 +80,71 @@ export default function RoleSelectPage() {
           zIndex: 1,
         }}
       >
-        {/* 第一行：3 列 */}
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(3, 1fr)',
-            gap: 'var(--space-5)',
-            width: '100%',
-          }}
-        >
-          {roles.slice(0, 3).map((role) => {
-            const IconComponent = role.icon;
-            return (
+        {roles.map((role) => {
+          const IconComponent = role.icon;
+          return (
+            <div
+              key={role.key}
+              className="role-card"
+              onClick={() => handleSelect(role.key)}
+              style={{ borderColor: 'var(--border-primary)' }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.borderColor = role.color;
+                e.currentTarget.style.boxShadow = `0 8px 32px ${role.color}25`;
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = 'var(--border-primary)';
+                e.currentTarget.style.boxShadow = 'none';
+              }}
+            >
+              {/* 角色图标 */}
               <div
-                key={role.key}
-                className="role-card"
-                onClick={() => handleSelect(role.key)}
-                style={{ borderColor: 'var(--border-primary)' }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.borderColor = role.color;
-                  e.currentTarget.style.boxShadow = `0 8px 32px ${role.color}25`;
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.borderColor = 'var(--border-primary)';
-                  e.currentTarget.style.boxShadow = 'none';
+                className="role-icon"
+                style={{
+                  backgroundColor: role.subtleBg,
+                  color: role.color,
                 }}
               >
-                {/* 角色图标 */}
-                <div
-                  className="role-icon"
-                  style={{
-                    backgroundColor: role.subtleBg,
-                    color: role.color,
-                  }}
-                >
-                  <IconComponent size={28} />
-                </div>
-
-                {/* 角色名称 */}
-                <div className="role-name">{role.name}</div>
-
-                {/* 角色描述 */}
-                <div className="role-desc">{role.description}</div>
-
-                {/* 进入按钮 */}
-                <button
-                  className="btn btn-sm"
-                  style={{
-                    marginTop: 'var(--space-5)',
-                    backgroundColor: role.subtleBg,
-                    color: role.color,
-                    border: `1px solid transparent`,
-                    borderRadius: 'var(--radius-md)',
-                    fontSize: 'var(--text-sm)',
-                    fontWeight: 500,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 'var(--space-1)',
-                    transition: 'all 0.2s ease',
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.backgroundColor = role.color;
-                    e.currentTarget.style.color = '#ffffff';
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.backgroundColor = role.subtleBg;
-                    e.currentTarget.style.color = role.color;
-                  }}
-                >
-                  进入
-                  <ArrowRight size={14} />
-                </button>
+                <IconComponent size={28} />
               </div>
-            );
-          })}
-        </div>
 
-        {/* 第二行：2 列居中 */}
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(2, 1fr)',
-            gap: 'var(--space-5)',
-            width: '66.67%',
-          }}
-        >
-          {roles.slice(3, 5).map((role) => {
-            const IconComponent = role.icon;
-            return (
-              <div
-                key={role.key}
-                className="role-card"
-                onClick={() => handleSelect(role.key)}
-                style={{ borderColor: 'var(--border-primary)' }}
+              {/* 角色名称 */}
+              <div className="role-name">{role.name}</div>
+
+              {/* 角色描述 */}
+              <div className="role-desc">{role.description}</div>
+
+              {/* 进入按钮 */}
+              <button
+                className="btn btn-sm"
+                style={{
+                  marginTop: 'var(--space-5)',
+                  backgroundColor: role.subtleBg,
+                  color: role.color,
+                  border: '1px solid transparent',
+                  borderRadius: 'var(--radius-md)',
+                  fontSize: 'var(--text-sm)',
+                  fontWeight: 500,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 'var(--space-1)',
+                  transition: 'all 0.2s ease',
+                }}
                 onMouseEnter={(e) => {
-                  e.currentTarget.style.borderColor = role.color;
-                  e.currentTarget.style.boxShadow = `0 8px 32px ${role.color}25`;
+                  e.currentTarget.style.backgroundColor = role.color;
+                  e.currentTarget.style.color = '#ffffff';
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.borderColor = 'var(--border-primary)';
-                  e.currentTarget.style.boxShadow = 'none';
+                  e.currentTarget.style.backgroundColor = role.subtleBg;
+                  e.currentTarget.style.color = role.color;
                 }}
               >
-                {/* 角色图标 */}
-                <div
-                  className="role-icon"
-                  style={{
-                    backgroundColor: role.subtleBg,
-                    color: role.color,
-                  }}
-                >
-                  <IconComponent size={28} />
-                </div>
-
-                {/* 角色名称 */}
-                <div className="role-name">{role.name}</div>
-
-                {/* 角色描述 */}
-                <div className="role-desc">{role.description}</div>
-
-                {/* 进入按钮 */}
-                <button
-                  className="btn btn-sm"
-                  style={{
-                    marginTop: 'var(--space-5)',
-                    backgroundColor: role.subtleBg,
-                    color: role.color,
-                    border: '1px solid transparent',
-                    borderRadius: 'var(--radius-md)',
-                    fontSize: 'var(--text-sm)',
-                    fontWeight: 500,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 'var(--space-1)',
-                    transition: 'all 0.2s ease',
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.backgroundColor = role.color;
-                    e.currentTarget.style.color = '#ffffff';
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.backgroundColor = role.subtleBg;
-                    e.currentTarget.style.color = role.color;
-                  }}
-                >
-                  进入
-                  <ArrowRight size={14} />
-                </button>
-              </div>
-            );
-          })}
-        </div>
+                进入
+                <ArrowRight size={14} />
+              </button>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

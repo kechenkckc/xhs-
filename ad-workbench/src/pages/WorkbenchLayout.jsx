@@ -1,4 +1,4 @@
-import React, { useState, lazy, Suspense } from 'react';
+import React, { useEffect, useState, lazy, Suspense } from 'react';
 import { useParams, useLocation, useNavigate, Link } from 'react-router-dom';
 import {
   LayoutDashboard,
@@ -25,6 +25,8 @@ import {
   Settings,
   ScrollText,
   Bell,
+  Check,
+  ChevronDown,
   LogOut,
   ChevronRight,
   Zap,
@@ -97,9 +99,10 @@ const navConfig = {
   ],
   screening: [
     { icon: FolderOpen, label: '项目预览', path: 'projects' },
-    { icon: LayoutDashboard, label: '流程工作台', path: 'overview' },
-    { icon: Users, label: '初筛评分 + 人工筛选', path: 'screening-review' },
-    { icon: BarChart3, label: '候选评分预览', path: 'score-preview' },
+    { icon: LayoutDashboard, label: '采集工作台', path: 'overview' },
+    { icon: Users, label: '筛选工作台', path: 'screening-review' },
+    { icon: UserCheck, label: '审号工作台', path: 'creator-audit' },
+    { icon: BarChart3, label: '项目达人池', path: 'score-preview' },
     { icon: FolderPlus, label: '立项 + 标准 + 飞书绑定', path: 'project-setup' },
     { divider: true },
     { icon: ScrollText, label: '操作日志', path: 'audit-log' },
@@ -192,10 +195,19 @@ function SidebarUser({ role, onLogout }) {
 }
 
 // Header 组件
-function Header({ role, currentPath }) {
+function Header({
+  role,
+  currentPath,
+  screeningProjects = [],
+  selectedScreeningProjectId,
+  onSelectScreeningProject,
+}) {
   const roleInfo = roleConfig[role];
   const navItems = navConfig[role] || [];
   const currentPage = navItems.find((item) => item.path === currentPath);
+  const isScreeningRole = role === 'screening';
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const selectedProject = screeningProjects.find(project => project.project_id === selectedScreeningProjectId) || screeningProjects[0];
 
   return (
     <header
@@ -207,13 +219,60 @@ function Header({ role, currentPath }) {
       }}
     >
       {/* 面包屑导航 */}
-      <div className="breadcrumb">
-        <span className="breadcrumb-item">{roleInfo.name}</span>
-        <span className="breadcrumb-separator">/</span>
-        <span className="breadcrumb-item active">
-          {currentPage?.label || '工作概览'}
-        </span>
-      </div>
+      {isScreeningRole ? (
+        <div className="breadcrumb project-switcher">
+          <span className="breadcrumb-item">当前项目</span>
+          <span className="breadcrumb-separator">/</span>
+          <button
+            type="button"
+            className="breadcrumb-item active project-switcher-trigger"
+            onClick={() => setProjectMenuOpen((open) => !open)}
+          >
+            <span>{selectedProject?.project_name || '点击切换项目'}</span>
+            <ChevronDown size={14} />
+          </button>
+          {projectMenuOpen && (
+            <div className="project-switcher-menu">
+              <div className="project-switcher-title">点击切换项目</div>
+              {screeningProjects.length > 0 ? (
+                screeningProjects.map((project) => {
+                  const isSelected = project.project_id === selectedProject?.project_id;
+                  return (
+                    <button
+                      type="button"
+                      key={project.project_id}
+                      className={`project-switcher-option ${isSelected ? 'active' : ''}`}
+                      onClick={() => {
+                        onSelectScreeningProject?.(project.project_id);
+                        setProjectMenuOpen(false);
+                      }}
+                    >
+                      <FolderOpen size={15} />
+                      <span className="project-switcher-option-main">
+                        <span className="project-switcher-option-name">{project.project_name}</span>
+                        <span className="project-switcher-option-meta">
+                          {project.period_start || '待定'} 至 {project.period_end || '待定'}
+                        </span>
+                      </span>
+                      {isSelected && <Check size={15} />}
+                    </button>
+                  );
+                })
+              ) : (
+                <div className="project-switcher-empty">暂无项目</div>
+              )}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="breadcrumb">
+          <span className="breadcrumb-item">{roleInfo.name}</span>
+          <span className="breadcrumb-separator">/</span>
+          <span className="breadcrumb-item active">
+            {currentPage?.label || '工作概览'}
+          </span>
+        </div>
+      )}
 
       {/* 右侧操作区 */}
       <div className="page-header-actions">
@@ -272,6 +331,14 @@ export default function WorkbenchLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
+  const [screeningProjects, setScreeningProjects] = useState([]);
+  const [selectedScreeningProjectId, setSelectedScreeningProjectId] = useState(() => {
+    try {
+      return window.localStorage.getItem('adflow-selected-screening-project') || '';
+    } catch {
+      return '';
+    }
+  });
 
   // 获取当前路径的最后一部分作为当前页面
   const currentPath = location.pathname.split('/').pop() || 'overview';
@@ -279,6 +346,47 @@ export default function WorkbenchLayout() {
   // 处理退出登录
   const handleLogout = () => {
     navigate('/');
+  };
+
+  useEffect(() => {
+    if (role !== 'screening') return;
+
+    let cancelled = false;
+    fetch('/api/projects')
+      .then((response) => response.json())
+      .then((payload) => {
+        if (cancelled) return;
+        const nextProjects = payload.projects || [];
+        setScreeningProjects(nextProjects);
+        setSelectedScreeningProjectId((currentId) => (
+          currentId || nextProjects[0]?.project_id || 'youdao_001'
+        ));
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setScreeningProjects([]);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [role]);
+
+  useEffect(() => {
+    if (!selectedScreeningProjectId) return;
+    try {
+      window.localStorage.setItem('adflow-selected-screening-project', selectedScreeningProjectId);
+    } catch {
+      // Local storage is optional; the page still works without persistence.
+    }
+  }, [selectedScreeningProjectId]);
+
+  const handleSelectScreeningProject = (projectId) => {
+    setSelectedScreeningProjectId(projectId);
+    if (currentPath === 'projects') {
+      navigate('/workbench/screening/overview');
+    }
   };
 
   // 如果 role 无效，重定向到角色选择页
@@ -300,17 +408,27 @@ export default function WorkbenchLayout() {
 
       {/* 右侧主内容区 */}
       <main className="main-content">
-        <Header role={role} currentPath={currentPath} />
+        <Header
+          role={role}
+          currentPath={currentPath}
+          screeningProjects={screeningProjects}
+          selectedScreeningProjectId={selectedScreeningProjectId}
+          onSelectScreeningProject={handleSelectScreeningProject}
+        />
         <div className="page-body">
           <Suspense fallback={<div style={{
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
             minHeight: '400px',
-            color: '#5A6478',
+            color: 'var(--text-muted)',
             fontSize: '14px'
           }}>加载面板中...</div>}>
-            <DashboardComponent key={currentPath} />
+            <DashboardComponent
+              key={currentPath}
+              selectedProjectId={selectedScreeningProjectId}
+              onSelectedProjectIdChange={setSelectedScreeningProjectId}
+            />
           </Suspense>
         </div>
       </main>

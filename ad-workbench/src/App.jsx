@@ -13,8 +13,8 @@ function App() {
         alignItems: 'center',
         justifyContent: 'center',
         height: '100vh',
-        background: '#0B0E11',
-        color: '#8B95A5',
+        background: '#F4F7FB',
+        color: '#4E5F74',
         fontSize: '14px',
         fontFamily: "'DM Sans', sans-serif"
       }}>加载中...</div>}>

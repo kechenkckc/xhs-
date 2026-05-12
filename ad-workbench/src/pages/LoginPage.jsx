@@ -63,12 +63,12 @@ export default function LoginPage() {
         {/* 产品名 */}
         <h1
           style={{
-            fontFamily: "'Playfair Display'",
-            fontSize: 'var(--text-4xl)',
+            fontFamily: 'var(--font-sans)',
+            fontSize: '28px',
             fontWeight: 700,
             color: 'var(--text-primary)',
             marginBottom: 'var(--space-3)',
-            letterSpacing: '-0.02em',
+            letterSpacing: 0,
           }}
         >
           AdFlow AI
@@ -77,7 +77,7 @@ export default function LoginPage() {
         {/* 副标题 */}
         <p
           style={{
-            fontSize: 'var(--text-lg)',
+            fontSize: 'var(--text-md)',
             color: 'var(--text-secondary)',
             marginBottom: 'var(--space-12)',
             fontWeight: 400,
