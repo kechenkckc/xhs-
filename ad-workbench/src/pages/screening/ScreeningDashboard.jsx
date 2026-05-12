@@ -700,7 +700,6 @@ function getCreatorMetricChips(creator) {
   const traffic = pickCreatorValue(creator, ['traffic_stability', '近30天流量稳定性']);
   const rateLimit = pickCreatorValue(creator, ['rateLimitRisk', 'rate_limit_risk', '限流风险判断']);
   const shop30 = pickCreatorValue(creator, ['shop_cost_30d', '30天外溢进店成本']);
-  const direction = pickCreatorValue(creator, ['cooperation_direction', '合作方向']);
   if (grade) chips.push(`年级 ${grade}`);
   if (age) chips.push(`孩子${age}岁`);
   if (gender && gender !== '未披露') chips.push(`${gender}孩`);
@@ -711,37 +710,21 @@ function getCreatorMetricChips(creator) {
   if (traffic) chips.push(`流量${traffic}`);
   if (rateLimit && !['无', '低'].includes(String(rateLimit))) chips.push(`限流${rateLimit}`);
   if (shop30) chips.push(`进店¥${shop30}`);
-  if (direction) chips.push(direction);
   return uniqueCompactItems(chips, 8);
 }
 
 function getCreatorTags(creator) {
-  const personaTags = splitCreatorTags(pickCreatorValue(creator, ['personaTags', 'persona_tags', '人设标签']));
-  const categoryTags = splitCreatorTags(pickCreatorValue(creator, ['category_tags', 'content_tags', '内容标签', '类目标签']));
-  const riskTags = Array.isArray(creator.risk) ? creator.risk : splitCreatorTags(pickCreatorValue(creator, ['risk_tags', 'risk', '风险标签']));
-  const derivedTags = [];
-  const intro = getCreatorIntro(creator);
-  const creatorType = getCreatorCategory(creator);
-  const location = getCreatorLocation(creator);
   const budgetStatus = pickCreatorValue(creator, ['budget_status', '预算状态']);
   const mcnStatus = pickCreatorValue(creator, ['mcn_status', 'MCN状态']);
-
-  if (creatorType && creatorType !== '达人') derivedTags.push(creatorType);
-  if (location && location !== '其他') derivedTags.push(location);
-  if (budgetStatus) derivedTags.push(budgetStatus);
-  if (mcnStatus) derivedTags.push(mcnStatus);
-  if (/老师|教师|教资|班主任/.test(intro + creator.name)) derivedTags.push('教师人设');
-  if (/妈妈|宝妈|陪读|亲子|家庭/.test(intro + creator.name)) derivedTags.push('家庭教育');
-  if (/小升初|初中|高中|升学|作业/.test(intro)) derivedTags.push('升学场景');
-  if (/测评|开箱|好物|种草/.test(intro)) derivedTags.push('测评种草');
-
+  const tagGroups = getCreatorTagGroups(creator);
   return uniqueCompactItems([
-    ...getCreatorMetricChips(creator),
-    ...personaTags,
-    ...categoryTags,
-    ...derivedTags,
-    ...riskTags,
-  ], 10);
+    ...tagGroups.persona,
+    ...tagGroups.content,
+    ...tagGroups.metric,
+    ...tagGroups.risk,
+    budgetStatus,
+    mcnStatus,
+  ], 20);
 }
 
 function creatorHasTag(creator, tag) {
@@ -749,15 +732,181 @@ function creatorHasTag(creator, tag) {
   return getCreatorTags(creator).includes(tag);
 }
 
-function getCreatorProfileFacts(creator, tier) {
-  return uniqueCompactItems([
-    getCreatorXhsId(creator) ? `小红书号：${getCreatorXhsId(creator)}` : '',
-    getCreatorLocation(creator) ? `地区：${getCreatorLocation(creator)}` : '',
-    getCreatorCategory(creator) ? `类型：${getCreatorCategory(creator)}` : '',
-    creator.followers ? `粉丝：${creator.followers}` : '',
-    creator.quote ? `报价：${creator.quote}` : '',
-    tier?.label ? `评分：${creator.baseScore} / ${tier.label}` : '',
-  ], 6);
+function projectBrandHint(creator) {
+  const text = `${creator.name || ''} ${getCreatorIntro(creator)}`;
+  if (/有道|答疑|学习|教育|作业/.test(text)) return '教育学习';
+  if (/母婴|育儿|宝宝/.test(text)) return '母婴亲子';
+  if (/美妆|护肤/.test(text)) return '美妆护肤';
+  return '内容样本';
+}
+
+function getCreatorNoteCases(creator) {
+  const rawPayload = getCreatorRawPayload(creator);
+  const fromPages = Array.isArray(rawPayload.cooperation_note_case_pages)
+    ? rawPayload.cooperation_note_case_pages.flatMap(page => page?.cases || [])
+    : [];
+  const rawCases = [
+    ...(Array.isArray(rawPayload.cooperation_note_cases) ? rawPayload.cooperation_note_cases : []),
+    ...(Array.isArray(rawPayload.note_cases) ? rawPayload.note_cases : []),
+    ...(Array.isArray(rawPayload.notes) ? rawPayload.notes : []),
+    ...fromPages,
+  ];
+  const seen = new Set();
+  const cases = rawCases
+    .map((item, index) => {
+      if (typeof item === 'string') return { brand: '笔记', title: item, index };
+      if (!item || typeof item !== 'object') return null;
+      return {
+        index,
+        brand: item.brand || item.cooperation_brand || item.category || '合作笔记',
+        title: item.title || item.note_title || item.name || '未命名笔记',
+        readCount: item.read_count ?? item.readCount ?? item.read ?? '',
+        likeCount: item.like_count ?? item.likeCount ?? item.likes ?? '',
+        saveCount: item.save_count ?? item.saveCount ?? item.saves ?? '',
+        publishedAt: item.published_at || item.publish_time || item.time || '',
+        promoted: Boolean(item.has_promoted_traffic || item.promoted),
+        coverUrl: item.cover_url || item.coverUrl || item.image || item.image_url || '',
+      };
+    })
+    .filter(Boolean)
+    .filter((item) => {
+      const key = `${item.brand}|${item.title}|${item.publishedAt}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+  if (cases.length) return cases.slice(0, 12);
+
+  const tags = getCreatorTags(creator);
+  const direction = pickCreatorValue(creator, ['cooperation_direction', '合作方向']);
+  return [
+    {
+      brand: projectBrandHint(creator),
+      title: direction || `${creator.name}的日常内容与项目场景`,
+      readCount: pickCreatorValue(creator, ['cooperation_read_median', '合作阅读中位数']) || pickCreatorValue(creator, ['image_daily_read_median']),
+      likeCount: pickCreatorValue(creator, ['cooperation_interaction_median', '合作互动中位数']),
+      saveCount: '',
+      publishedAt: formatDateLabel(getCreatorCollectedAt(creator)),
+      promoted: true,
+      coverUrl: getCreatorAvatarUrl(creator),
+    },
+    ...tags.slice(0, 3).map((tag, index) => ({
+      brand: '证据标签',
+      title: `${tag}：${getCreatorIntro(creator).slice(0, 34) || '待补采详情页后生成更多证据'}`,
+      readCount: '',
+      likeCount: '',
+      saveCount: '',
+      publishedAt: index === 0 ? '详情页快照' : '规则命中',
+      promoted: false,
+      coverUrl: '',
+    })),
+  ].slice(0, 6);
+}
+
+function getProjectScoringCriteria(project) {
+  const plan = normalizeWorkbenchPlan(project?.screeningPlan || {});
+  const hardFilters = [
+    ...(plan.scoringHardFilters || []),
+    ...(plan.hardFilters || []),
+    ...((plan.scoringCriteria && Array.isArray(plan.scoringCriteria.hardFilters)) ? plan.scoringCriteria.hardFilters : []),
+  ];
+  return {
+    hardFilters: uniqueCompactItems(hardFilters.map(item => hardFilterLabel(item)), 8),
+    weights: plan.scoringWeights || plan.weights || plan.scoringCriteria?.weights || {},
+  };
+}
+
+function getCreatorMatchProfile(creator, project) {
+  const score = Math.max(0, Math.min(100, Math.round(Number(creator.baseScore || creator.finalScore || 0))));
+  const scores = creator.scores || {};
+  const persona = Number(scores.persona ?? score);
+  const content = Number(scores.content ?? score);
+  const cpe = Number(scores.cpe ?? score);
+  const budget = Number(scores.budget ?? score);
+  const noteCases = getCreatorNoteCases(creator);
+  const criteria = getProjectScoringCriteria(project);
+  const matchedSignals = [];
+  const riskSignals = [];
+  const text = `${creator.name || ''} ${getCreatorIntro(creator)} ${getCreatorTags(creator).join(' ')} ${creator.aiReason || ''}`;
+
+  if (/女|妈妈|宝妈|陪读|亲子|家庭/.test(text)) matchedSignals.push('人设/家庭场景命中');
+  if (/教育|学习|老师|教师|作业|小升初|初中|高中/.test(text)) matchedSignals.push('教育学习内容命中');
+  if (noteCases.length >= 3) matchedSignals.push(`${noteCases.length}条笔记证据`);
+  if (creator.informationCompletenessLabel && creator.informationCompletenessLabel !== '待补') matchedSignals.push(`资料完整度${creator.informationCompletenessLabel}`);
+  if (Number.isFinite(cpe) && cpe >= 80) matchedSignals.push('互动成本表现较好');
+  if (Number.isFinite(budget) && budget >= 80) matchedSignals.push('报价预算匹配');
+  (creator.risk || []).forEach(item => riskSignals.push(item));
+  if (!getPgyUrl(creator)) riskSignals.push('缺少蒲公英详情链接');
+  if (!noteCases.length) riskSignals.push('缺少合作笔记证据');
+
+  const noteEvidenceBonus = Math.min(noteCases.length * 2, 8);
+  const matchScore = Math.round(Math.min(100, score * 0.45 + persona * 0.22 + content * 0.2 + cpe * 0.08 + noteEvidenceBonus));
+  const tier = matchScore >= 85 ? '强匹配' : matchScore >= 70 ? '较匹配' : matchScore >= 55 ? '需复核' : '不匹配';
+  return {
+    matchScore,
+    tier,
+    noteCases,
+    matchedSignals: uniqueCompactItems(matchedSignals, 5),
+    riskSignals: uniqueCompactItems(riskSignals, 4),
+    reason: creator.aiReason || creator.reason || '待补采详情页后生成完整匹配原因。',
+    criteria,
+  };
+}
+
+function getCreatorRecommendation(creator, stage) {
+  const score = Number(creator.baseScore || 0);
+  if ((creator.risk || []).some(item => /无蒲公英|限流|报价偏高/.test(item))) return '先核风险';
+  if (stage === '已合作跟进中') return '跟进数据';
+  if (stage === '待建联达人') return score >= 80 ? '优先建联' : '补充判断';
+  if (stage === '合格达人待合作') return score >= 90 ? '优先排期' : '排期沟通';
+  if (score >= 100) return '强匹配';
+  if (score >= 90) return '优先推进';
+  if (score >= 80) return '高潜备选';
+  return '暂缓观察';
+}
+
+function getCreatorFollowupInfo(creator, stage) {
+  const owner = pickCreatorValue(creator, ['owner', '负责人', 'reviewer'], creator.reviewer || '待分配');
+  const rawStatus = pickCreatorValue(creator, ['contact_status', '建联状态', 'portfolio_role'], creator.raw?.portfolio_role || '');
+  const statusByStage = {
+    '已合作跟进中': '已确认合作',
+    '合格达人待合作': '待排期/商务推进',
+    '待建联达人': '待建联',
+    '观察暂缓': '暂缓观察',
+  };
+  const lastRaw = pickCreatorValue(creator, ['last_contacted_at', '最近跟进时间', 'reviewedAt', 'updatedAt', 'updated_at'], creator.reviewedAt || creator.updatedAt || creator.createdAt);
+  const lastAt = lastRaw ? formatDateTime(lastRaw) : '待记录';
+  return {
+    owner,
+    status: rawStatus || statusByStage[stage] || '待跟进',
+    lastAt,
+    note: pickCreatorValue(creator, ['note', '备注', 'reason'], creator.reason || ''),
+  };
+}
+
+function getCreatorTagGroups(creator) {
+  const metricTags = getCreatorMetricChips(creator);
+  const personaTags = splitCreatorTags(pickCreatorValue(creator, ['personaTags', 'persona_tags', '人设标签']));
+  const contentTags = splitCreatorTags(pickCreatorValue(creator, ['category_tags', 'content_tags', '内容标签', '类目标签']));
+  const riskTags = Array.isArray(creator.risk) ? creator.risk : splitCreatorTags(pickCreatorValue(creator, ['risk_tags', 'risk', '风险标签']));
+  const intro = getCreatorIntro(creator);
+  const derivedPersona = [];
+  const derivedContent = [];
+  const category = getCreatorCategory(creator);
+  const location = getCreatorLocation(creator);
+
+  if (/老师|教师|教资|班主任/.test(intro + creator.name)) derivedPersona.push('教师人设');
+  if (/妈妈|宝妈|陪读|亲子|家庭/.test(intro + creator.name)) derivedPersona.push('家庭教育');
+  if (/小升初|初中|高中|升学|作业/.test(intro)) derivedContent.push('升学场景');
+  if (/测评|开箱|好物|种草/.test(intro)) derivedContent.push('测评种草');
+
+  return {
+    persona: uniqueCompactItems([...personaTags, ...derivedPersona, location !== '其他' ? location : ''], 5),
+    content: uniqueCompactItems([category !== '达人' ? category : '', ...contentTags, ...derivedContent], 5),
+    metric: uniqueCompactItems(metricTags, 6),
+    risk: uniqueCompactItems(riskTags, 4),
+  };
 }
 
 function getPoolStage(creator, index = 0) {
@@ -2595,6 +2744,311 @@ function ScreeningReviewTab({ project, screeningStatus, setScreeningStatus, onRe
   );
 }
 
+// ==================== 审号工作台 ====================
+
+function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, onCollectDetails, onScore, onReview, onRefresh, onTabChange }) {
+  const creators = useMemo(() => getProjectCreators(project).map(c => ({
+    ...getDefaultCreatorStatus(),
+    ...c,
+    ...(getCreatorStatus(project.id, c.id, screeningStatus) || {}),
+  })), [project, screeningStatus]);
+  const rows = useMemo(() => creators
+    .map(creator => ({ creator, match: getCreatorMatchProfile(creator, project) }))
+    .sort((a, b) => b.match.matchScore - a.match.matchScore), [creators, project]);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [activeId, setActiveId] = useState(() => rows[0]?.creator.id || null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [matchFilter, setMatchFilter] = useState('全部');
+  const [busy, setBusy] = useState(false);
+  const [localMessage, setLocalMessage] = useState('');
+
+  useEffect(() => {
+    setSelectedIds([]);
+    setActiveId(rows[0]?.creator.id || null);
+  }, [project.id]);
+
+  const filteredRows = useMemo(() => {
+    let list = rows;
+    if (searchTerm) {
+      list = list.filter(({ creator }) => `${creator.name} ${creator.id} ${getCreatorTags(creator).join(' ')}`.includes(searchTerm));
+    }
+    if (matchFilter !== '全部') {
+      list = list.filter(({ match }) => match.tier === matchFilter);
+    }
+    return list;
+  }, [matchFilter, rows, searchTerm]);
+
+  const activeRow = rows.find(({ creator }) => creator.id === activeId) || filteredRows[0] || rows[0];
+  const selectedCreators = rows.filter(({ creator }) => selectedIds.includes(creator.id)).map(({ creator }) => creator);
+  const visibleIds = filteredRows.map(({ creator }) => creator.id);
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.includes(id));
+  const criteria = getProjectScoringCriteria(project);
+  const avgMatch = rows.length
+    ? Math.round(rows.reduce((sum, item) => sum + item.match.matchScore, 0) / rows.length)
+    : 0;
+  const needDetailCount = rows.filter(({ creator, match }) => {
+    const completeness = creator.informationCompletenessLabel || formatCompleteness(creator.informationCompleteness);
+    return completeness === '待补' || match.noteCases.length <= 1 || !getPgyUrl(creator);
+  }).length;
+  const strongCount = rows.filter(({ match }) => match.tier === '强匹配').length;
+
+  const toggleVisible = () => {
+    setSelectedIds(ids => {
+      if (allVisibleSelected) return ids.filter(id => !visibleIds.includes(id));
+      return Array.from(new Set([...ids, ...visibleIds]));
+    });
+  };
+
+  const toggleCreator = (creatorId) => {
+    setSelectedIds(ids => ids.includes(creatorId) ? ids.filter(id => id !== creatorId) : [...ids, creatorId]);
+  };
+
+  const collectForCreators = async (targetCreators, label = '审号工作台') => {
+    if (!targetCreators.length || !onCollectDetails) return;
+    setBusy(true);
+    setLocalMessage(`正在补采 ${targetCreators.length} 位达人详情页...`);
+    try {
+      await onCollectDetails({
+        creatorIds: targetCreators.map(creator => creator.id),
+        segment: 'audit',
+        segmentLabel: label,
+      });
+      await onRefresh?.();
+      setLocalMessage(`已提交 ${targetCreators.length} 位达人详情页补采，并触发匹配度刷新`);
+    } catch (error) {
+      setLocalMessage(error.message || '详情页补采失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const collectVisible = () => collectForCreators(
+    selectedCreators.length ? selectedCreators : filteredRows.map(({ creator }) => creator),
+    selectedCreators.length ? '勾选达人' : '当前列表达人'
+  );
+
+  const collectNeedDetail = () => collectForCreators(
+    rows
+      .filter(({ creator, match }) => {
+        const completeness = creator.informationCompletenessLabel || formatCompleteness(creator.informationCompleteness);
+        return completeness === '待补' || match.noteCases.length <= 1 || !getPgyUrl(creator);
+      })
+      .map(({ creator }) => creator),
+    '待补采达人'
+  );
+
+  const updateReview = async (creator, status, reason) => {
+    const now = new Date().toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-');
+    setScreeningStatus?.(prev => ({
+      ...prev,
+      [project.id]: {
+        ...(prev[project.id] || {}),
+        [creator.id]: {
+          review: status,
+          reviewVariant: getReviewVariant(status),
+          finalScore: creator.baseScore,
+          reason,
+          reviewer: '当前用户',
+          reviewedAt: now,
+        },
+      },
+    }));
+    await onReview?.([creator.id], status, reason);
+  };
+
+  const scoreDimLabels = { budget: '预算', fans: '粉丝', cpe: 'CPE', engagement: '互动', persona: '人设', content: '内容' };
+
+  return (
+    <div className="creator-audit-workbench">
+      <div className="creator-audit-task">
+        <button className="creator-audit-back" type="button" onClick={() => onTabChange?.('screening-review')} title="返回筛选工作台">
+          <ChevronLeft size={18} />
+        </button>
+        <div className="creator-audit-task-main">
+          <div className="creator-audit-task-title">审号工作台：{project.name}</div>
+          <div className="creator-audit-task-brief">{project.description || project.brief?.description || '当前项目暂未填写 Brief'}</div>
+        </div>
+        <div className="creator-audit-task-stats">
+          <div><strong>{avgMatch}%</strong><span>平均匹配</span></div>
+          <div><strong>{strongCount}</strong><span>强匹配</span></div>
+          <div><strong>{needDetailCount}</strong><span>待补采</span></div>
+        </div>
+      </div>
+
+      <div className="creator-audit-toolbar">
+        <div className="creator-audit-toolbar-left">
+          <button className="btn btn-sm btn-primary" onClick={collectVisible} disabled={busy || !filteredRows.length}>
+            <FileText size={14} />一键补采{selectedCreators.length ? ` ${selectedCreators.length}` : ''}
+          </button>
+          <button className="btn btn-sm btn-secondary" onClick={collectNeedDetail} disabled={busy || !needDetailCount}>
+            <Database size={14} />补采待完善 {needDetailCount}
+          </button>
+          <button className="btn btn-sm btn-secondary" onClick={onScore} disabled={busy}>
+            <Sparkles size={14} />重新匹配
+          </button>
+        </div>
+        <div className="creator-audit-toolbar-right">
+          <div className="search-box creator-audit-search">
+            <Search size={14} className="search-icon" />
+            <input className="search-input" placeholder="搜索达人/标签" value={searchTerm} onChange={event => setSearchTerm(event.target.value)} />
+          </div>
+          <select className="select-field" value={matchFilter} onChange={event => setMatchFilter(event.target.value)}>
+            <option value="全部">全部匹配度</option>
+            <option value="强匹配">强匹配</option>
+            <option value="较匹配">较匹配</option>
+            <option value="需复核">需复核</option>
+            <option value="不匹配">不匹配</option>
+          </select>
+        </div>
+      </div>
+
+      {localMessage && <div className="creator-audit-message">{localMessage}</div>}
+
+      <div className="creator-audit-shell">
+        <section className="creator-audit-table-card">
+          <div className="creator-audit-table-head">
+            <label className="creator-audit-check">
+              <input type="checkbox" checked={allVisibleSelected} disabled={!visibleIds.length} onChange={toggleVisible} />
+              <span>全选</span>
+            </label>
+            <span>达人</span>
+            <span>匹配度</span>
+            <span>推荐原因</span>
+            <span>分析详情</span>
+          </div>
+          <div className="creator-audit-table-body">
+            {filteredRows.map(({ creator, match }) => {
+              const tier = getScoreTier(creator.baseScore);
+              const avatarUrl = getCreatorAvatarUrl(creator);
+              const isActive = activeRow?.creator.id === creator.id;
+              return (
+                <article
+                  key={creator.id}
+                  className={`creator-audit-row ${isActive ? 'is-active' : ''}`}
+                  onClick={() => setActiveId(creator.id)}
+                >
+                  <label className="creator-audit-check" onClick={event => event.stopPropagation()}>
+                    <input type="checkbox" checked={selectedIds.includes(creator.id)} onChange={() => toggleCreator(creator.id)} />
+                  </label>
+                  <div className="creator-audit-profile">
+                    {avatarUrl ? <img src={avatarUrl} alt={creator.name} /> : <div>{creator.name[0]}</div>}
+                    <div>
+                      <strong>{creator.name}</strong>
+                      <span>{getCreatorLocation(creator)} · {creator.followers || '粉丝待补'} · {creator.quote || '报价待补'}</span>
+                      <small>{getCreatorXhsId(creator)}</small>
+                    </div>
+                  </div>
+                  <div className="creator-audit-match">
+                    <strong style={{ color: getScoreColor(match.matchScore) }}>{match.matchScore}%</strong>
+                    <Badge variant={match.matchScore >= 85 ? 'green' : match.matchScore >= 70 ? 'blue' : match.matchScore >= 55 ? 'amber' : 'red'}>{match.tier}</Badge>
+                    <span>{tier.label} · {creator.baseScore}分</span>
+                  </div>
+                  <div className="creator-audit-reason">
+                    <p>{match.reason}</p>
+                    <div>
+                      {match.matchedSignals.slice(0, 3).map(item => <span className="tag" key={item}>{item}</span>)}
+                    </div>
+                  </div>
+                  <div className="creator-audit-actions">
+                    <button className="btn btn-sm btn-secondary" onClick={(event) => { event.stopPropagation(); collectForCreators([creator], creator.name); }} disabled={busy}>
+                      <FileText size={13} />补采
+                    </button>
+                    <button className="btn btn-sm btn-ghost" onClick={(event) => { event.stopPropagation(); setActiveId(creator.id); }}>
+                      <Eye size={13} />详情
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+
+        <aside className="creator-audit-detail">
+          {activeRow ? (
+            <>
+              <div className="creator-audit-detail-head">
+                <div>
+                  <span className="creator-audit-eyebrow">Match Detail</span>
+                  <h3>{activeRow.creator.name}</h3>
+                  <p>{getCreatorIntro(activeRow.creator)}</p>
+                </div>
+                <div className="creator-audit-detail-score" style={{ color: getScoreColor(activeRow.match.matchScore) }}>
+                  {activeRow.match.matchScore}%
+                </div>
+              </div>
+
+              <div className="creator-audit-standard-strip">
+                {(criteria.hardFilters.length ? criteria.hardFilters : ['达人性别/人设匹配', '内容场景匹配', '合作笔记表现']).slice(0, 4).map(item => (
+                  <span key={item}>{item}</span>
+                ))}
+              </div>
+
+              <div className="creator-audit-note-grid">
+                {activeRow.match.noteCases.slice(0, 6).map((note, index) => (
+                  <div className="creator-audit-note" key={`${note.title}-${index}`}>
+                    <div className="creator-audit-note-cover">
+                      {note.coverUrl ? <img src={note.coverUrl} alt={note.title} /> : <span>{note.brand.slice(0, 2)}</span>}
+                      {note.promoted && <Badge variant="green">符合</Badge>}
+                    </div>
+                    <div className="creator-audit-note-body">
+                      <strong>{note.title}</strong>
+                      <span>{note.brand} · {note.publishedAt || '时间待补'}</span>
+                      <div>
+                        {note.readCount && <em>读 {compactNumber(note.readCount)}</em>}
+                        {note.likeCount && <em>赞 {compactNumber(note.likeCount)}</em>}
+                        {note.saveCount && <em>藏 {compactNumber(note.saveCount)}</em>}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="creator-audit-analysis">
+                <div>
+                  <h4>维度拆解</h4>
+                  {activeRow.creator.scores ? Object.entries(activeRow.creator.scores).map(([key, value]) => (
+                    <div className="creator-audit-dim" key={key}>
+                      <span>{scoreDimLabels[key] || key}</span>
+                      <div><i style={{ width: `${Math.max(0, Math.min(100, Number(value) || 0))}%`, background: getScoreColor(Number(value) || 0) }} /></div>
+                      <strong>{value}</strong>
+                    </div>
+                  )) : <p>待重新匹配后生成维度拆解。</p>}
+                </div>
+                <div>
+                  <h4>命中与风险</h4>
+                  <div className="creator-audit-chip-list">
+                    {activeRow.match.matchedSignals.map(item => <span className="tag" key={item}>{item}</span>)}
+                    {activeRow.match.riskSignals.map(item => <span className="tag creator-audit-risk" key={item}>{item}</span>)}
+                  </div>
+                </div>
+              </div>
+
+              <div className="creator-audit-detail-actions">
+                <button className="btn btn-primary" onClick={() => updateReview(activeRow.creator, '已通过', `审号通过，匹配度 ${activeRow.match.matchScore}%`)}>
+                  <UserCheck size={14} />通过
+                </button>
+                <button className="btn btn-secondary" onClick={() => updateReview(activeRow.creator, '备选', `审号备选，匹配度 ${activeRow.match.matchScore}%`)}>
+                  <Bookmark size={14} />备选
+                </button>
+                <button className="btn btn-danger" onClick={() => updateReview(activeRow.creator, '已驳回', `审号驳回，匹配度 ${activeRow.match.matchScore}%`)}>
+                  <UserX size={14} />驳回
+                </button>
+                {getPgyUrl(activeRow.creator) && (
+                  <a className="btn btn-secondary" href={getPgyUrl(activeRow.creator)} target="_blank" rel="noreferrer">
+                    <ExternalLink size={14} />蒲公英
+                  </a>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="creator-audit-empty">暂无达人</div>
+          )}
+        </aside>
+      </div>
+    </div>
+  );
+}
+
 // ==================== 项目达人池 ====================
 
 function ScorePreviewTab({ project, screeningStatus, onCollectDetails }) {
@@ -2886,9 +3340,23 @@ function ScorePreviewTab({ project, screeningStatus, onCollectDetails }) {
                     const xhsId = getCreatorXhsId(creator);
                     const intro = getCreatorIntro(creator);
                     const tags = getCreatorTags(creator);
+                    const tagGroups = getCreatorTagGroups(creator);
+                    const followup = getCreatorFollowupInfo(creator, stage);
+                    const recommendation = getCreatorRecommendation(creator, stage);
                     const platformMark = String(creator.type || '达').replace(/[\/\s].*$/, '').slice(0, 2);
                     const pgyUrl = getPgyUrl(creator);
                     const collectedAt = getCreatorCollectedAt(creator);
+                    const renderTag = (item, group) => (
+                      <button
+                        type="button"
+                        className={`tag creator-pool-tag creator-pool-tag-${group} ${activeTagFilter === item ? 'is-active' : ''}`}
+                        key={`${group}-${item}`}
+                        onClick={() => handleTagFilter(item)}
+                        title={`筛选${item}标签达人`}
+                      >
+                        {item}
+                      </button>
+                    );
                     return (
                       <article key={creator.id} className="creator-pool-card">
                         <div className="creator-pool-profile">
@@ -2920,41 +3388,48 @@ function ScorePreviewTab({ project, screeningStatus, onCollectDetails }) {
                               <span className="creator-pool-location">{location}</span>
                               <Badge variant="neutral">{category}</Badge>
                             </div>
-                            <div className="creator-pool-xhs-line">
-                              <span>小红书号：</span>
-                              <strong>{xhsId}</strong>
-                              <Copy size={13} />
+                            <div className="creator-pool-identity-row">
+                              <span>小红书号：<strong>{xhsId}</strong><Copy size={13} /></span>
+                              <span>{creator.followers} 粉丝</span>
+                              <span>{creator.quote} 报价</span>
+                              <span>{formatDateLabel(collectedAt)} 采集</span>
                             </div>
                             <div className="creator-pool-intro">{intro}</div>
                           </div>
                           <div className="creator-pool-score-panel">
                             <div className="creator-pool-score" style={{ color: getScoreColor(creator.baseScore) }}>{creator.baseScore}</div>
                             <span>{tier.label}</span>
+                            <strong>{recommendation}</strong>
                           </div>
                         </div>
 
                         <div className="creator-pool-card-meta">
-                          <span className="creator-pool-stat"><strong>{creator.followers}</strong><em>粉丝</em></span>
-                          <span className="creator-pool-stat"><strong>{creator.quote}</strong><em>报价</em></span>
-                          <span className="creator-pool-stat"><strong>{formatDateLabel(collectedAt)}</strong><em>采集时间</em></span>
                           <Badge variant={tier.variant}>{tier.text}</Badge>
                           <Badge variant={getReviewVariant(creator.review)}>{creator.review || '待审核'}</Badge>
+                          <span className="creator-pool-followup-pill">{followup.status}</span>
+                          <span className="creator-pool-followup-pill">负责人 {followup.owner}</span>
+                          <span className="creator-pool-followup-pill">最近 {followup.lastAt}</span>
                         </div>
 
-                        <div className="creator-pool-risk-row">
-                          {tags.length
-                            ? tags.map(item => (
-                              <button
-                                type="button"
-                                className={`tag creator-pool-tag ${activeTagFilter === item ? 'is-active' : ''}`}
-                                key={item}
-                                onClick={() => handleTagFilter(item)}
-                                title={`筛选${item}标签达人`}
-                              >
-                                {item}
-                              </button>
-                            ))
-                            : <span className="creator-pool-safe">暂无明显风险</span>}
+                        <div className="creator-pool-tag-groups">
+                          <div>
+                            <span>人设</span>
+                            <div>{tagGroups.persona.length ? tagGroups.persona.map(item => renderTag(item, 'persona')) : <em>待补人设</em>}</div>
+                          </div>
+                          <div>
+                            <span>内容</span>
+                            <div>{tagGroups.content.length ? tagGroups.content.map(item => renderTag(item, 'content')) : <em>待补内容</em>}</div>
+                          </div>
+                          <div>
+                            <span>数据</span>
+                            <div>{tagGroups.metric.length ? tagGroups.metric.map(item => renderTag(item, 'metric')) : <em>待补数据</em>}</div>
+                          </div>
+                          {(tagGroups.risk.length || !tags.length) && (
+                            <div className="creator-pool-risk-group">
+                              <span>风险</span>
+                              <div>{tagGroups.risk.length ? tagGroups.risk.map(item => renderTag(item, 'risk')) : <em className="creator-pool-safe">暂无明显风险</em>}</div>
+                            </div>
+                          )}
                         </div>
 
                         <div className="creator-pool-actions">
@@ -4156,6 +4631,7 @@ function ScreeningDashboard({ selectedProjectId: externalSelectedProjectId, onSe
     switch (activeTab) {
       case 'overview': return <OverviewTab project={currentProject} onCollect={handleCollect} onSavePlan={handleSaveScreeningPlan} />;
       case 'screening-review': return <ScreeningReviewTab project={currentProject} screeningStatus={screeningStatus} setScreeningStatus={setScreeningStatus} onReview={handleReview} onRefresh={loadData} onScore={handleScore} onImport={handleImport} onCollect={handleCollect} onCollectDetails={handleCollectDetails} onSavePlan={handleSaveScreeningPlan} onTabChange={handleTabChange} />;
+      case 'creator-audit': return <CreatorAuditTab project={currentProject} screeningStatus={screeningStatus} setScreeningStatus={setScreeningStatus} onCollectDetails={handleCollectDetails} onScore={handleScore} onReview={handleReview} onRefresh={loadData} onTabChange={handleTabChange} />;
       case 'score-preview': return <ScorePreviewTab project={currentProject} screeningStatus={screeningStatus} onCollectDetails={handleCollectDetails} />;
       case 'project-setup': return <ProjectSetupTab project={currentProject} feishuConfig={feishuConfig} feishuFields={feishuFields} feishuTables={feishuTables} onSaveProject={handleSaveProject} onSaveScreeningPlan={handleSaveScreeningPlan} onSaveFeishu={handleSaveFeishu} onTestFeishu={handleTestFeishu} onLoadTables={handleLoadTables} onLoadFields={handleLoadFields} onWriteBack={handleWriteBack} />;
       case 'audit-log': return <AuditLogTab project={currentProject} />;
