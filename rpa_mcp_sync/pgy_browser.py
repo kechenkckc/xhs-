@@ -218,8 +218,69 @@ PGY_COUNT_RANGE_OPTIONS = ["100万以上", "50万～100万", "10万～50万", "1
 PGY_NOTE_COUNT_RANGE_OPTIONS = ["5万以上", "1万～5万", "0.5万～1万", "0.1万～0.5万"]
 PGY_INTERACTION_RANGE_OPTIONS = ["2000以上", "1000～2000", "500～1000", "200～500", "100～200"]
 PGY_RATE_RANGE_OPTIONS = ["40%以上", "30%～40%", "20%～30%", "10%～20%", "10%以下"]
-PGY_PRICE_RANGE_OPTIONS = ["0.1万～0.5万", "0.5万～1万", "1万～2万", "2万～5万", "5万以上"]
+PGY_PRICE_RANGE_OPTIONS = ["5万及以上", "1万～5万", "0.5万～1万", "0.1万～0.5万", "0.1万以下"]
 PGY_UNIT_PRICE_OPTIONS = ["0.5以下", "0.5～1.0", "1.0～1.5", "1.5～2.0", "2.0以上"]
+PGY_FAMILY_IDENTITY_GROUPS = [
+    {"label": "家庭角色", "options": ["妈妈", "萌娃", "爸爸", "奶奶"]},
+    {"label": "出镜人关系", "options": ["情侣", "夫妻", "家庭", "闺蜜", "兄弟"]},
+    {"label": "母婴阶段", "options": ["备孕中", "孕期中", "0-6个月", "6-12个月", "1-3岁", "3-6岁", "6-12岁", "12岁以上"]},
+]
+PGY_CAREER_IDENTITY_GROUPS = [
+    {"label": "传统行业", "options": ["工程师", "销售", "HR"]},
+    {"label": "互联网", "options": ["主播", "运营", "产品经理", "程序员"]},
+    {"label": "教育科研", "options": ["学生"]},
+    {"label": "金融法律", "options": ["金融从业者"]},
+    {"label": "企业创业", "options": ["创业者", "品牌创始人", "公益人"]},
+    {"label": "时尚美妆", "options": ["模特", "化妆师", "造型师", "服装设计师", "珠宝设计师", "发型设计师"]},
+    {"label": "食品饮料", "options": ["甜点师", "厨师", "咖啡师", "调酒师"]},
+    {"label": "文化传媒", "options": ["编辑", "记者", "翻译", "作家", "娱评人", "影评人", "乐评人"]},
+    {"label": "医疗健康", "options": ["营养师", "医生", "康复师"]},
+    {"label": "艺术设计", "options": ["摄影师", "插画师", "室内设计师", "画家", "平面设计师", "建筑设计师", "非遗传承人", "涂鸦艺术家", "数字艺术家"]},
+    {"label": "影视娱乐", "options": ["主持人", "导演", "制片人", "编剧", "经纪人", "真人秀嘉宾", "虚拟偶像", "rapper"]},
+    {"label": "运动健身", "options": ["教练", "运动员", "舞蹈老师"]},
+    {"label": "专业服务", "options": ["空乘", "花艺师", "整理师", "民宿主", "育婴师"]},
+]
+PGY_SPECIAL_BACKGROUND_GROUPS = [
+    {"label": "生活背景", "options": ["留学背景", "海外华人", "铲屎官", "孕妈", "独居人群", "外国人", "混血儿"]},
+    {"label": "备考经验", "options": ["考公过来人", "考研过来人", "法考过来人", "注会过来人"]},
+    {"label": "兴趣爱好", "options": ["户外爱好者", "数码爱好者", "手账爱好者", "二次元人群", "汉服爱好者", "手办爱好者", "模型爱好者", "街舞爱好者", "骑行爱好者", "飞盘爱好者", "书法爱好者"]},
+]
+PGY_AUDIENCE_20_GROUPS = [
+    {"label": "自在户外", "options": ["挑战极限者", "野趣探索家", "短逃离自愈派", "心灵远行客", "户外显眼包", "户外欢聚团"]},
+    {"label": "自由畅行", "options": ["都市漫游家", "静奢新贵", "爆改浓人", "出行精算师"]},
+    {"label": "运动焕活", "options": ["轻松健体派", "线条雕塑家", "寻乐运动派", "好动局内人", "自我超越者", "身心觉察师"]},
+    {"label": "孕育学习", "options": ["科研育儿党", "松驰爸妈", "友伴式父母", "积进式父母", "好孕预备役", "稳孕选手"]},
+    {"label": "娱乐放松", "options": ["放松乐子人", "沉浸式“戏”迷", "娱乐交友派", "真爱忠粉"]},
+    {"label": "优奢享法", "options": ["奢派生活家", "悦己摘星人", "潮奢风格家", "静奢知识分子", "奢品入门人", "奢交体面人"]},
+    {"label": "养身韧体", "options": ["爆肝青年", "高能青年", "娇宠彼得潘", "高消耗中年", "稳定守成中年", "探索人生的中年玩家", "熟龄悦己中年", "活力夕阳红"]},
+    {"label": "虚拟人生", "options": ["审美收藏控", "高能“偷闲”客", "沉浸式畅“游”人", "竞技大神", "通关小机灵", "联结小“玩伴”", "“游”文化信徒"]},
+    {"label": "美力加成", "options": ["美养佳人", "风格日抛党", "精养奢美族", "变美练习生", "气场精英", "美研尖子生"]},
+    {"label": "心灵奇旅", "options": ["亲密学习父母", "恋爱修炼家", "实用信徒", "野生玄学家", "精进修心客"]},
+    {"label": "文艺沉浸", "options": ["情绪捕手", "美学鉴赏家", "规律钻研党", "热门玩家", "世界狂想家"]},
+    {"label": "数智未来", "options": ["效能领航员", "灵感创想客", "未来原住民", "品质感官控", "数码时髦精"]},
+    {"label": "舌尖盛宴", "options": ["好味饕客", "精算稳妥人", "食饮养生族", "吃喝欢聚派", "逐潮尝新客", "拓圈商务客", "专味信徒", "“怪味”猎手", "“乐养”零食客", "囤粮“小馋猫”", "生活“增味”家", "“纵情”高压党"]},
+    {"label": "看世界", "options": ["轻松舒心派", "热门追踪党", "同心群游党", "求索漫旅人", "野地探险家", "圣地巡礼者", "追爱忠粉", "山水避世客"]},
+    {"label": "家有萌宠", "options": ["自然“动物学家”", "同行伙伴", "宠溺“爸妈”", "爱宠观赏派", "流浪动物保护党"]},
+    {"label": "家生活", "options": ["游牧青年", "筑巢青年", "全能生活家", "居家策展人"]},
+    {"label": "发现附近", "options": ["下楼享受派", "社区玩咖", "市井“街溜子”", "圈层专研人", "“速联”社交狂", "举家“撒欢”党", "城郊出走族"]},
+    {"label": "成长进阶", "options": ["争渡“上岸”人", "资格证“卷王”", "进阶专业精英", "职场闯关人", "兴趣研学家", "精英培优家", "“社会人”教练", "因材施教师", "尽责陪练员"]},
+    {"label": "时尚态度", "options": ["追新之乐", "弄潮先锋", "IP狂人", "街头潮客", "三坑玩家", "质感男士", "社会新鲜人", "气场大女主"]},
+]
+PGY_SKILLED_CONTENT_GROUPS = [
+    {"label": "形式", "options": ["vlog", "探店", "测评", "ootd", "合集", "plog", "开箱", "教程", "成分解析", "彩妆试色", "仿妆", "沉浸式"]},
+    {"label": "风格", "options": ["韩系", "日系", "欧美风", "氛围感", "纯欲", "甜酷", "复古", "高级感", "校园风", "中性风"]},
+    {"label": "生活方式", "options": ["职场生活", "自律生活", "露营徒步", "极简主义", "低脂低卡"]},
+    {"label": "肤质肤色", "options": ["油皮", "干皮", "混合肌", "敏感肌", "痘痘肌", "瑕疵皮", "白皮", "黄皮"]},
+    {"label": "皮肤养护", "options": ["保湿补水", "美白", "淡斑", "祛黄", "抗氧化", "抗老", "祛皱", "抗炎", "修复", "祛痘祛闭口", "隔离防晒", "控油", "眼部护理"]},
+]
+PGY_CONTENT_SUBJECT_GROUPS = [
+    {"label": "汽车特色", "options": ["沉浸式开车", "汽车美图"]},
+    {"label": "通用", "options": ["大字报", "干货分享", "街头采访", "口播", "长文", "知识科普", "变装", "访谈", "梗图", "好物分享", "幽默搞笑", "挑战"]},
+]
+PGY_INDUSTRY_PORTRAIT_OPTIONS = ["家居家装", "日化家清", "多行业适用", "教育培训", "母婴", "汽车出行", "服饰鞋包", "美妆个护", "出行旅游", "珠宝配饰", "文玩娱乐", "奢侈品", "食品饮料", "到店综合", "宠物", "3C数码", "互联网", "家用电器", "运动户外", "本地生活", "行业通用人群", "家具", "家居百货", "灯饰光源", "装修设计与工程服务", "家居建材零售", "智能家居", "家装主材", "场景", "风格", "产品", "卧室兴趣人群", "餐厅兴趣人群", "客厅场景人群", "阳台兴趣用户", "厨房兴趣人群", "儿童房兴趣人群", "自我充电卧室", "多边形卧室", "高敏感卧室", "客厅兴趣人群", "浴室兴趣人群", "玄关兴趣人群", "造型卧室"]
+PGY_CONSUMPTION_BEHAVIOR_GROUPS = [
+    {"label": "预估车主作者", "options": ["Porsche", "ORA", "MINI", "MAZDA", "BYD", "萤火虫", "一汽红旗", "一汽奥迪", "小鹏", "五菱", "蔚来", "特斯拉", "坦克", "斯巴鲁", "上汽大众", "梅赛德斯-奔驰", "路虎", "领克", "铃木", "理想", "雷克萨斯", "兰博基尼", "捷途", "江铃福特", "极越", "极氪", "吉普", "吉利银河", "哈弗", "广汽丰田", "福特", "宾利", "宝马", "奥迪", "阿维塔"]},
+]
 
 
 def _extract_brands_after_labels(brief: str, labels: list[str]) -> list[str]:
@@ -285,19 +346,22 @@ PGY_FILTER_CATALOG = [
     {
         "field": "家庭身份",
         "control_type": "checkbox_popover",
-        "options": ["家庭角色", "出镜人关系", "母婴阶段", "妈妈", "萌娃", "爸爸", "奶奶"],
+        "option_groups": PGY_FAMILY_IDENTITY_GROUPS,
+        "options": [value for group in PGY_FAMILY_IDENTITY_GROUPS for value in group["options"]],
         "notes": "打开后是多选弹层，需要点确定。",
     },
     {
         "field": "职业身份",
         "control_type": "checkbox_popover",
-        "options": ["传统行业", "互联网", "教育科研", "金融法律", "企业创业", "时尚美妆", "食品饮料", "文化传媒", "医疗健康", "艺术设计", "影视娱乐", "运动健身", "专业服务", "工程师", "销售", "HR"],
+        "option_groups": PGY_CAREER_IDENTITY_GROUPS,
+        "options": [value for group in PGY_CAREER_IDENTITY_GROUPS for value in group["options"]],
         "notes": "打开后是多选弹层，需要点确定。",
     },
     {
         "field": "特色背景",
         "control_type": "checkbox_popover",
-        "options": ["生活背景", "备考经验", "兴趣爱好", "留学背景", "海外华人", "铲屎官", "孕妈", "独居人群", "外国人", "混血儿"],
+        "option_groups": PGY_SPECIAL_BACKGROUND_GROUPS,
+        "options": [value for group in PGY_SPECIAL_BACKGROUND_GROUPS for value in group["options"]],
         "notes": "打开后是多选弹层，需要点确定。",
     },
     {
@@ -314,6 +378,26 @@ PGY_FILTER_CATALOG = [
         "notes": "打开后先选国家，国内城市需要继续展开二级选项。",
     },
     {
+        "field": "二十大人群",
+        "control_type": "checkbox_popover",
+        "option_groups": PGY_AUDIENCE_20_GROUPS,
+        "options": [value for group in PGY_AUDIENCE_20_GROUPS for value in group["options"]],
+        "notes": "页面显示为“新 二十大人群”，打开后是两列级联多选，需要点确定。",
+    },
+    {
+        "field": "行业特色画像",
+        "control_type": "checkbox_popover",
+        "options": PGY_INDUSTRY_PORTRAIT_OPTIONS,
+        "notes": "页面显示为“新 行业特色画像”，打开后是行业级联多选；选项会随行业列继续展开。",
+    },
+    {
+        "field": "预估消费行为",
+        "control_type": "checkbox_popover",
+        "option_groups": PGY_CONSUMPTION_BEHAVIOR_GROUPS,
+        "options": [value for group in PGY_CONSUMPTION_BEHAVIOR_GROUPS for value in group["options"]],
+        "notes": "页面显示为“新 预估消费行为”，当前可在汽车/预估车主作者下选择品牌。",
+    },
+    {
         "field": "签约情况",
         "control_type": "dropdown_single",
         "options": ["不限", "个人博主", "机构博主"],
@@ -322,8 +406,16 @@ PGY_FILTER_CATALOG = [
     {
         "field": "擅长内容",
         "control_type": "checkbox_popover",
-        "options": ["形式", "风格", "生活方式", "肤质肤色", "皮肤养护", "vlog", "探店", "测评", "ootd", "合集", "plog", "开箱", "教程", "成分解析", "彩妆试色", "仿妆", "沉浸式"],
+        "option_groups": PGY_SKILLED_CONTENT_GROUPS,
+        "options": [value for group in PGY_SKILLED_CONTENT_GROUPS for value in group["options"]],
         "notes": "打开后是多选弹层，需要点确定。",
+    },
+    {
+        "field": "内容题材",
+        "control_type": "checkbox_popover",
+        "option_groups": PGY_CONTENT_SUBJECT_GROUPS,
+        "options": [value for group in PGY_CONTENT_SUBJECT_GROUPS for value in group["options"]],
+        "notes": "页面显示为“新 内容题材”，当前汽车类目下包含汽车特色与通用题材。",
     },
     {
         "field": "粉丝量",
@@ -540,6 +632,93 @@ def _number_from_text(value: str) -> float | None:
         return float(text) * multiplier
     except ValueError:
         return None
+
+
+def _format_filter_number(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        number = float(str(value).replace(",", "").replace("，", ""))
+        return str(int(number)) if number.is_integer() else f"{number:g}"
+    except Exception:
+        return str(value)
+
+
+def _range_numbers_from_text(value: str) -> tuple[float | None, float | None]:
+    text = str(value or "")
+    text = text.split("：", 1)[-1]
+    parts = [part.strip() for part in re.split(r"～|~|至|到|-", text) if part.strip()]
+    if len(parts) >= 2:
+        return _number_from_text(parts[0]), _number_from_text(parts[1])
+    if re.search(r"(?:及以上|以上)$", text.strip()):
+        return _number_from_text(text), None
+    if re.search(r"(?:及以下|以下)$", text.strip()):
+        return None, _number_from_text(text)
+    max_match = re.search(r"[≤<]\s*([0-9][0-9,，]*(?:\.\d+)?\s*(?:万|w|W)?)", text)
+    if max_match:
+        return None, _number_from_text(max_match.group(1))
+    min_match = re.search(r"[≥>]\s*([0-9][0-9,，]*(?:\.\d+)?\s*(?:万|w|W)?)", text)
+    if min_match:
+        return _number_from_text(min_match.group(1)), None
+    return None, None
+
+
+def _split_filter_values(value: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[;；\n]+", str(value or "")) if part.strip()]
+
+
+def _subfield_names_from_item(item: dict[str, Any], default: str | list[str] = "图文笔记") -> list[str]:
+    raw_values: list[Any] = []
+    for key in ("sub_fields", "subFields"):
+        value = item.get(key)
+        if isinstance(value, list):
+            raw_values.extend(value)
+        elif value:
+            raw_values.append(value)
+    for key in ("sub_field", "subField"):
+        if item.get(key):
+            raw_values.append(item.get(key))
+    names: list[str] = []
+    for raw in raw_values:
+        for part in re.split(r"[、,，/;；|]+", str(raw)):
+            part = part.strip()
+            if part:
+                names.append(part)
+    text = str(item.get("value") or "")
+    if not names:
+        if "图文笔记" in text:
+            names.append("图文笔记")
+        if "视频笔记" in text:
+            names.append("视频笔记")
+    if not names and default:
+        if isinstance(default, list):
+            names.extend(default)
+        else:
+            names.append(default)
+    return list(dict.fromkeys(names))
+
+
+def _range_for_subfield(item: dict[str, Any], sub_field: str) -> tuple[Any, Any]:
+    ranges = item.get("sub_ranges") or item.get("subRanges") or {}
+    if isinstance(ranges, dict):
+        config = ranges.get(sub_field)
+        if isinstance(config, dict):
+            return config.get("min", item.get("min", "")), config.get("max", item.get("max", ""))
+        if isinstance(config, (list, tuple)) and len(config) >= 2:
+            return config[0], config[1]
+    text = str(item.get("value") or "")
+    for segment in _split_filter_values(text):
+        if sub_field in segment:
+            parsed_min, parsed_max = _range_numbers_from_text(segment)
+            return (
+                item.get("min", parsed_min if parsed_min is not None else 0),
+                item.get("max", parsed_max if parsed_max is not None else ""),
+            )
+    parsed_min, parsed_max = _range_numbers_from_text(text)
+    return (
+        item.get("min", parsed_min if parsed_min is not None else 0),
+        item.get("max", parsed_max if parsed_max is not None else ""),
+    )
 
 
 def _ratio_from_text(value: str) -> float | None:
@@ -816,6 +995,191 @@ def _extract_note_cases(lines: list[str]) -> list[dict[str, Any]]:
         else:
             index += 1
     return cases
+
+
+def _compact_ratio(value: float) -> str:
+    if value >= 10:
+        return f"{value:.0f}"
+    if value >= 1:
+        return f"{value:.1f}".rstrip("0").rstrip(".")
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _note_interaction_count(case: dict[str, Any]) -> float | None:
+    total = 0.0
+    found = False
+    for key in ["like_count", "save_count", "comment_count", "share_count"]:
+        value = _number_from_text(str(case.get(key) or ""))
+        if value is None:
+            continue
+        total += value
+        found = True
+    return total if found else None
+
+
+def _case_title_key(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip().lower()
+
+
+def _extract_note_case_dom_assets(page: Any) -> list[dict[str, Any]]:
+    try:
+        assets = page.evaluate(
+            """
+            () => {
+              const normalize = value => String(value || '').replace(/\\s+/g, '\\n').trim();
+              const inline = value => String(value || '').replace(/\\s+/g, ' ').trim();
+              const visible = el => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+              };
+              const absolutize = value => {
+                if (!value) return '';
+                try { return new URL(value, location.href).href; } catch { return value; }
+              };
+              const imageFor = node => {
+                const img = node.querySelector('img');
+                if (img?.currentSrc || img?.src) return absolutize(img.currentSrc || img.src);
+                for (const el of [node, ...Array.from(node.querySelectorAll('*'))]) {
+                  const style = window.getComputedStyle(el);
+                  const bg = style.backgroundImage || '';
+                  const match = bg.match(/url\\(["']?([^"')]+)["']?\\)/);
+                  if (match?.[1]) return absolutize(match[1]);
+                }
+                return '';
+              };
+              const linkFor = node => {
+                const anchors = [
+                  node.closest?.('a'),
+                  ...Array.from(node.querySelectorAll('a')),
+                ].filter(Boolean);
+                const preferred = anchors.find(anchor => /xiaohongshu\\.com\\/(?:explore|discovery|search_result|user\\/profile)/.test(anchor.href || ''))
+                  || anchors.find(anchor => anchor.href && !/javascript:void|^#$/.test(anchor.getAttribute('href') || ''));
+                return preferred ? absolutize(preferred.href) : '';
+              };
+              const wrappers = Array.from(document.querySelectorAll('.note-case-wrapper, [class*="note-case"], [class*="case-wrapper"], section, div'))
+                .filter(visible)
+                .filter(el => (el.innerText || '').includes('笔记案例'));
+              const wrapper = wrappers.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
+              if (!wrapper) return [];
+              let candidates = Array.from(wrapper.querySelectorAll('article, li, a, [class*="card"], [class*="item"], [class*="note"]'))
+                .filter(visible)
+                .map(node => ({ node, text: normalize(node.innerText || node.textContent || '') }))
+                .filter(item => item.text.includes('阅读') && item.text.includes('点赞') && item.text.includes('收藏') && item.text.includes('发布时间'))
+                .filter(item => item.text.length >= 20 && item.text.length <= 900);
+              candidates = candidates.filter(item => !candidates.some(other => other.node !== item.node && item.node.contains(other.node) && other.text.length < item.text.length));
+              const seen = new Set();
+              return candidates.map((item, index) => {
+                const lines = item.text.split('\\n').map(line => line.trim()).filter(Boolean);
+                const title = lines.find((line, i) => i > 0 && !['阅读', '点赞', '收藏', '发布时间', '含推广流量'].includes(line) && !/^\\d+$/.test(line)) || '';
+                const payload = {
+                  index,
+                  title,
+                  raw_text: inline(item.text),
+                  cover_url: imageFor(item.node),
+                  note_url: linkFor(item.node),
+                  source_url: location.href,
+                };
+                const key = `${payload.title}|${payload.cover_url}|${payload.note_url}|${payload.raw_text.slice(0, 80)}`;
+                if (seen.has(key)) return null;
+                seen.add(key);
+                return payload;
+              }).filter(Boolean);
+            }
+            """
+        )
+    except Exception:
+        return []
+    return [item for item in assets if isinstance(item, dict)]
+
+
+def _merge_note_case_assets(cases: list[dict[str, Any]], assets: list[dict[str, Any]], source_url: str = "") -> list[dict[str, Any]]:
+    if not cases:
+        return []
+    unused = list(enumerate(assets or []))
+    merged: list[dict[str, Any]] = []
+    for index, case in enumerate(cases):
+        title_key = _case_title_key(case.get("title"))
+        match_pos = next(
+            (
+                pos
+                for pos, (_, asset) in enumerate(unused)
+                if title_key
+                and (
+                    title_key in _case_title_key(asset.get("title") or asset.get("raw_text"))
+                    or _case_title_key(asset.get("title") or asset.get("raw_text")) in title_key
+                )
+            ),
+            None,
+        )
+        if match_pos is None:
+            match_pos = next((pos for pos, (asset_index, _) in enumerate(unused) if asset_index == index), None)
+        asset = unused.pop(match_pos)[1] if match_pos is not None else {}
+        next_case = {**case}
+        for source_key, target_key in [
+            ("cover_url", "cover_url"),
+            ("note_url", "note_url"),
+            ("source_url", "source_url"),
+        ]:
+            if asset.get(source_key) and not next_case.get(target_key):
+                next_case[target_key] = asset[source_key]
+        if source_url and not next_case.get("source_url"):
+            next_case["source_url"] = source_url
+        merged.append(next_case)
+    return merged
+
+
+def _annotate_note_cases_with_traffic_reference(detail: dict[str, Any]) -> dict[str, Any]:
+    raw = detail.get("raw_payload")
+    if not isinstance(raw, dict):
+        return detail
+    read_median = detail.get("cooperation_read_median") or detail.get("daily_read_median")
+    interaction_median = detail.get("cooperation_interaction_median") or detail.get("daily_interaction_median")
+    reference_source = "cooperation" if detail.get("cooperation_read_median") or detail.get("cooperation_interaction_median") else "daily"
+    read_median = _number_from_text(str(read_median or ""))
+    interaction_median = _number_from_text(str(interaction_median or ""))
+    if not read_median and not interaction_median:
+        return detail
+
+    def annotate(case: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(case, dict):
+            return case
+        next_case = {**case}
+        comparisons: list[str] = []
+        is_clear = False
+        read_count = _number_from_text(str(next_case.get("read_count") or next_case.get("readCount") or ""))
+        if read_count is not None and read_median:
+            ratio = read_count / read_median
+            next_case["read_vs_median"] = round(ratio, 3)
+            comparisons.append(f"阅读为{_compact_ratio(ratio)}倍")
+            is_clear = is_clear or ratio >= 1.5 or ratio <= 0.67
+        interaction_count = _note_interaction_count(next_case)
+        if interaction_count is not None and interaction_median:
+            ratio = interaction_count / interaction_median
+            next_case["interaction_count"] = interaction_count
+            next_case["interaction_vs_median"] = round(ratio, 3)
+            comparisons.append(f"互动为{_compact_ratio(ratio)}倍")
+            is_clear = is_clear or ratio >= 1.5 or ratio <= 0.67
+        if comparisons:
+            next_case["traffic_median_reference"] = {
+                "source": reference_source,
+                "read_median": read_median,
+                "interaction_median": interaction_median,
+            }
+            next_case["traffic_comparison"] = "，".join(comparisons)
+            next_case["has_clear_median_contrast"] = is_clear
+        return next_case
+
+    for key in ["note_cases", "recent_note_cases", "recent_notes", "cooperation_note_cases", "notes"]:
+        if isinstance(raw.get(key), list):
+            raw[key] = [annotate(case) for case in raw[key]]
+    pages = raw.get("cooperation_note_case_pages")
+    if isinstance(pages, list):
+        for page in pages:
+            if isinstance(page, dict) and isinstance(page.get("cases"), list):
+                page["cases"] = [annotate(case) for case in page["cases"]]
+    detail["raw_payload"] = raw
+    return detail
 
 
 def _value_after_label(lines: list[str], label: str) -> str:
@@ -1242,7 +1606,7 @@ def _collect_note_case_pages(page: Any, max_cases: int = 24) -> dict[str, Any]:
                 break
         text = _container_text(page, ".note-case-wrapper", ["笔记案例"], "first") or _body_text(page)
         lines = _visible_text_lines(text)
-        cases = _extract_note_cases(lines)
+        cases = _merge_note_case_assets(_extract_note_cases(lines), _extract_note_case_dom_assets(page), page.url)
         pages.append({"page": page_no, "count": len(cases), "cases": cases})
         before = len(collected)
         for case in cases:
@@ -1447,15 +1811,42 @@ def _hard_filters_to_pgy_filters(hard_filters: list[dict[str, Any]]) -> list[dic
         pgy_field = str(item.get("pgyField") or "")
         text = f"{field} {pgy_field} {value}".lower()
         reason = f"硬性条件：{field}{item.get('condition') or ''}{value}"
+        value_control = str(item.get("valueControl") or "")
+        sub_field = str(item.get("subField") or "")
         if pgy_field in {"营销目标", "博主类目", "粉丝量", "粉丝年龄", "家庭身份", "职业身份", "特色背景", "母婴阶段", "地域", "粉丝地域"} and value:
-            add(pgy_field, value, reason, control_type=str(item.get("valueControl") or "checkbox_popover"))
+            if pgy_field == "粉丝年龄":
+                age_values = []
+                if any(keyword in value for keyword in ["35", "34", "40", "家长", "父母", ">44", "44岁以上"]):
+                    age_values.append("35～44 占比高")
+                    if ">44" in value or "44岁以上" in value or "35岁以上" in value:
+                        age_values.append(">44 占比高")
+                for age_value in age_values or [value]:
+                    add(pgy_field, age_value, reason, control_type="dropdown")
+                continue
+            if pgy_field == "粉丝量" and "、" in value:
+                for part in [part.strip() for part in re.split(r"[、,，/]+", value) if part.strip()]:
+                    add(pgy_field, part, reason, control_type="preset_or_number_range")
+                continue
+            add(pgy_field, value, reason, control_type=value_control or "checkbox_popover")
             continue
         if pgy_field in {"合作报价", "预估阅读单价", "预估互动单价", "阅读中位数", "互动中位数", "曝光中位数"} and value:
-            add(pgy_field, value, reason, control_type="subfield_preset_or_number_range", sub_field=str(item.get("subField") or "图文笔记"))
+            if pgy_field == "合作报价":
+                max_quote = _threshold_from_text(value, "quote", 20000) or 20000
+                add(pgy_field, f"图文笔记：0.1万～{max_quote / 10000:g}万", reason, control_type="subfield_preset_or_number_range", sub_field=sub_field or "图文笔记", min=1000, max=max_quote)
+                continue
+            if pgy_field == "预估阅读单价":
+                cpc_max = _threshold_from_text(value, "cpc", 2) or _threshold_from_text(value, "generic", 2) or 2
+                add(pgy_field, f"{sub_field or '图文笔记阅读单价'}≤{cpc_max:g}", reason, control_type="subfield_preset_or_number_range", sub_field=sub_field or "图文笔记阅读单价", max=cpc_max)
+                continue
+            if pgy_field == "预估互动单价":
+                cpe_max = _threshold_from_text(value, "cpe", 20) or _threshold_from_text(value, "generic", 20) or 20
+                add(pgy_field, f"{sub_field or '图文笔记互动单价'}≤{cpe_max:g}", reason, control_type="subfield_preset_or_number_range", sub_field=sub_field or "图文笔记互动单价", max=cpe_max)
+                continue
+            add(pgy_field, value, reason, control_type="subfield_preset_or_number_range", sub_field=sub_field or "图文笔记")
             continue
         if any(keyword in text for keyword in ["报价", "预算", "合作价格", "平台价格"]):
             max_quote = _threshold_from_text(value, "quote", 20000) or 20000
-            add("合作报价", f"图文笔记：0.1万～{max_quote / 10000:g}万", reason, control_type="subfield_preset_or_number_range", sub_field="图文笔记", max=max_quote)
+            add("合作报价", f"图文笔记：0.1万～{max_quote / 10000:g}万", reason, control_type="subfield_preset_or_number_range", sub_field="图文笔记", min=1000, max=max_quote)
         if any(keyword in text for keyword in ["35", "34", "粉丝年龄", "宝妈", "家长"]):
             add("粉丝年龄", "35～44 占比高", reason, control_type="dropdown")
         if any(keyword in text for keyword in ["cpc", "cpe", "阅读单价", "互动单价"]):
@@ -1495,9 +1886,35 @@ def _normalize_pgy_filter_item(item: dict[str, Any]) -> dict[str, Any]:
             "pending_detail": "预估互动单价需作为独立条件补充",
         }
     if field == "报价":
-        return {**normalized, "field": "合作报价", "value": "图文笔记：0.1万～2万", "control_type": "subfield_preset_or_number_range", "sub_field": "图文笔记", "max": 20000}
+        return {**normalized, "field": "合作报价", "value": "0.1万～2万", "control_type": "subfield_preset_or_number_range", "sub_field": "", "sub_fields": ["图文笔记", "视频笔记"], "min": 1000, "max": 20000}
+    if field == "合作报价":
+        parsed_min, parsed_max = _range_numbers_from_text(value)
+        sub_names = _subfield_names_from_item(normalized, default=["图文笔记", "视频笔记"])
+        sub_field = sub_names[0] if len(sub_names) == 1 else ""
+        has_explicit_min = normalized.get("min") not in (None, "")
+        has_explicit_max = normalized.get("max") not in (None, "")
+        min_value = normalized.get("min") if has_explicit_min else parsed_min
+        max_value = normalized.get("max") if has_explicit_max else parsed_max
+        if min_value is None and max_value is None:
+            min_value, max_value = 1000, 20000
+        elif min_value is None:
+            min_value = ""
+        elif max_value is None:
+            max_value = ""
+        return {
+            **normalized,
+            "control_type": normalized.get("control_type") or "subfield_preset_or_number_range",
+            "sub_field": sub_field,
+            "sub_fields": sub_names,
+            "min": min_value,
+            "max": max_value,
+        }
     if field == "粉丝年龄" and value in {"35岁以上优先", "35岁以上≥40%"}:
         return {**normalized, "value": "35～44 占比高", "control_type": "dropdown"}
+    if field == "粉丝量":
+        return {**normalized, "control_type": normalized.get("control_type") or "preset_or_number_range"}
+    if field == "粉丝年龄":
+        return {**normalized, "control_type": normalized.get("control_type") or "dropdown"}
     if field == "地域" and "优先" in value:
         return {**normalized, "control_type": "cascade_checkbox_popover", "pending_detail": "需要展开国内城市二级选项"}
     if field == "常规剔除" and value in {"低风险/流量稳定", "规避限流异常", "流量稳定"}:
@@ -1539,11 +1956,12 @@ def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None
     if isinstance(screening_plan, dict) and isinstance(screening_plan.get("pgyCollectionPlan"), dict):
         plan = screening_plan["pgyCollectionPlan"]
         hard_filters = screening_plan.get("collectionHardFilters") or plan.get("hard_filters") or screening_plan.get("hardFilters") or []
-        derived_filters = _hard_filters_to_pgy_filters(hard_filters)
         schemes = plan.get("schemes") or []
         default_filters = plan.get("filters") or []
         if not default_filters and schemes and isinstance(schemes[0], dict):
             default_filters = schemes[0].get("filters") or []
+        active_scheme = bool(plan.get("active_scheme_id"))
+        derived_filters = [] if active_scheme else _hard_filters_to_pgy_filters(hard_filters)
         metrics = plan.get("display_metrics") or PGY_DISPLAY_METRICS
         if PGY_ALL_NON_LIVE_METRICS not in metrics:
             metrics = [PGY_ALL_NON_LIVE_METRICS]
@@ -1641,12 +2059,98 @@ def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None
     }
 
 
+PGY_EMPTY_RESULT_HINTS = [
+    "暂未找到相关博主",
+    "暂未发现相关博主",
+    "试试按行业找博主",
+    "放宽条件才能找到更多的博主",
+    "放宽条件才能找到更多博主",
+    "未发现相关博主",
+    "没有找到相关博主",
+    "暂无相关博主",
+    "暂无数据",
+]
+
+PGY_BROAD_KEEP_FIELDS = {"营销目标", "博主类目"}
+PGY_INVALID_ROW_NAMES = {"暂无数据", "暂无相关博主", "暂未找到相关博主", "暂未发现相关博主", "没有找到相关博主"}
+
+
 def _visible_text_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def _clean_text(value: str) -> str:
     return re.sub(r"\s+", "", value or "")
+
+
+def _page_empty_result_hint(page: Any) -> str:
+    try:
+        text = page.locator("body").inner_text(timeout=2500)
+    except Exception:
+        return ""
+    normalized = _clean_text(text)
+    for hint in PGY_EMPTY_RESULT_HINTS:
+        if hint in normalized:
+            return hint
+    return ""
+
+
+def _relaxed_collection_plan(plan: dict[str, Any], stage: str) -> dict[str, Any] | None:
+    filters = [item for item in plan.get("filters") or [] if isinstance(item, dict)]
+    if not filters:
+        return None
+    if stage == "broad":
+        kept = [item for item in filters if str(item.get("field") or "") in PGY_BROAD_KEEP_FIELDS]
+        if len(kept) == len(filters):
+            return None
+        strategy = "页面无结果，自动放宽为基础类目/目标条件"
+    elif stage == "unfiltered":
+        kept = []
+        strategy = "基础类目/目标仍无结果，清空蒲公英页面筛选后采集，再由本地筛选工作台标记"
+    else:
+        return None
+    removed = [
+        item
+        for item in filters
+        if not any(
+            str(item.get("field") or "") == str(next_item.get("field") or "")
+            and str(item.get("value") or "") == str(next_item.get("value") or "")
+            for next_item in kept
+        )
+    ]
+    return {
+        **plan,
+        "filters": kept,
+        "auto_relaxed": True,
+        "relaxation": {
+            "stage": stage,
+            "strategy": strategy,
+            "original_filter_count": len(filters),
+            "relaxed_filter_count": len(kept),
+            "removed_filters": removed,
+            "kept_filters": kept,
+        },
+    }
+
+
+def _merge_plan_results(base: dict[str, Any], retry: dict[str, Any], relaxation: dict[str, Any]) -> dict[str, Any]:
+    removed_skips = [
+        {**item, "message": relaxation.get("strategy") or "页面无结果，自动放宽该筛选项"}
+        for item in relaxation.get("removed_filters") or []
+    ]
+    return {
+        "applied_filters": retry.get("applied_filters") or [],
+        "skipped_filters": [
+            *(base.get("skipped_filters") or []),
+            *removed_skips,
+            *(retry.get("skipped_filters") or []),
+        ],
+        "selected_metrics": retry.get("selected_metrics") or base.get("selected_metrics") or [],
+        "skipped_metrics": [
+            *(base.get("skipped_metrics") or []),
+            *(retry.get("skipped_metrics") or []),
+        ],
+    }
 
 
 def _is_visible(locator: Any) -> bool:
@@ -1710,28 +2214,67 @@ def _selected_filter_text(page: Any) -> str:
         return ""
 
 
+def _item_selection_value(item: dict[str, Any]) -> str:
+    value = str(item.get("value") or "")
+    sub_field = str(item.get("sub_field") or item.get("subField") or "")
+    if sub_field:
+        for sep in ("：", ":"):
+            prefix = f"{sub_field}{sep}"
+            if value.startswith(prefix):
+                return value[len(prefix):].strip()
+    return value.strip()
+
+
+def _filter_value_candidates(item: dict[str, Any]) -> list[str]:
+    raw_value = str(item.get("value") or "").strip()
+    selection_value = _item_selection_value(item)
+    candidates = [selection_value, raw_value]
+    for value in [selection_value, raw_value]:
+        candidates.extend(PGY_FILTER_ALIASES.get(value) or [])
+    return list(dict.fromkeys([candidate for candidate in candidates if candidate]))
+
+
+def _catalog_option_groups(field: str) -> list[dict[str, Any]]:
+    for catalog_item in PGY_FILTER_CATALOG:
+        if catalog_item.get("field") == field:
+            groups = catalog_item.get("option_groups") or catalog_item.get("optionGroups") or []
+            return groups if isinstance(groups, list) else []
+    return []
+
+
+def _infer_option_group(field: str, value: str) -> str:
+    for group in _catalog_option_groups(field):
+        options = group.get("options") or []
+        if value in options:
+            return str(group.get("label") or "")
+    return ""
+
+
 def _filter_already_selected(page: Any, item: dict[str, str]) -> bool:
     selected_text = _clean_text(_selected_filter_text(page))
     field = _clean_text(item.get("field") or "")
-    value = _clean_text(item.get("value") or "")
-    if not selected_text or not value:
+    values = [_clean_text(candidate) for candidate in _filter_value_candidates(item)]
+    values = [value for value in values if value]
+    if not selected_text or not values:
         return False
-    if value in selected_text:
+    if any(value in selected_text for value in values):
         return True
-    aliases = [_clean_text(alias) for alias in PGY_FILTER_ALIASES.get(item.get("value") or "", [])]
-    return bool(field and field in selected_text and any(alias and alias in selected_text for alias in aliases))
+    return bool(field and field in selected_text and any(value and value in selected_text for value in values))
 
 
 def _parse_row_text(text: str, page_url: str, table_payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
     lines = _visible_text_lines(text)
     if not lines or any("skeleton-block" in line for line in lines):
         return None
+    cleaned_text = _clean_text(text)
+    if any(hint in cleaned_text for hint in PGY_EMPTY_RESULT_HINTS):
+        return None
     stop_words = {"添加合作", "发起邀约", "更多操作"}
     lines = [line for line in lines if line not in {"合作", "\t"}]
     if not lines:
         return None
     nickname = lines[0]
-    if nickname in stop_words or len(nickname) > 60:
+    if nickname in stop_words or nickname in PGY_INVALID_ROW_NAMES or len(nickname) > 60:
         return None
 
     quote_index = next((i for i, line in enumerate(lines) if line in {"¥", "￥"}), -1)
@@ -1779,6 +2322,8 @@ def _parse_row_text(text: str, page_url: str, table_payload: dict[str, Any] | No
     tags = [line for line in profile_lines[2:] if not line.startswith("期待与") and line not in stop_words]
     cooperation_hint = next((line for line in profile_lines if line.startswith("期待与")), "")
     table_payload = table_payload or {}
+    if not any([followers, read_median, interaction_median, table_payload.get("pgy_url"), table_payload.get("xiaohongshu_id")]) and len(lines) <= 3:
+        return None
     raw_payload = {
         "text": text,
         "lines": lines,
@@ -2047,8 +2592,11 @@ def _extract_row_link_fields(row: Any) -> dict[str, Any]:
     try:
         urls = row.evaluate(
             """
-            node => Array.from(node.querySelectorAll('[href], [data-href], [data-url]'))
-              .flatMap(el => [el.href, el.getAttribute('href'), el.getAttribute('data-href'), el.getAttribute('data-url')])
+            node => Array.from(node.querySelectorAll('*'))
+              .flatMap(el => {
+                const attrs = Array.from(el.attributes || []).map(attr => attr.value);
+                return [el.href, el.getAttribute('href'), el.getAttribute('data-href'), el.getAttribute('data-url'), ...attrs];
+              })
               .filter(Boolean)
             """
         )
@@ -2059,11 +2607,7 @@ def _extract_row_link_fields(row: Any) -> dict[str, Any]:
         pgy_url = next((url for url in urls if "/blogger-detail/" in url), "")
     if not pgy_url:
         return {}
-    result = {"pgy_url": pgy_url, "profile_url": pgy_url}
-    blogger_match = re.search(r"/blogger-detail/([^?/#]+)", pgy_url)
-    if blogger_match:
-        result["pgy_blogger_id"] = blogger_match.group(1)
-    return result
+    return _detail_url_fields(pgy_url, source="row_dom") or {"pgy_url": pgy_url, "profile_url": pgy_url}
 
 
 def _detail_url_fields(url: str, source: str = "") -> dict[str, Any]:
@@ -2610,7 +3154,8 @@ def _collect_first_detail_for_creator(context: Any, row: Any) -> dict[str, Any]:
         detail = {**_detail_url_fields(detail_page.url, source="detail_page"), **detail}
         detail = _merge_detail_payload(detail, _collect_audience_profile_chart_metrics(detail_page))
         detail = _merge_detail_payload(detail, _collect_detail_interaction_states(detail_page))
-        return _merge_detail_payload(detail, _capture_audience_profile_screenshot(detail_page, detail))
+        detail = _merge_detail_payload(detail, _capture_audience_profile_screenshot(detail_page, detail))
+        return _annotate_note_cases_with_traffic_reference(detail)
     finally:
         try:
             detail_page.close()
@@ -2629,7 +3174,8 @@ def _collect_detail_by_url(context: Any, url: str) -> dict[str, Any]:
         detail = _extract_detail_fields(text, detail_page.url)
         detail = _merge_detail_payload(detail, _collect_audience_profile_chart_metrics(detail_page))
         detail = _merge_detail_payload(detail, _collect_detail_interaction_states(detail_page))
-        return _merge_detail_payload(detail, _capture_audience_profile_screenshot(detail_page, detail))
+        detail = _merge_detail_payload(detail, _capture_audience_profile_screenshot(detail_page, detail))
+        return _annotate_note_cases_with_traffic_reference(detail)
     finally:
         try:
             detail_page.close()
@@ -3041,8 +3587,9 @@ def _find_filter_trigger(page: Any, field: str) -> Any:
         ".blogger-list_filter button.dropdown-button",
         ".blogger-list_filter .tag",
     ]
+    field_pattern = re.compile(f"^\\s*(?:新\\s*)?{re.escape(field)}\\s*$")
     for selector in selectors:
-        locator = page.locator(selector).filter(has_text=re.compile(f"^\\s*{re.escape(field)}\\s*$"))
+        locator = page.locator(selector).filter(has_text=field_pattern)
         try:
             count = min(locator.count(), 10)
         except Exception:
@@ -3139,6 +3686,62 @@ def _select_popover_checkbox(page: Any, popover: Any, text: str) -> bool:
     return False
 
 
+def _click_popover_group(page: Any, popover: Any, group_label: str) -> bool:
+    if not group_label:
+        return False
+    selectors = [
+        ".range-select-content__left .range-select-item",
+        ".d-new-cascader__option-list__item:first-child .d-new-cascader__option-wrapper",
+        ".d-cascader-menu:first-child .d-cascader-menu-item",
+        ".d-new-cascader__option-wrapper",
+        ".range-select-item",
+    ]
+    pattern = re.compile(f"^\\s*{re.escape(group_label)}\\s*$")
+    for selector in selectors:
+        candidates = popover.locator(selector).filter(has_text=pattern)
+        try:
+            count = min(candidates.count(), 20)
+        except Exception:
+            continue
+        for index in range(count):
+            candidate = candidates.nth(index)
+            try:
+                if not _is_visible(candidate):
+                    continue
+                class_name = candidate.get_attribute("class") or ""
+                if "--active" in class_name or "active" in class_name:
+                    return True
+                if _click_locator(page, candidate, timeout=1500):
+                    page.wait_for_timeout(450)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _select_grouped_popover_value(page: Any, popover: Any, item: dict[str, Any]) -> bool:
+    field = str(item.get("field") or "")
+    value = _item_selection_value(item)
+    group = str(item.get("sub_field") or item.get("subField") or "")
+    if not group:
+        group = _infer_option_group(field, value)
+    if group:
+        _click_popover_group(page, popover, group)
+    for candidate in _filter_value_candidates({**item, "value": value}):
+        if _select_popover_checkbox(page, popover, candidate):
+            return True
+    if group:
+        return False
+    for inferred_group in [
+        str(group_item.get("label") or "")
+        for group_item in _catalog_option_groups(field)
+        if value in (group_item.get("options") or [])
+    ]:
+        if _click_popover_group(page, popover, inferred_group) and _select_popover_checkbox(page, popover, value):
+            return True
+    return False
+
+
 def _visible_popovers(page: Any, selector: str = ".d-popover, .filter-select-popover") -> list[Any]:
     popovers = page.locator(selector)
     try:
@@ -3202,7 +3805,7 @@ def _find_subfield_selector(popover: Any, field: str, sub_field: str) -> Any:
 
 
 def _fill_nested_number_range(nested: Any, min_value: Any, max_value: Any) -> int:
-    inputs = nested.locator("input[type=text], input:not([type])")
+    inputs = nested.locator("input[type=text], input[type=number], input:not([type])")
     try:
         count = min(inputs.count(), 8)
     except Exception:
@@ -3218,22 +3821,39 @@ def _fill_nested_number_range(nested: Any, min_value: Any, max_value: Any) -> in
             editable.append(input_box)
         except Exception:
             continue
-    values = [min_value, max_value]
+    target_inputs = editable[-2:]
+    values = [min_value, max_value] if len(target_inputs) >= 2 else [max_value]
     filled = 0
-    for input_box, value in zip(editable[-2:], values):
+    for input_box, value in zip(target_inputs, values):
         if value is None or value == "":
             continue
+        text_value = _format_filter_number(value)
         try:
-            input_box.fill(str(value), timeout=1500)
+            input_box.fill(text_value, timeout=1500)
             filled += 1
         except Exception:
             try:
                 input_box.click(timeout=1000)
                 input_box.press("Control+A")
-                input_box.type(str(value), timeout=1500)
+                input_box.type(text_value, timeout=1500)
                 filled += 1
             except Exception:
-                continue
+                try:
+                    input_box.evaluate(
+                        """
+                        (node, value) => {
+                          node.removeAttribute('readonly');
+                          node.removeAttribute('disabled');
+                          node.value = value;
+                          node.dispatchEvent(new Event('input', { bubbles: true }));
+                          node.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        """,
+                        text_value,
+                    )
+                    filled += 1
+                except Exception:
+                    continue
     return filled
 
 
@@ -3248,40 +3868,87 @@ def _click_nested_confirm(page: Any, nested: Any) -> bool:
     return False
 
 
-def _apply_subfield_number_range(page: Any, item: dict[str, Any]) -> tuple[bool, str]:
+def _apply_single_subfield_number_range(page: Any, popover: Any, item: dict[str, Any], sub_field: str) -> tuple[bool, str]:
     field = item.get("field") or ""
     value = str(item.get("value") or "")
-    sub_field = str(item.get("sub_field") or "")
-    popover, message = _open_filter_popover(page, field)
-    if popover is None:
-        return False, message
     selector = _find_subfield_selector(popover, field, sub_field)
     if selector is None:
-        _click_popover_confirm(page, popover)
         return False, "弹层内未找到子字段选择框，已保留在采集计划中"
     if not _click_locator(page, selector, timeout=1500):
-        _click_popover_confirm(page, popover)
         return False, "子字段下拉未打开，已保留在采集计划中"
     page.wait_for_timeout(600)
     nested = _last_visible_popover(page, ".d-popover.filters-item-custom, .d-popover .filters-item-custom, .filter-select-popover")
     if nested is None:
-        _click_popover_confirm(page, popover)
         return False, "子字段区间弹层未出现，已保留在采集计划中"
-    min_value = item.get("min", 0)
-    max_value = item.get("max")
+    min_value, max_value = _range_for_subfield(item, sub_field)
     if max_value in (None, ""):
         match = re.search(r"[≤<]\s*([0-9]+(?:\.[0-9]+)?)", value)
         max_value = match.group(1) if match else ""
     filled = _fill_nested_number_range(nested, min_value, max_value)
-    if filled < 2:
+    required_fills = 2 if min_value not in (None, "") and max_value not in (None, "") else 1
+    if filled < required_fills:
         _click_nested_confirm(page, nested)
-        _click_popover_confirm(page, popover)
         return False, "子字段区间输入未完整填写，已保留在采集计划中"
     if not _click_nested_confirm(page, nested):
-        _click_popover_confirm(page, popover)
         return False, "子字段区间确认失败，已保留在采集计划中"
+    if min_value not in (None, "") and max_value not in (None, ""):
+        range_text = f"{_format_filter_number(min_value)}～{_format_filter_number(max_value)}"
+    elif min_value not in (None, ""):
+        range_text = f"{_format_filter_number(min_value)}以上"
+    else:
+        range_text = f"{_format_filter_number(max_value)}以下"
+    return True, f"{sub_field or field} {range_text}"
+
+
+def _apply_subfield_number_range(page: Any, item: dict[str, Any]) -> tuple[bool, str]:
+    field = item.get("field") or ""
+    popover, message = _open_filter_popover(page, field)
+    if popover is None:
+        return False, message
+    default_subfields: str | list[str] = ["图文笔记", "视频笔记"] if field == "合作报价" else str(item.get("sub_field") or "")
+    sub_fields = _subfield_names_from_item(item, default=default_subfields)
+    if not sub_fields:
+        sub_fields = [str(item.get("sub_field") or "")]
+    successes: list[str] = []
+    failures: list[str] = []
+    for sub_field in sub_fields:
+        success, detail = _apply_single_subfield_number_range(page, popover, item, sub_field)
+        if success:
+            successes.append(detail)
+        else:
+            failures.append(f"{sub_field or field}：{detail}")
+    if not successes:
+        _click_popover_confirm(page, popover)
+        return False, "；".join(failures) or "子字段区间输入失败，已保留在采集计划中"
     _click_popover_confirm(page, popover)
-    return True, f"已填写{sub_field or field}自定义区间 {min_value}～{max_value}"
+    suffix = f"；部分失败：{'；'.join(failures)}" if failures else ""
+    return True, f"已填写{field}自定义区间：{'；'.join(successes)}{suffix}"
+
+
+def _apply_preset_or_number_range(page: Any, item: dict[str, Any]) -> tuple[bool, str]:
+    field = item.get("field") or ""
+    value = str(item.get("value") or "")
+    popover, message = _open_filter_popover(page, field)
+    if popover is None:
+        return False, message
+    candidates = _filter_value_candidates(item)
+    for candidate in [candidate for candidate in dict.fromkeys(candidates) if candidate]:
+        if _select_popover_checkbox(page, popover, candidate):
+            _click_popover_confirm(page, popover)
+            return True, "已在弹层中选择区间筛选项"
+    parsed_min, parsed_max = _range_numbers_from_text(value)
+    min_value = item.get("min", parsed_min if parsed_min is not None else "")
+    max_value = item.get("max", parsed_max if parsed_max is not None else "")
+    if min_value in (None, "") and max_value in (None, ""):
+        _click_popover_confirm(page, popover)
+        return False, "弹层内未找到匹配区间，已保留在采集计划中"
+    filled = _fill_nested_number_range(popover, min_value, max_value)
+    if filled < (2 if min_value not in (None, "") and max_value not in (None, "") else 1):
+        _click_popover_confirm(page, popover)
+        return False, "区间输入未完整填写，已保留在采集计划中"
+    if not _click_popover_confirm(page, popover):
+        return False, "区间筛选确认失败，已保留在采集计划中"
+    return True, f"已填写{field}自定义区间 {_format_filter_number(min_value)}～{_format_filter_number(max_value)}"
 
 
 def _fill_popover_text_inputs(popover: Any, values: list[str]) -> int:
@@ -3332,18 +3999,18 @@ def _apply_popover_filter_item(page: Any, item: dict[str, Any]) -> tuple[bool, s
         if control_type == "nested_select_popover":
             _click_popover_confirm(page, popover)
             return False, "该条件打开后仍有下拉选项，需要继续选择，已保留在采集计划中"
-        candidates = PGY_FILTER_ALIASES.get(value) or [value]
-        for candidate in candidates:
-            if _select_popover_checkbox(page, popover, candidate):
-                _click_popover_confirm(page, popover)
-                return True, "已在弹层中选择筛选项"
+        if _select_grouped_popover_value(page, popover, item):
+            _click_popover_confirm(page, popover)
+            return True, "已在弹层中选择筛选项"
         _click_popover_confirm(page, popover)
         return False, "弹层内未找到匹配选项，已保留在采集计划中"
     if control_type in {"brand_search_recommendation"}:
         return False, "该条件需要在右上角合作品牌/竞品搜索入口选择品牌，已保留在采集计划中"
     if control_type in {"subfield_preset_or_number_range", "subfield_preset_or_percent_range", "multi_subfield_preset_or_number_range"}:
         return _apply_subfield_number_range(page, item)
-    if control_type in {"range_select_pair", "number_range", "preset_or_number_range", "preset_or_percent_range", "cascade_checkbox_popover", "three_level_cascade_checkbox_popover"}:
+    if control_type in {"range_select_pair", "number_range", "preset_or_number_range", "preset_or_percent_range"}:
+        return _apply_preset_or_number_range(page, item)
+    if control_type in {"cascade_checkbox_popover", "three_level_cascade_checkbox_popover"}:
         return False, "该条件需要区间/子筛选/级联细分，已保留在采集计划中"
     return False, ""
 
@@ -3356,7 +4023,7 @@ def _apply_filter_item(page: Any, item: dict[str, Any]) -> tuple[bool, str]:
     popover_success, popover_message = _apply_popover_filter_item(page, item)
     if popover_success or popover_message:
         return popover_success, popover_message
-    candidates = PGY_FILTER_ALIASES.get(value) or [value]
+    candidates = _filter_value_candidates(item)
     if field in {"平台推荐", "常规剔除"}:
         for candidate in candidates:
             if _click_filter_checkbox(page, candidate):
@@ -3686,6 +4353,68 @@ def apply_collection_plan(page: Any, plan: dict[str, Any]) -> dict[str, Any]:
     return {"applied_filters": applied, "skipped_filters": skipped, **metric_result}
 
 
+def _read_visible_collection_state(page: Any) -> dict[str, Any]:
+    rows = _creator_list_rows(page)
+    try:
+        rows.first.wait_for(state="visible", timeout=8000)
+    except Exception:
+        pass
+    try:
+        raw_count = rows.count()
+    except Exception:
+        raw_count = 0
+    count = 0
+    for index in range(min(raw_count, 30)):
+        try:
+            row_text = rows.nth(index).inner_text(timeout=800)
+        except Exception:
+            continue
+        if _parse_row_text(row_text, page.url):
+            count += 1
+    return {
+        "rows": rows,
+        "count": count,
+        "empty_hint": _page_empty_result_hint(page),
+    }
+
+
+def _apply_relaxed_plan_after_empty_result(page: Any, plan: dict[str, Any], plan_result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    current_plan = plan
+    current_result = plan_result
+    current_state = _read_visible_collection_state(page)
+    if current_state["count"] > 0 or not current_state["empty_hint"]:
+        return current_plan, current_result, current_state
+
+    attempts = [("broad", False), ("unfiltered", True)]
+    for stage, reset_filters in attempts:
+        relaxed_plan = _relaxed_collection_plan(plan, stage)
+        if relaxed_plan is None:
+            continue
+        try:
+            if reset_filters or "/solar/pre-trade/note/kol" in page.url:
+                page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
+        except Exception:
+            pass
+        retry_result = apply_collection_plan(page, relaxed_plan) if relaxed_plan.get("filters") else {
+            "applied_filters": [],
+            "skipped_filters": [],
+            "selected_metrics": [],
+            "skipped_metrics": [],
+        }
+        if not relaxed_plan.get("filters"):
+            metrics_result = _ensure_display_metrics(page, [str(item) for item in relaxed_plan.get("display_metrics") or []])
+            retry_result = {**retry_result, **metrics_result}
+        retry_state = _read_visible_collection_state(page)
+        merged_result = _merge_plan_results(current_result, retry_result, relaxed_plan.get("relaxation") or {})
+        if retry_state["count"] > 0 or not retry_state["empty_hint"]:
+            return relaxed_plan, merged_result, retry_state
+        current_plan = relaxed_plan
+        current_result = merged_result
+        current_state = retry_state
+    return current_plan, current_result, current_state
+
+
 def _extract_recommendation_count(page: Any) -> dict[str, Any]:
     try:
         text = page.locator("body").inner_text(timeout=3000)
@@ -3805,9 +4534,11 @@ def collect_visible_list(
             page = next((item for item in pages if "pgy.xiaohongshu.com" in item.url), pages[0] if pages else context.new_page())
             _install_kol_response_capture(page)
             setattr(page, "_pgy_latest_api_kols", [])
-            if "pgy.xiaohongshu.com" not in page.url:
-                page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
-            elif reset_filters and "/solar/pre-trade/note/kol" in page.url:
+            if (
+                "pgy.xiaohongshu.com" not in page.url
+                or "/solar/pre-trade/note/kol" not in page.url
+                or reset_filters
+            ):
                 page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
             if "/solar/pre-trade/note/kol" not in page.url:
                 return {"ok": False, "message": "请先打开蒲公英博主广场 / 找博主页面", "current_url": page.url}
@@ -3821,12 +4552,16 @@ def collect_visible_list(
                 if apply_filters
                 else {"applied_filters": [], "skipped_filters": [], "selected_metrics": [], "skipped_metrics": []}
             )
+            active_plan = plan
+            collection_state = _read_visible_collection_state(page)
+            if apply_filters and collection_state["count"] == 0 and collection_state["empty_hint"]:
+                active_plan, plan_result, collection_state = _apply_relaxed_plan_after_empty_result(page, plan, plan_result)
             recommendation_count = _extract_recommendation_count(page)
             if preflight_only:
                 return {
                     "ok": True,
                     "current_url": page.url,
-                    "collection_plan": plan,
+                    "collection_plan": active_plan,
                     **plan_result,
                     **recommendation_count,
                     "detail_collection": "preflight_only",
@@ -3834,18 +4569,20 @@ def collect_visible_list(
                     "creators": [],
                 }
             export_result = _export_current_table(page) if export_metrics else {"status": "skipped", "message": "本次未请求导出"}
-            rows = page.locator(".blogger-list_list .d-new-table tbody tr").filter(has_not=page.locator(".skeleton-block"))
-            try:
-                rows.first.wait_for(state="visible", timeout=8000)
-            except Exception:
-                pass
-            count = rows.count()
+            rows = collection_state["rows"]
+            count = collection_state["count"]
             if count == 0:
+                hint = collection_state.get("empty_hint")
+                message = (
+                    f"蒲公英页面提示「{hint}」，系统已尝试自动放宽筛选但仍无可采集列表"
+                    if hint
+                    else "未识别到博主列表，请确认已登录并停留在博主广场列表页"
+                )
                 return {
                     "ok": False,
-                    "message": "未识别到博主列表，请确认已登录并停留在博主广场列表页",
+                    "message": message,
                     "current_url": page.url,
-                    "collection_plan": plan,
+                    "collection_plan": active_plan,
                     "export_result": export_result,
                     **plan_result,
                     **recommendation_count,
@@ -3863,7 +4600,7 @@ def collect_visible_list(
                     "ok": False,
                     "message": "已连接蒲公英页面，但未读取到有效达人内容。请确认列表加载完成后再采集，必要时滚动列表或刷新页面。",
                     "current_url": page.url,
-                    "collection_plan": plan,
+                    "collection_plan": active_plan,
                     "export_result": export_result,
                     **plan_result,
                     **recommendation_count,
@@ -3872,7 +4609,7 @@ def collect_visible_list(
                 "ok": True,
                 "creators": creators,
                 "current_url": page.url,
-                "collection_plan": plan,
+                "collection_plan": active_plan,
                 "detail_collection": "planned" if include_details else "skipped",
                 "export_result": export_result,
                 **recommendation_count,

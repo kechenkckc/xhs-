@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import {
   Inbox, CheckSquare, Clock, Bot, Brain, CalendarDays, Send,
   FileSpreadsheet, MessageSquare, Mic, FileText, Upload, Sparkles,
@@ -14,6 +15,9 @@ import ProgressBar from '../../components/ProgressBar';
 import TabBar from '../../components/TabBar';
 import PageHeader from '../../components/PageHeader';
 import AgentCard from '../../components/AgentCard';
+import ProjectWorkspacePanel from '../../components/ProjectWorkspacePanel';
+import { ClickSurface, useWorkbenchActions } from '../../components/WorkbenchActionKit';
+import { projectWorkspaceApi, useProjectWorkspace } from '../../shared/projectWorkspace';
 
 /* ============================================================
    Mock Data
@@ -265,7 +269,10 @@ function renderSource(value, row) {
 /* ============================================================
    Tab 1: 工作概览
    ============================================================ */
-function TabOverview() {
+function TabOverview({ actions, workspace }) {
+  const summary = workspace.metrics?.summary || {};
+  const pending = workspace.handoffs.filter((item) => item.to_role === 'executor' && item.status === 'pending');
+  const blocked = workspace.tasks.filter((item) => item.status === 'blocked');
   const taskColumns = [
     { key: 'task', label: '任务名称', render: (val) => <span className="font-medium text-primary">{val}</span> },
     { key: 'project', label: '所属项目', render: (val) => <Badge variant="neutral">{val}</Badge> },
@@ -278,79 +285,41 @@ function TabOverview() {
     <div className="flex flex-col gap-6">
       {/* Top StatCards */}
       <div className="grid grid-cols-4 gap-4">
-        <StatCard
-          title="待处理需求"
-          value="7"
-          change={3}
-          changeLabel="今日新增"
-          icon={Inbox}
-          color="cyan"
-        />
-        <StatCard
-          title="进行中任务"
-          value="23"
-          change={0}
-          changeLabel="占总任务 45%"
-          icon={CheckSquare}
-          color="blue"
-        />
-        <StatCard
-          title="今日到期"
-          value="3"
-          change={0}
-          changeLabel="需关注"
-          icon={Clock}
-          color="red"
-        />
-        <StatCard
-          title="Agent 运行中"
-          value="4/6"
-          change={0}
-          changeLabel="正常运行"
-          icon={Bot}
-          color="green"
-        />
+        <ClickSurface onClick={() => actions.openDetail('待处理需求', { 数量: 7, 今日新增: 3, 状态: '待分配' })}>
+          <StatCard title="待接收交接" value={pending.length} icon={Inbox} color="cyan" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('进行中任务', { 数量: 23, 占比: '45%', 今日更新: 8 })}>
+          <StatCard title="进行中任务" value={workspace.tasks.filter((item) => item.status === 'doing').length} icon={CheckSquare} color="blue" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openForm('今日到期处理', ['任务名称', '负责人', '延期原因', '处理动作'])}>
+          <StatCard title="阻塞事项" value={blocked.length} icon={Clock} color="red" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('Agent 运行状态', { 运行中: '4', 总数: '6', 状态: '正常运行' })}>
+          <StatCard title="完成率" value={`${summary.execution_score ?? 0}%`} icon={Bot} color="green" />
+        </ClickSurface>
       </div>
 
       {/* Agent Team Status */}
       <div>
         <div className="section-title">Agent 团队状态</div>
         <div className="grid grid-cols-4 gap-4">
-          <AgentCard
-            name="洞察 Agent"
-            type="数据分析"
-            status="running"
-            description="正在分析竞品数据"
-            icon={Brain}
-          />
-          <AgentCard
-            name="排期 Agent"
-            type="任务调度"
-            status="running"
-            description="已生成 3 个排期方案"
-            icon={CalendarDays}
-          />
-          <AgentCard
-            name="汇报 Agent"
-            type="数据汇总"
-            status="idle"
-            description="上次汇报: 昨日 18:00"
-            icon={BarChart3}
-          />
-          <AgentCard
-            name="协同 Agent"
-            type="流程同步"
-            status="running"
-            description="已同步 12 条任务到飞书"
-            icon={RefreshCw}
-          />
+          {[
+            { name: '洞察 Agent', type: '数据分析', status: 'running', description: '正在分析竞品数据', icon: Brain },
+            { name: '排期 Agent', type: '任务调度', status: 'running', description: '已生成 3 个排期方案', icon: CalendarDays },
+            { name: '汇报 Agent', type: '数据汇总', status: 'idle', description: '上次汇报: 昨日 18:00', icon: BarChart3 },
+            { name: '协同 Agent', type: '流程同步', status: 'running', description: '已同步 12 条任务到飞书', icon: RefreshCw },
+          ].map((agent) => (
+            <ClickSurface key={agent.name} onClick={() => actions.openForm(`${agent.name}操作`, ['操作类型', '运行范围', '通知对象', '备注'], agent)}>
+              <AgentCard {...agent} />
+            </ClickSurface>
+          ))}
         </div>
       </div>
 
       {/* Urgent Task Table */}
       <div>
-        <div className="section-title">紧急任务列表</div>
-        <DataTable columns={taskColumns} data={urgentTasks} />
+        <div className="section-title">当前项目任务</div>
+        <DataTable columns={taskColumns} data={(workspace.tasks.length ? workspace.tasks.map((task) => ({ ...task, task: task.title, assignee: task.owner || '未分配', deadline: task.due_at || '待定' })) : urgentTasks)} onRowClick={(row) => actions.openForm(row.task || row.title, ['处理动作', '负责人', '预计完成', '备注'], row)} />
       </div>
     </div>
   );
@@ -359,7 +328,37 @@ function TabOverview() {
 /* ============================================================
    Tab 2: 需求接入
    ============================================================ */
-function TabRequirement() {
+function TabRequirement({ actions, workspace }) {
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiTasks, setAiTasks] = useState([]);
+  const executorHandoffs = workspace.handoffs.filter((item) => item.to_role === 'executor');
+  const handleAccept = async (handoff) => {
+    await projectWorkspaceApi.acceptHandoff(workspace.projectId, handoff.handoff_id, '执行');
+    await workspace.reloadCurrentProject();
+    actions.notify('交接已接收');
+  };
+  const handleCreateTasks = async (handoff) => {
+    await projectWorkspaceApi.createTasksFromHandoff(workspace.projectId, handoff.handoff_id, '执行');
+    await workspace.reloadCurrentProject();
+    actions.notify('已从交接单生成执行任务');
+  };
+  const handleAiCreateTasks = async (handoff) => {
+    setAiBusy(true);
+    try {
+      const result = await projectWorkspaceApi.aiTasks(workspace.projectId, {
+        payload: { handoff },
+        persist: true,
+        operator: '执行',
+      });
+      setAiTasks(result.tasks || []);
+      await workspace.reloadCurrentProject();
+      actions.notify(result.source === 'llm' ? 'AI 已拆解执行任务' : '已用规则生成执行任务');
+    } catch (error) {
+      actions.notify(error.message || 'AI 任务拆解失败');
+    } finally {
+      setAiBusy(false);
+    }
+  };
   const reqColumns = [
     { key: 'id', label: '编号', render: (val) => <span className="font-mono text-primary">{val}</span> },
     { key: 'source', label: '来源', render: renderSource },
@@ -378,12 +377,55 @@ function TabRequirement() {
 
   return (
     <div className="flex flex-col gap-6">
+      <div>
+        <div className="section-title">项目交接接入</div>
+        <div className="handoff-grid">
+          {executorHandoffs.map((handoff) => (
+            <div className="handoff-card" key={handoff.handoff_id}>
+              <div className="handoff-card-head">
+                <div>
+                  <h4>{handoff.title}</h4>
+                  <p>{handoff.summary || '暂无摘要'}</p>
+                </div>
+                {renderBadge(requirementStatusMap, handoff.status === 'pending' ? 'pending' : handoff.status === 'completed' ? 'completed' : 'processing')}
+              </div>
+              <div className="text-xs text-muted">来源：{handoff.from_role} · {handoff.created_at}</div>
+              <div className="handoff-card-actions">
+                <button type="button" className="btn btn-secondary btn-sm" onClick={() => actions.openDetail(handoff.title, handoff.payload)}>详情</button>
+                <button type="button" className="btn btn-secondary btn-sm" onClick={() => handleAccept(handoff)}>接收</button>
+                <button type="button" className="btn btn-primary btn-sm" onClick={() => handleCreateTasks(handoff)}>生成任务</button>
+                <button type="button" className="btn btn-secondary btn-sm" disabled={aiBusy} onClick={() => handleAiCreateTasks(handoff)}>
+                  <Bot size={14} />
+                  AI 拆任务
+                </button>
+              </div>
+            </div>
+          ))}
+          {!executorHandoffs.length && <div className="empty-state"><div className="empty-state-text">暂无执行交接</div></div>}
+        </div>
+      </div>
+
+      {aiTasks.length > 0 && (
+        <div className="card ai-result-panel">
+          <div className="card-header">
+            <h3>AI 任务拆解结果</h3>
+            <Badge variant="green">{aiTasks.length} 项</Badge>
+          </div>
+          <div className="card-body">
+            <pre>{JSON.stringify(aiTasks, null, 2)}</pre>
+          </div>
+        </div>
+      )}
+
       {/* Upload Area */}
       <div className="card">
         <div className="card-body">
-          <div
+          <button
+            type="button"
             className="flex flex-col items-center justify-center gap-4 py-8"
+            onClick={() => actions.openForm('需求文件接入', ['接入来源', '需求类型', '关联项目', '补充说明'])}
             style={{
+              width: '100%',
               border: '2px dashed var(--border-primary)',
               borderRadius: 'var(--radius-lg)',
               backgroundColor: 'var(--bg-secondary)',
@@ -460,7 +502,7 @@ function TabRequirement() {
               </div>
               <span className="text-xs text-muted">自动识别需求类型</span>
             </div>
-          </div>
+          </button>
         </div>
       </div>
 
@@ -472,7 +514,7 @@ function TabRequirement() {
             <h3>已接入需求</h3>
             <span className="text-xs font-mono text-muted">共 8 条</span>
           </div>
-          <DataTable columns={reqColumns} data={requirementData} />
+        <DataTable columns={reqColumns} data={requirementData} onRowClick={(row) => actions.openForm(`${row.id} 需求处理`, ['处理动作', '分配执行人', '截止时间', '处理备注'], row)} />
         </div>
 
         {/* Pie Chart (CSS Simulated) */}
@@ -537,13 +579,14 @@ function TabRequirement() {
 /* ============================================================
    Tab 3: Agent 编排
    ============================================================ */
-function TabAgent() {
+function TabAgent({ actions }) {
   const [agentStates, setAgentStates] = useState(
     agentConfigs.reduce((acc, a) => ({ ...acc, [a.id]: a.enabled }), {})
   );
 
   const toggleAgent = (id) => {
     setAgentStates((prev) => ({ ...prev, [id]: !prev[id] }));
+    actions.notify('Agent 状态已切换');
   };
 
   return (
@@ -577,7 +620,7 @@ function TabAgent() {
           const isEnabled = agentStates[agent.id];
           const IconComp = agent.icon;
           return (
-            <div key={agent.id} className="card" style={{ opacity: isEnabled ? 1 : 0.6 }}>
+            <ClickSurface key={agent.id} as="div" className="card" onClick={() => actions.openForm(`${agent.name}配置`, ['频率', '输出格式', '通知渠道', '说明'], agent)} style={{ opacity: isEnabled ? 1 : 0.6 }}>
               <div className="card-body">
                 {/* Header: Name + Toggle */}
                 <div className="flex items-center justify-between mb-4">
@@ -600,8 +643,12 @@ function TabAgent() {
                     </div>
                   </div>
                   {/* Toggle Switch */}
-                  <button
-                    onClick={() => toggleAgent(agent.id)}
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        toggleAgent(agent.id);
+                      }}
                     style={{
                       width: 40,
                       height: 22,
@@ -659,7 +706,7 @@ function TabAgent() {
                   </span>
                 </div>
               </div>
-            </div>
+            </ClickSurface>
           );
         })}
       </div>
@@ -669,7 +716,7 @@ function TabAgent() {
         <div className="section-title">编排模板</div>
         <div className="grid grid-cols-3 gap-4">
           {orchestrationTemplates.map((tpl) => (
-            <div key={tpl.id} className="card" style={{ cursor: 'pointer' }}>
+            <ClickSurface key={tpl.id} className="card" onClick={() => actions.openForm(`套用${tpl.name}`, ['项目', '执行范围', '启用 Agent', '备注'], tpl)}>
               <div className="card-body">
                 <div className="flex items-center gap-3 mb-3">
                   <div
@@ -706,7 +753,7 @@ function TabAgent() {
                   ))}
                 </div>
               </div>
-            </div>
+            </ClickSurface>
           ))}
         </div>
       </div>
@@ -717,12 +764,13 @@ function TabAgent() {
 /* ============================================================
    Tab 4: 任务看板
    ============================================================ */
-function TabKanban() {
+function TabKanban({ actions, workspace }) {
   const columns = [
-    { key: 'todo', title: '待启动', color: 'var(--text-muted)' },
-    { key: 'in_progress', title: '进行中', color: 'var(--accent-blue)' },
+    { key: 'todo', title: '待处理', color: 'var(--text-muted)' },
+    { key: 'doing', title: '进行中', color: 'var(--accent-blue)' },
     { key: 'review', title: '待审核', color: 'var(--accent-amber)' },
     { key: 'done', title: '已完成', color: 'var(--accent-green)' },
+    { key: 'blocked', title: '阻塞', color: 'var(--accent-red)' },
   ];
 
   const avatarColors = ['#3B82F6', '#8B5CF6', '#EC4899', '#F59E0B', '#10B981', '#06B6D4'];
@@ -732,7 +780,7 @@ function TabKanban() {
     const avatarColor = avatarColors[card.assignee.charCodeAt(0) % avatarColors.length];
 
     return (
-      <div key={card.id} className="kanban-card">
+      <div key={card.id} className="kanban-card" onClick={() => actions.openForm(card.title, ['处理动作', '负责人', '截止时间', '备注'], card)}>
         {/* Title */}
         <div className="kanban-card-title">{card.title}</div>
 
@@ -780,7 +828,18 @@ function TabKanban() {
   return (
     <div className="flex gap-4" style={{ overflowX: 'auto', paddingBottom: 'var(--space-4)' }}>
       {columns.map((col) => {
-        const cards = kanbanData[col.key] || [];
+        const cards = workspace.tasks.length
+          ? workspace.tasks.filter((task) => task.status === col.key).map((task) => ({
+            ...task,
+            id: task.task_id,
+            title: task.title,
+            project: workspace.currentProject?.project_name || '当前项目',
+            assignee: task.owner || '未分配',
+            deadline: task.due_at || '待定',
+            priority: task.priority || 'medium',
+            deps: task.source_handoff_id ? 1 : 0,
+          }))
+          : (kanbanData[col.key === 'doing' ? 'in_progress' : col.key] || []);
         return (
           <div key={col.key} className="kanban-column">
             <div className="kanban-column-header">
@@ -811,7 +870,7 @@ function TabKanban() {
 /* ============================================================
    Tab 5: Daily Push
    ============================================================ */
-function TabDaily() {
+function TabDaily({ actions, workspace }) {
   const [pushConfig, setPushConfig] = useState({
     time: '09:00',
     hotTopics: true,
@@ -839,7 +898,7 @@ function TabDaily() {
       <div className="card">
         <div className="card-header">
           <h3>推送配置</h3>
-          <button className="btn btn-primary btn-sm">
+          <button className="btn btn-primary btn-sm" onClick={() => actions.notify('Daily Push 配置已保存')}>
             <Save size={14} />
             保存配置
           </button>
@@ -868,7 +927,10 @@ function TabDaily() {
                   <label
                     key={item.key}
                     className="flex items-center gap-2 cursor-pointer"
-                    onClick={() => toggleConfig(item.key)}
+                    onClick={() => {
+                      toggleConfig(item.key);
+                      actions.notify(`${item.label}已切换`);
+                    }}
                   >
                     <div
                       style={{
@@ -959,6 +1021,15 @@ function TabDaily() {
                     <ProgressBar value={proj.progress} color={proj.color} size="sm" />
                   </div>
                 ))}
+                {workspace.tasks.length > 0 && (
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs text-secondary">{workspace.currentProject?.project_name || '当前项目'}</span>
+                      <span className="text-xs font-mono font-semibold text-primary">{workspace.metrics?.summary?.execution_score || 0}%</span>
+                    </div>
+                    <ProgressBar value={workspace.metrics?.summary?.execution_score || 0} color="cyan" size="sm" />
+                  </div>
+                )}
               </div>
             </div>
 
@@ -991,7 +1062,7 @@ function TabDaily() {
       {/* Push History */}
       <div>
         <div className="section-title">历史推送记录（最近 7 天）</div>
-        <DataTable columns={pushColumns} data={pushHistory} />
+        <DataTable columns={pushColumns} data={pushHistory} onRowClick={(row) => actions.openDetail(`${row.date} 推送记录`, row)} />
       </div>
     </div>
   );
@@ -1000,7 +1071,7 @@ function TabDaily() {
 /* ============================================================
    Tab 6: 执行跟进
    ============================================================ */
-function TabFollowup() {
+function TabFollowup({ actions }) {
   const followupColumns = [
     { key: 'item', label: '跟进事项', render: (val) => <span className="font-medium text-primary">{val}</span> },
     { key: 'type', label: '类型', render: (val) => renderBadge(followupTypeMap, val) },
@@ -1015,6 +1086,10 @@ function TabFollowup() {
         return (
           <button
             className={`btn btn-sm ${isUrgent ? 'btn-danger' : 'btn-secondary'}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              actions.openForm(row.item, ['跟进动作', '通知对象', '催办时间', '备注'], row);
+            }}
           >
             {val}
           </button>
@@ -1068,7 +1143,7 @@ function TabFollowup() {
             <h3>跟进事项列表</h3>
             <span className="text-xs font-mono text-muted">共 10 条</span>
           </div>
-          <DataTable columns={followupColumns} data={followupItems} />
+        <DataTable columns={followupColumns} data={followupItems} onRowClick={(row) => actions.openForm(row.item, ['跟进动作', '通知对象', '催办时间', '备注'], row)} />
         </div>
 
         {/* Reminder Status Panel */}
@@ -1130,47 +1205,47 @@ function TabFollowup() {
 /* ============================================================
    Main Component
    ============================================================ */
-export default function ExecutorDashboard() {
-  const [activeTab, setActiveTab] = useState('overview');
+export default function ExecutorDashboard({ selectedProjectId, onSelectedProjectIdChange }) {
+  const navigate = useNavigate();
+  const { tab } = useParams();
+  const navToTab = { gateway: 'requirement', 'agent-orch': 'agent', tasks: 'kanban', 'daily-push': 'daily', 'follow-up': 'followup' };
+  const tabToNav = { requirement: 'gateway', agent: 'agent-orch', kanban: 'tasks', daily: 'daily-push', followup: 'follow-up' };
+  const initialTab = navToTab[tab] || (tabs.some((item) => item.key === tab) ? tab : 'overview');
+  const [activeTab, setActiveTab] = useState(initialTab);
+  const actions = useWorkbenchActions();
+  const workspace = useProjectWorkspace(selectedProjectId, onSelectedProjectIdChange);
+
+  useEffect(() => {
+    const nextTab = navToTab[tab] || tab;
+    if (tabs.some((item) => item.key === nextTab)) {
+      setActiveTab(nextTab);
+    }
+  }, [tab]);
+
+  const handleTabChange = (nextTab) => {
+    setActiveTab(nextTab);
+    navigate(`/workbench/executor/${tabToNav[nextTab] || nextTab}`);
+  };
 
   const renderTabContent = () => {
     switch (activeTab) {
-      case 'overview': return <TabOverview />;
-      case 'requirement': return <TabRequirement />;
-      case 'agent': return <TabAgent />;
-      case 'kanban': return <TabKanban />;
-      case 'daily': return <TabDaily />;
-      case 'followup': return <TabFollowup />;
-      default: return <TabOverview />;
+      case 'overview': return <TabOverview actions={actions} workspace={workspace} />;
+      case 'requirement': return <TabRequirement actions={actions} workspace={workspace} />;
+      case 'agent': return <TabAgent actions={actions} />;
+      case 'kanban': return <TabKanban actions={actions} workspace={workspace} />;
+      case 'daily': return <TabDaily actions={actions} workspace={workspace} />;
+      case 'followup': return <TabFollowup actions={actions} />;
+      default: return <TabOverview actions={actions} workspace={workspace} />;
     }
   };
 
   return (
     <div className="flex flex-col h-full">
-      <PageHeader
-        title="执行工作台"
-        subtitle="需求管理 | Agent 编排 | 任务执行 | 进度跟进"
-        breadcrumbs={[
-          { label: '工作台' },
-          { label: '执行工作台' },
-        ]}
-        actions={
-          <div className="flex items-center gap-3">
-            <button className="btn btn-secondary btn-sm">
-              <Filter size={14} />
-              筛选
-            </button>
-            <button className="btn btn-primary btn-sm">
-              <Plus size={14} />
-              新建任务
-            </button>
-          </div>
-        }
-      />
-      <TabBar tabs={tabs} activeTab={activeTab} onChange={setActiveTab} />
       <div className="page-body">
         {renderTabContent()}
       </div>
+      {actions.toastNode}
+      {actions.modalNode}
     </div>
   );
 }

@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import {
   Users, FolderOpen, DollarSign, AlertTriangle, Search, Filter,
   ArrowRight, ChevronRight, MessageSquare, Phone, Mail,
@@ -15,6 +16,7 @@ import ProgressBar from '../../components/ProgressBar';
 import TabBar from '../../components/TabBar';
 import PageHeader from '../../components/PageHeader';
 import KpiCard from '../../components/KpiCard';
+import { ClickSurface, useWorkbenchActions } from '../../components/WorkbenchActionKit';
 
 /* ============================================================
    Tab Definitions
@@ -225,7 +227,7 @@ const optimizationSuggestions = [
 /* ============================================================
    Tab 1: 工作概览
    ============================================================ */
-function TabOverview() {
+function TabOverview({ actions }) {
   const projectColumns = [
     { key: 'project', label: '项目名称', render: (val) => <span className="font-medium text-primary">{val}</span> },
     { key: 'brand', label: '品牌' },
@@ -239,66 +241,38 @@ function TabOverview() {
     <div className="flex flex-col gap-6">
       {/* Top StatCards */}
       <div className="grid grid-cols-4 gap-4">
-        <StatCard
-          title="合作达人"
-          value="156"
-          change={12}
-          changeLabel="本月"
-          icon={Users}
-          color="pink"
-        />
-        <StatCard
-          title="进行中项目"
-          value="8"
-          subtitle="占总项目 40%"
-          icon={FolderOpen}
-          color="blue"
-        />
-        <StatCard
-          title="平均 CPA"
-          value="¥23.5"
-          change={-8}
-          changeLabel="vs 上月"
-          icon={DollarSign}
-          color="green"
-        />
-        <StatCard
-          title="异常预警"
-          value="3"
-          subtitle="需处理"
-          icon={AlertTriangle}
-          color="red"
-        />
+        <ClickSurface onClick={() => actions.openDetail('合作达人', { 达人数: 156, 本月新增: 12, 覆盖平台: '小红书 / 抖音 / B站 / 微博' })}>
+          <StatCard title="合作达人" value="156" change={12} changeLabel="本月" icon={Users} color="pink" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('进行中项目', { 项目数: 8, 占比: '40%', 状态: '投放中' })}>
+          <StatCard title="进行中项目" value="8" subtitle="占总项目 40%" icon={FolderOpen} color="blue" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('平均 CPA', { 当前: '¥23.5', 变化: '-8%', 建议: '保持当前达人组合' })}>
+          <StatCard title="平均 CPA" value="¥23.5" change={-8} changeLabel="vs 上月" icon={DollarSign} color="green" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openForm('异常预警处理', ['异常对象', '处理负责人', '处理时限', '处理说明'])}>
+          <StatCard title="异常预警" value="3" subtitle="需处理" icon={AlertTriangle} color="red" />
+        </ClickSurface>
       </div>
 
       {/* KPI Cards */}
       <div className="grid grid-cols-2 gap-4">
-        <KpiCard
-          title="投放 ROI"
-          value="3.2x"
-          target={3.5}
-          current={3.2}
-          color="green"
-          trend={[
+        <ClickSurface onClick={() => actions.openDetail('投放 ROI', { 当前值: '3.2x', 目标: '3.5x', 缺口: '0.3x' })}>
+          <KpiCard title="投放 ROI" value="3.2x" target={3.5} current={3.2} color="green" trend={[
             { value: 2.5 }, { value: 2.8 }, { value: 2.6 }, { value: 3.0 }, { value: 3.1 }, { value: 3.2 },
-          ]}
-        />
-        <KpiCard
-          title="达人合作满意度"
-          value="4.6/5.0"
-          target={4.5}
-          current={4.6}
-          color="blue"
-          trend={[
+          ]} />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('达人合作满意度', { 当前值: '4.6/5.0', 目标: '4.5/5.0', 状态: '达标' })}>
+          <KpiCard title="达人合作满意度" value="4.6/5.0" target={4.5} current={4.6} color="blue" trend={[
             { value: 4.2 }, { value: 4.3 }, { value: 4.4 }, { value: 4.5 }, { value: 4.5 }, { value: 4.6 },
-          ]}
-        />
+          ]} />
+        </ClickSurface>
       </div>
 
       {/* Active Projects Table */}
       <div>
         <div className="section-title">活跃项目列表</div>
-        <DataTable columns={projectColumns} data={activeProjects} />
+        <DataTable columns={projectColumns} data={activeProjects} onRowClick={(row) => actions.openDetail(row.project, row)} />
       </div>
     </div>
   );
@@ -307,7 +281,7 @@ function TabOverview() {
 /* ============================================================
    Tab 2: 达人建联
    ============================================================ */
-function TabKol() {
+function TabKol({ actions }) {
   const [selectedKol, setSelectedKol] = useState(kolList[0]);
   const [searchText, setSearchText] = useState('');
   const [filterPlatform, setFilterPlatform] = useState('all');
@@ -444,7 +418,10 @@ function TabKol() {
         <DataTable
           columns={kolColumns}
           data={kolList}
-          onRowClick={(row) => setSelectedKol(row)}
+          onRowClick={(row) => {
+            setSelectedKol(row);
+            actions.notify(`已选中${row.name}`);
+          }}
         />
 
         {/* KOL Detail Panel */}
@@ -515,7 +492,13 @@ function TabKol() {
 
             {/* Recommended Script */}
             <div className="mb-5">
-              <div className="text-xs text-muted mb-2 font-medium uppercase tracking-wide">推荐话术</div>
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-xs text-muted font-medium uppercase tracking-wide">推荐话术</div>
+                <button className="btn btn-sm btn-primary" onClick={() => actions.openForm(`${selectedKol.name}建联`, ['建联方式', '合作报价', '档期', '备注'], selectedKol)}>
+                  <Send size={12} />
+                  发送建联
+                </button>
+              </div>
               <div
                 className="p-3 rounded text-sm text-secondary"
                 style={{
@@ -578,7 +561,7 @@ function TabKol() {
 /* ============================================================
    Tab 3: 项目进度
    ============================================================ */
-function TabProgress() {
+function TabProgress({ actions }) {
   const [selectedProject, setSelectedProject] = useState('all');
   const [viewMode, setViewMode] = useState('project');
 
@@ -633,7 +616,7 @@ function TabProgress() {
         {projectProgressData
           .filter((p) => selectedProject === 'all' || String(p.id) === selectedProject)
           .map((project) => (
-            <div key={project.id} className="card">
+            <ClickSurface key={project.id} as="div" className="card" onClick={() => actions.openDetail(project.name, { 品牌: project.brand, 阶段: project.stageLabel, 完成度: `${project.overallProgress}%` })}>
               <div className="card-header">
                 <div className="flex items-center gap-3">
                   <span className="text-md font-semibold text-primary">{project.name}</span>
@@ -728,7 +711,7 @@ function TabProgress() {
                   </div>
                 </div>
               </div>
-            </div>
+            </ClickSurface>
           ))}
       </div>
     </div>
@@ -738,7 +721,7 @@ function TabProgress() {
 /* ============================================================
    Tab 4: 广告追踪
    ============================================================ */
-function TabTracking() {
+function TabTracking({ actions }) {
   const nodeStatusColor = {
     running: { bg: 'var(--accent-green-subtle)', border: 'var(--accent-green)', text: 'var(--accent-green)' },
     done: { bg: 'var(--accent-cyan-subtle)', border: 'var(--accent-cyan)', text: 'var(--accent-cyan)' },
@@ -809,7 +792,7 @@ function TabTracking() {
         <div className="flex items-center gap-3">
           {trackingNodes.map((node, index) => (
             <React.Fragment key={node.id}>
-              <div className="card flex-1" style={{ padding: 'var(--space-4)' }}>
+              <ClickSurface as="div" className="card flex-1" onClick={() => actions.openForm(`${node.label}操作`, ['节点动作', '数据范围', '负责人', '备注'], node)} style={{ padding: 'var(--space-4)' }}>
                 <div className="flex items-center justify-between mb-3">
                   <div
                     className="flex items-center justify-center rounded-lg"
@@ -830,7 +813,7 @@ function TabTracking() {
                 </div>
                 <div className="text-sm font-medium text-primary mb-1">{node.label}</div>
                 <div className="text-xs font-mono text-muted">{node.dataCount}</div>
-              </div>
+              </ClickSurface>
               {index < trackingNodes.length - 1 && (
                 <ArrowRight size={20} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
               )}
@@ -846,7 +829,7 @@ function TabTracking() {
           <div className="card-header">
             <h3>平台效果对比</h3>
           </div>
-          <DataTable columns={platformColumns} data={platformCompareData} />
+          <DataTable columns={platformColumns} data={platformCompareData} onRowClick={(row) => actions.openDetail(`${row.platform}效果对比`, row)} />
         </div>
 
         {/* Anomaly Detection */}
@@ -857,10 +840,14 @@ function TabTracking() {
           <div className="card-body">
             <div className="flex flex-col gap-4">
               {anomalyList.map((item) => (
-                <div
+                <button
+                  type="button"
                   key={item.id}
                   className="flex items-start gap-3 p-3 rounded-lg"
+                  onClick={() => actions.openForm(item.type, ['处理动作', '负责人', '完成时间', '备注'], item)}
                   style={{
+                    width: '100%',
+                    textAlign: 'left',
                     backgroundColor: item.severity === 'urgent' ? 'var(--accent-red-subtle)' : 'var(--accent-amber-subtle)',
                     border: `1px solid ${anomalySeverityColor[item.severity]}`,
                   }}
@@ -881,7 +868,7 @@ function TabTracking() {
                     <span className="text-sm text-secondary">{item.content}</span>
                     <span className="text-xs text-muted mt-1">{item.time}</span>
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           </div>
@@ -894,7 +881,7 @@ function TabTracking() {
 /* ============================================================
    Tab 5: 预算优化
    ============================================================ */
-function TabBudget() {
+function TabBudget({ actions }) {
   const budgetColumns = [
     { key: 'item', label: '投放项目', render: (val) => <span className="font-medium text-primary text-sm">{val}</span> },
     { key: 'platform', label: '平台', render: (val) => <Badge variant="neutral">{val}</Badge> },
@@ -943,7 +930,7 @@ function TabBudget() {
       {/* Budget Allocation Table */}
       <div>
         <div className="section-title">预算分配明细</div>
-        <DataTable columns={budgetColumns} data={budgetAllocationData} />
+        <DataTable columns={budgetColumns} data={budgetAllocationData} onRowClick={(row) => actions.openDetail(`${row.item}预算`, row)} />
       </div>
 
       {/* Bottom: Warnings + Optimization Suggestions */}
@@ -956,10 +943,14 @@ function TabBudget() {
           <div className="card-body">
             <div className="flex flex-col gap-3">
               {warningList.map((item) => (
-                <div
+                <button
+                  type="button"
                   key={item.id}
                   className="flex items-start gap-3 p-3 rounded-lg"
+                  onClick={() => actions.openForm(`${item.item}预警处理`, ['处理动作', '调整预算', '负责人', '备注'], item)}
                   style={{
+                    width: '100%',
+                    textAlign: 'left',
                     backgroundColor: 'var(--accent-red-subtle)',
                     border: '1px solid var(--accent-red)',
                   }}
@@ -977,7 +968,7 @@ function TabBudget() {
                       <Zap size={10} style={{ display: 'inline', verticalAlign: 'middle' }} /> {item.suggestion}
                     </span>
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           </div>
@@ -1011,7 +1002,7 @@ function TabBudget() {
                     <span className="text-xs font-mono" style={{ color: 'var(--accent-green)' }}>
                       {item.expected}
                     </span>
-                    <button className="btn btn-sm btn-primary">
+                    <button className="btn btn-sm btn-primary" onClick={() => actions.openForm(item.title, ['执行动作', '预算来源', '生效时间', '备注'], item)}>
                       执行优化
                     </button>
                   </div>
@@ -1029,45 +1020,44 @@ function TabBudget() {
    Main Component
    ============================================================ */
 export default function MediaDashboard() {
-  const [activeTab, setActiveTab] = useState('overview');
+  const navigate = useNavigate();
+  const { tab } = useParams();
+  const navToTab = { influencer: 'kol', 'ad-tracking': 'tracking' };
+  const tabToNav = { kol: 'influencer', tracking: 'ad-tracking' };
+  const initialTab = navToTab[tab] || (tabs.some((item) => item.key === tab) ? tab : 'overview');
+  const [activeTab, setActiveTab] = useState(initialTab);
+  const actions = useWorkbenchActions();
+
+  useEffect(() => {
+    const nextTab = navToTab[tab] || tab;
+    if (tabs.some((item) => item.key === nextTab)) {
+      setActiveTab(nextTab);
+    }
+  }, [tab]);
+
+  const handleTabChange = (nextTab) => {
+    setActiveTab(nextTab);
+    navigate(`/workbench/media/${tabToNav[nextTab] || nextTab}`);
+  };
 
   const renderTabContent = () => {
     switch (activeTab) {
-      case 'overview': return <TabOverview />;
-      case 'kol': return <TabKol />;
-      case 'progress': return <TabProgress />;
-      case 'tracking': return <TabTracking />;
-      case 'budget': return <TabBudget />;
-      default: return <TabOverview />;
+      case 'overview': return <TabOverview actions={actions} />;
+      case 'kol': return <TabKol actions={actions} />;
+      case 'progress': return <TabProgress actions={actions} />;
+      case 'tracking': return <TabTracking actions={actions} />;
+      case 'budget': return <TabBudget actions={actions} />;
+      default: return <TabOverview actions={actions} />;
     }
   };
 
   return (
     <div className="flex flex-col h-full">
-      <PageHeader
-        title="媒介工作台"
-        subtitle="达人管理 | 项目进度 | 广告追踪 | 预算优化"
-        breadcrumbs={[
-          { label: '工作台' },
-          { label: '媒介工作台' },
-        ]}
-        actions={
-          <div className="flex items-center gap-3">
-            <button className="btn btn-secondary btn-sm">
-              <Download size={14} />
-              导出报表
-            </button>
-            <button className="btn btn-primary btn-sm">
-              <UserPlus size={14} />
-              新建合作
-            </button>
-          </div>
-        }
-      />
-      <TabBar tabs={tabs} activeTab={activeTab} onChange={setActiveTab} />
       <div className="page-body">
         {renderTabContent()}
       </div>
+      {actions.toastNode}
+      {actions.modalNode}
     </div>
   );
 }

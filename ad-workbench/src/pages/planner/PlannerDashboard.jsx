@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import {
   Search, FileText, Sparkles, AlertCircle, TrendingUp, BarChart3,
   Eye, Brain, Bot, Globe, Video, Image, Radio, Plus, Filter,
@@ -14,6 +15,9 @@ import TabBar from '../../components/TabBar';
 import PageHeader from '../../components/PageHeader';
 import AgentCard from '../../components/AgentCard';
 import KpiCard from '../../components/KpiCard';
+import ProjectWorkspacePanel from '../../components/ProjectWorkspacePanel';
+import { ClickSurface, useWorkbenchActions } from '../../components/WorkbenchActionKit';
+import { projectWorkspaceApi, useProjectWorkspace } from '../../shared/projectWorkspace';
 
 /* ============================================================
    Mock Data
@@ -230,7 +234,10 @@ function renderStatusBadge(status) {
 /* ============================================================
    Tab 1: 工作概览
    ============================================================ */
-function TabOverview() {
+function TabOverview({ actions, workspace }) {
+  const summary = workspace.metrics?.summary || {};
+  const planner = workspace.metrics?.role_efficiency?.planner || {};
+  const pendingHandoffs = workspace.handoffs.filter((item) => item.from_role === 'planner' && item.status === 'pending');
   const briefColumns = [
     { key: 'name', label: 'Brief 名称' },
     { key: 'brand', label: '品牌' },
@@ -242,91 +249,66 @@ function TabOverview() {
     <div className="flex flex-col gap-6">
       {/* Top StatCards */}
       <div className="grid grid-cols-4 gap-4">
-        <StatCard
-          title="监控品牌数"
-          value="12"
-          change={2}
-          changeLabel="本月"
-          icon={Search}
-          color="purple"
-        />
-        <StatCard
-          title="活跃 Brief"
-          value="8"
-          change={3}
-          changeLabel="本周"
-          icon={FileText}
-          color="cyan"
-        />
-        <StatCard
-          title="创意方案"
-          value="23"
-          change={-5}
-          changeLabel="vs 上月"
-          icon={Sparkles}
-          color="amber"
-        />
-        <StatCard
-          title="待审核"
-          value="5"
-          change={0}
-          changeLabel="紧急"
-          icon={AlertCircle}
-          color="red"
-        />
+        <ClickSurface onClick={() => actions.openDetail('监控品牌数', { 品牌数: 12, 本月新增: 2, 覆盖平台: '小红书 / 抖音 / B站 / 微博' })}>
+          <StatCard title="项目健康度" value={summary.health_score ?? 0} icon={Target} color="purple" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('活跃 Brief', { Brief: 8, 本周新增: 3, 待评审: 5 })}>
+          <StatCard title="Brief 资产" value={planner.brief_assets || 0} icon={FileText} color="cyan" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('创意方案', { 方案数: 23, 已通过: 12, 待优化: 6 })}>
+          <StatCard title="策略资产" value={planner.strategy_assets || 0} icon={Sparkles} color="amber" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openForm('待审核处理', ['审核对象', '审核人', '处理时限', '处理意见'], { 待审核: 5, 紧急级别: '高' })}>
+          <StatCard title="待接交接" value={pendingHandoffs.length} icon={AlertCircle} color="red" />
+        </ClickSurface>
       </div>
 
       {/* KPI Cards */}
       <div className="grid grid-cols-2 gap-4">
-        <KpiCard
-          title="声量覆盖率"
-          value="78%"
-          target={85}
-          current={78}
-          color="purple"
-          trend={[
+        <ClickSurface onClick={() => actions.openDetail('声量覆盖率', { 当前值: '78%', 目标: '85%', 缺口: '7%' })}>
+          <KpiCard title="声量覆盖率" value="78%" target={85} current={78} color="purple" trend={[
             { value: 65 }, { value: 70 }, { value: 68 }, { value: 72 }, { value: 75 }, { value: 78 },
-          ]}
-        />
-        <KpiCard
-          title="策略产出效率"
-          value="92%"
-          target={90}
-          current={92}
-          color="green"
-          trend={[
+          ]} />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('策略产出效率', { 当前值: '92%', 目标: '90%', 状态: '超目标' })}>
+          <KpiCard title="策略产出效率" value="92%" target={90} current={92} color="green" trend={[
             { value: 80 }, { value: 85 }, { value: 82 }, { value: 88 }, { value: 90 }, { value: 92 },
-          ]}
-        />
+          ]} />
+        </ClickSurface>
       </div>
 
       {/* Agent Status */}
       <div>
         <div className="section-title">Agent 状态</div>
         <div className="grid grid-cols-2 gap-4">
-          <AgentCard
-            name="Insight Node"
-            type="舆情数据采集"
-            status="running"
-            lastRun="10 分钟前"
-            output="已抓取 1,234 条数据"
-            icon={Brain}
-          />
-          <AgentCard
-            name="Brief Parser"
-            type="Brief 智能解析"
-            status="idle"
-            lastRun="2 小时前"
-            output="已解析 8 份 Brief"
-            icon={Bot}
-          />
+          <ClickSurface onClick={() => actions.openForm('Insight Node 调度', ['调度动作', '监控品牌', '运行频率', '备注'])}>
+            <AgentCard name="Insight Node" type="舆情数据采集" status="running" lastRun="10 分钟前" output="已抓取 1,234 条数据" icon={Brain} />
+          </ClickSurface>
+          <ClickSurface onClick={() => actions.openForm('Brief Parser 调度', ['解析对象', '模板', '负责人', '备注'])}>
+            <AgentCard name="Brief Parser" type="Brief 智能解析" status="idle" lastRun="2 小时前" output="已解析 8 份 Brief" icon={Bot} />
+          </ClickSurface>
         </div>
       </div>
 
       {/* Recent Briefs Table */}
       <div>
-        <div className="section-title">最近 Brief</div>
-        <DataTable columns={briefColumns} data={recentBriefs} />
+        <div className="section-title">最近项目动态</div>
+        <DataTable
+          columns={[
+            { key: 'action', label: '动作' },
+            { key: 'target', label: '对象' },
+            { key: 'operator', label: '操作人' },
+            { key: 'created_at', label: '时间', render: (val) => <span className="font-mono text-muted">{val}</span> },
+          ]}
+          data={workspace.logs.slice(0, 6)}
+          onRowClick={(row) => actions.openDetail(row.action, row)}
+          emptyText="暂无项目动态"
+        />
+      </div>
+
+      <div>
+        <div className="section-title">示例 Brief 模板</div>
+        <DataTable columns={briefColumns} data={recentBriefs} onRowClick={(row) => actions.openDetail(row.name, row)} />
       </div>
     </div>
   );
@@ -335,7 +317,7 @@ function TabOverview() {
 /* ============================================================
    Tab 2: 舆情洞察
    ============================================================ */
-function TabInsight() {
+function TabInsight({ actions }) {
   const [activePlatform, setActivePlatform] = useState('all');
   const platforms = [
     { key: 'all', label: '全部' },
@@ -363,7 +345,10 @@ function TabInsight() {
             <button
               key={p.key}
               className={`btn btn-sm ${activePlatform === p.key ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => setActivePlatform(p.key)}
+              onClick={() => {
+                setActivePlatform(p.key);
+                actions.notify(`已切换到${p.label}舆情数据`);
+              }}
             >
               {p.label}
             </button>
@@ -382,7 +367,12 @@ function TabInsight() {
           <div className="chart-body">
             <div className="flex items-end gap-4" style={{ height: 180 }}>
               {volumeData.map((d) => (
-                <div key={d.day} className="flex flex-col items-center gap-2 flex-1">
+                <button
+                  type="button"
+                  key={d.day}
+                  className="flex flex-col items-center gap-2 flex-1"
+                  onClick={() => actions.openDetail(`${d.day}声量明细`, { 日期: d.day, 声量: d.value, 平台: activePlatform })}
+                >
                   <span className="text-xs font-mono text-secondary">{(d.value / 1000).toFixed(1)}K</span>
                   <div
                     style={{
@@ -395,7 +385,7 @@ function TabInsight() {
                     }}
                   />
                   <span className="text-xs text-muted">{d.day}</span>
-                </div>
+                </button>
               ))}
             </div>
           </div>
@@ -459,7 +449,12 @@ function TabInsight() {
           <div className="card-body">
             <div className="flex flex-col gap-4">
               {consumerPainPoints.map((item) => (
-                <div key={item.rank} className="flex items-center gap-3">
+                <button
+                  key={item.rank}
+                  type="button"
+                  className="flex items-center gap-3 workbench-inline-row"
+                  onClick={() => actions.openForm(`${item.text}洞察处理`, ['洞察主题', '关联品牌', '策略动作', '备注'], item)}
+                >
                   <span
                     className="flex-shrink-0 flex items-center justify-center font-mono font-bold text-xs"
                     style={{
@@ -479,7 +474,7 @@ function TabInsight() {
                     </div>
                     <ProgressBar value={item.percentage} color={item.rank === 1 ? 'purple' : 'blue'} size="sm" />
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           </div>
@@ -493,7 +488,12 @@ function TabInsight() {
           <div className="card-body">
             <div className="flex flex-col gap-5">
               {competitorSOV.map((item) => (
-                <div key={item.brand}>
+                <button
+                  key={item.brand}
+                  type="button"
+                  className="workbench-inline-row"
+                  onClick={() => actions.openDetail(`${item.brand} SOV 明细`, item)}
+                >
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-sm text-primary font-medium">{item.brand}</span>
                     <span className="text-sm font-mono font-semibold" style={{ color: item.color }}>
@@ -511,7 +511,7 @@ function TabInsight() {
                       }}
                     />
                   </div>
-                </div>
+                </button>
               ))}
             </div>
             <div className="mt-6 pt-4" style={{ borderTop: '1px solid var(--border-subtle)' }}>
@@ -530,7 +530,127 @@ function TabInsight() {
 /* ============================================================
    Tab 3: Brief 中心
    ============================================================ */
-function TabBrief() {
+function TabBrief({ actions, workspace }) {
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiResult, setAiResult] = useState(null);
+  const [form, setForm] = useState(() => ({
+    background: workspace.currentProject?.brief || '',
+    sellingPoints: 'AI 答疑、错题整理、家长减负',
+    audience: '小升初、初中、高中大孩家庭',
+    goals: '提升目标家庭对答疑笔的场景认知',
+    kpi: '入池达人 50 位，确认合作 10 位',
+    budget: '总预算 120000，单达人不超过 20000',
+    risk: '避免夸大提分、医疗化承诺和绝对化表达',
+  }));
+
+  useEffect(() => {
+    setForm((current) => ({ ...current, background: workspace.currentProject?.brief || current.background }));
+  }, [workspace.currentProject?.brief]);
+
+  const saveBrief = async (submitHandoff = false) => {
+    if (!workspace.projectId) return;
+    const briefText = [
+      form.background,
+      `核心卖点：${form.sellingPoints}`,
+      `目标人群：${form.audience}`,
+      `传播目标：${form.goals}`,
+      `KPI：${form.kpi}`,
+      `预算：${form.budget}`,
+      `风险禁区：${form.risk}`,
+    ].join('\n');
+    await projectWorkspaceApi.saveProject(workspace.projectId, { brief: briefText });
+    await projectWorkspaceApi.createAsset(workspace.projectId, {
+      asset_type: 'brief',
+      title: `${workspace.currentProject?.project_name || '项目'} Brief`,
+      payload: form,
+      created_by: '策划',
+    });
+    if (submitHandoff) {
+      await projectWorkspaceApi.createHandoff(workspace.projectId, {
+        from_role: 'planner',
+        to_role: 'executor',
+        title: '策划 Brief 交接给执行',
+        summary: form.goals,
+        created_by: '策划',
+        payload: {
+          brief: form,
+          execution_tasks: [
+            { title: '拆解内容交付物和排期', description: form.goals, priority: 'high' },
+            { title: '确认达人内容审核口径', description: form.risk, priority: 'medium' },
+            { title: '建立日报回流节奏', description: form.kpi, priority: 'medium' },
+          ],
+        },
+      });
+      await projectWorkspaceApi.createHandoff(workspace.projectId, {
+        from_role: 'planner',
+        to_role: 'screening',
+        title: '达人筛选标准草案',
+        summary: form.audience,
+        created_by: '策划',
+        payload: {
+          creator_requirements: {
+            audience: form.audience,
+            budget: form.budget,
+            sellingPoints: form.sellingPoints,
+            risk: form.risk,
+          },
+        },
+      });
+    }
+    await workspace.reloadCurrentProject();
+    actions.notify(submitHandoff ? 'Brief 已保存并生成交接单' : 'Brief 已保存为项目资产');
+  };
+
+  const runAiBrief = async () => {
+    if (!workspace.projectId) return;
+    setAiBusy(true);
+    try {
+      const result = await projectWorkspaceApi.aiBrief(workspace.projectId, {
+        input_text: form.background || workspace.currentProject?.brief || '',
+        persist: true,
+        operator: '策划',
+      });
+      const brief = result.brief || {};
+      setForm((current) => ({
+        ...current,
+        background: brief.background || current.background,
+        sellingPoints: Array.isArray(brief.selling_points) ? brief.selling_points.join('、') : (brief.selling_points || current.sellingPoints),
+        audience: brief.audience || current.audience,
+        goals: brief.goals || current.goals,
+        kpi: brief.kpi || current.kpi,
+        budget: brief.budget || current.budget,
+        risk: Array.isArray(brief.risk) ? brief.risk.join('、') : (brief.risk || current.risk),
+      }));
+      setAiResult({ type: 'brief', source: result.source, message: result.message, payload: brief });
+      await workspace.reloadCurrentProject();
+      actions.notify(result.source === 'llm' ? 'AI Brief 拆解完成' : '已用规则生成 Brief 草案');
+    } catch (error) {
+      actions.notify(error.message || 'AI Brief 拆解失败');
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const runAiHandoff = async (targetRole = 'executor') => {
+    if (!workspace.projectId) return;
+    setAiBusy(true);
+    try {
+      const result = await projectWorkspaceApi.aiHandoff(workspace.projectId, {
+        target_role: targetRole,
+        payload: { brief: form },
+        persist: true,
+        operator: '策划',
+      });
+      setAiResult({ type: 'handoff', source: result.source, message: result.message, payload: result.handoffDraft });
+      await workspace.reloadCurrentProject();
+      actions.notify(targetRole === 'executor' ? 'AI 已生成执行交接单' : 'AI 已生成达人筛选交接单');
+    } catch (error) {
+      actions.notify(error.message || 'AI 交接生成失败');
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
   const w2hLabels = {
     what: 'What',
     who: 'Who',
@@ -545,20 +665,73 @@ function TabBrief() {
     <div className="flex flex-col gap-6">
       {/* Action Bar */}
       <div className="flex items-center justify-between">
-        <button className="btn btn-primary">
+        <button className="btn btn-primary" onClick={() => saveBrief(true)}>
           <Plus size={14} />
-          新建 Brief
+          保存并交接
         </button>
+        <div className="flex items-center gap-2">
+          <button className="btn btn-secondary btn-sm" disabled={aiBusy} onClick={runAiBrief}>
+            <Bot size={14} />
+            AI 拆解 Brief
+          </button>
+          <button className="btn btn-secondary btn-sm" disabled={aiBusy} onClick={() => runAiHandoff('executor')}>
+            <Sparkles size={14} />
+            AI 执行交接
+          </button>
+          <button className="btn btn-secondary btn-sm" disabled={aiBusy} onClick={() => runAiHandoff('screening')}>
+            <Users size={14} />
+            AI 筛选交接
+          </button>
+        </div>
         <div className="search-box" style={{ width: 320 }}>
           <span className="search-icon"><Search size={14} /></span>
           <input className="search-input" placeholder="搜索 Brief..." />
         </div>
       </div>
 
+      {aiResult && (
+        <div className="card ai-result-panel">
+          <div className="card-header">
+            <h3>AI 结果预览</h3>
+            <Badge variant={aiResult.source === 'llm' ? 'green' : 'amber'}>{aiResult.source === 'llm' ? '模型生成' : '规则兜底'}</Badge>
+          </div>
+          <div className="card-body">
+            <pre>{JSON.stringify(aiResult.payload, null, 2)}</pre>
+          </div>
+        </div>
+      )}
+
+      <div className="card">
+        <div className="card-header">
+          <h3>当前项目 Brief</h3>
+          <button type="button" className="btn btn-secondary btn-sm" onClick={() => saveBrief(false)}>保存草稿</button>
+        </div>
+        <div className="card-body compact-form">
+          {[
+            ['background', '项目背景'],
+            ['sellingPoints', '核心卖点'],
+            ['audience', '目标人群'],
+            ['goals', '传播目标'],
+            ['kpi', 'KPI'],
+            ['budget', '预算范围'],
+            ['risk', '内容禁区'],
+          ].map(([key, label]) => (
+            <label key={key} className={key === 'background' || key === 'risk' ? 'full' : ''}>
+              <span>{label}</span>
+              {key === 'background' || key === 'risk' ? (
+                <textarea rows={3} value={form[key]} onChange={(event) => setForm({ ...form, [key]: event.target.value })} />
+              ) : (
+                <input value={form[key]} onChange={(event) => setForm({ ...form, [key]: event.target.value })} />
+              )}
+            </label>
+          ))}
+        </div>
+      </div>
+
       {/* Brief Cards */}
       <div className="flex flex-col gap-4">
         {briefCards.map((brief) => (
-          <div key={brief.id} className="card">
+          <ClickSurface key={brief.id} className="card" onClick={() => actions.openDetail(brief.briefName, { 品牌: brief.brand, 状态: statusBadgeMap[brief.status]?.label, 目标人群: brief.targetAudience })}>
             <div className="card-header">
               <div className="flex items-center gap-3">
                 <span className="text-md font-semibold text-primary">{brief.brand}</span>
@@ -651,7 +824,7 @@ function TabBrief() {
                 </div>
               </div>
             </div>
-          </div>
+          </ClickSurface>
         ))}
       </div>
     </div>
@@ -661,7 +834,42 @@ function TabBrief() {
 /* ============================================================
    Tab 4: 创意策略
    ============================================================ */
-function TabCreative() {
+function TabCreative({ actions, workspace }) {
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiStrategy, setAiStrategy] = useState(null);
+  const saveStrategy = async () => {
+    await projectWorkspaceApi.createAsset(workspace.projectId, {
+      asset_type: 'strategy',
+      title: '大孩家庭教育场景内容策略包',
+      created_by: '策划',
+      payload: {
+        positioning: '家长减负型学习陪伴工具',
+        core_message: '把课后答疑从家庭拉扯变成可持续的学习支持',
+        content_angles: ['真实陪读场景', '错题复盘', '孩子自主学习'],
+        platform_plan: ['小红书深度种草', '抖音场景短视频', 'B站学习方法长内容'],
+        execution_notes: ['保留真实错题场景', '统一风险词审核'],
+      },
+    });
+    await workspace.reloadCurrentProject();
+    actions.notify('创意策略已保存为项目资产');
+  };
+  const generateStrategy = async () => {
+    setAiBusy(true);
+    try {
+      const result = await projectWorkspaceApi.aiStrategy(workspace.projectId, {
+        input_text: workspace.currentProject?.brief || '',
+        persist: true,
+        operator: '策划',
+      });
+      setAiStrategy(result.strategy);
+      await workspace.reloadCurrentProject();
+      actions.notify(result.source === 'llm' ? 'AI 策略已生成' : '已用规则生成策略草案');
+    } catch (error) {
+      actions.notify(error.message || 'AI 策略生成失败');
+    } finally {
+      setAiBusy(false);
+    }
+  };
   const contentTypeIcons = {
     '图文': <Image size={12} />,
     '视频': <Video size={12} />,
@@ -697,13 +905,35 @@ function TabCreative() {
           color="green"
         />
       </div>
+      <div className="flex justify-end">
+        <button type="button" className="btn btn-secondary" disabled={aiBusy} onClick={generateStrategy}>
+          <Bot size={14} />
+          AI 生成策略
+        </button>
+        <button type="button" className="btn btn-primary" onClick={saveStrategy}>
+          <Sparkles size={14} />
+          保存策略资产
+        </button>
+      </div>
+
+      {aiStrategy && (
+        <div className="card ai-result-panel">
+          <div className="card-header">
+            <h3>AI 策略包</h3>
+            <Badge variant="green">已保存</Badge>
+          </div>
+          <div className="card-body">
+            <pre>{JSON.stringify(aiStrategy, null, 2)}</pre>
+          </div>
+        </div>
+      )}
 
       {/* Creative Inspiration Board */}
       <div>
         <div className="section-title">创意灵感板</div>
         <div className="grid grid-cols-2 gap-4">
           {creativeCards.map((card) => (
-            <div key={card.id} className="card" style={{ overflow: 'hidden' }}>
+            <ClickSurface key={card.id} className="card" onClick={() => actions.openForm(`${card.title}创意评审`, ['评审结论', '适用平台', '负责人', '修改建议'], card)} style={{ overflow: 'hidden' }}>
               {/* Cover Image Placeholder */}
               <div
                 className="flex items-center justify-center"
@@ -737,7 +967,7 @@ function TabCreative() {
                   {card.hook}
                 </p>
               </div>
-            </div>
+            </ClickSurface>
           ))}
         </div>
       </div>
@@ -748,7 +978,7 @@ function TabCreative() {
 /* ============================================================
    Tab 5: 社媒看板
    ============================================================ */
-function TabSocial() {
+function TabSocial({ actions }) {
   const maxSocialVolume = Math.max(...socialVolumeData.map((d) => d.value));
 
   // Build SVG polyline for line chart
@@ -949,7 +1179,7 @@ function TabSocial() {
           <div className="card-header">
             <h3>KOL 评价体系</h3>
           </div>
-          <DataTable columns={kolColumns} data={kolData} />
+          <DataTable columns={kolColumns} data={kolData} onRowClick={(row) => actions.openDetail(`${row.name} KOL 评价`, row)} />
         </div>
 
         {/* Topic Tag Cloud */}
@@ -963,9 +1193,11 @@ function TabSocial() {
                 const sizeStyle = tagSizeMap[tag.size];
                 const colorStyle = tagColorMap[tag.color];
                 return (
-                  <span
+                  <button
+                    type="button"
                     key={i}
                     className="tag"
+                    onClick={() => actions.openDetail(`${tag.text}主题聚类`, { 主题: tag.text, 热度: tag.size, 情绪: tag.color })}
                     style={{
                       fontSize: sizeStyle.fontSize,
                       padding: sizeStyle.padding,
@@ -976,7 +1208,7 @@ function TabSocial() {
                     }}
                   >
                     {tag.text}
-                  </span>
+                  </button>
                 );
               })}
             </div>
@@ -990,46 +1222,43 @@ function TabSocial() {
 /* ============================================================
    Main Component
    ============================================================ */
-export default function PlannerDashboard() {
-  const [activeTab, setActiveTab] = useState('overview');
+export default function PlannerDashboard({ selectedProjectId, onSelectedProjectIdChange }) {
+  const navigate = useNavigate();
+  const { tab } = useParams();
+  const initialTab = tabs.some((item) => item.key === tab) ? tab : 'overview';
+  const [activeTab, setActiveTab] = useState(initialTab);
+  const actions = useWorkbenchActions();
+  const workspace = useProjectWorkspace(selectedProjectId, onSelectedProjectIdChange);
+
+  useEffect(() => {
+    if (tabs.some((item) => item.key === tab)) {
+      setActiveTab(tab);
+    }
+  }, [tab]);
+
+  const handleTabChange = (nextTab) => {
+    setActiveTab(nextTab);
+    navigate(`/workbench/planner/${nextTab}`);
+  };
 
   const renderTabContent = () => {
     switch (activeTab) {
-      case 'overview': return <TabOverview />;
-      case 'insight': return <TabInsight />;
-      case 'brief': return <TabBrief />;
-      case 'creative': return <TabCreative />;
-      case 'social': return <TabSocial />;
-      default: return <TabOverview />;
+      case 'overview': return <TabOverview actions={actions} workspace={workspace} />;
+      case 'insight': return <TabInsight actions={actions} workspace={workspace} />;
+      case 'brief': return <TabBrief actions={actions} workspace={workspace} />;
+      case 'creative': return <TabCreative actions={actions} workspace={workspace} />;
+      case 'social': return <TabSocial actions={actions} />;
+      default: return <TabOverview actions={actions} workspace={workspace} />;
     }
   };
 
   return (
     <div className="flex flex-col h-full">
-      <PageHeader
-        title="策划工作台"
-        subtitle="品牌策略 | 舆情监控 | 创意管理"
-        breadcrumbs={[
-          { label: '工作台' },
-          { label: '策划工作台' },
-        ]}
-        actions={
-          <div className="flex items-center gap-3">
-            <button className="btn btn-secondary btn-sm">
-              <Filter size={14} />
-              筛选
-            </button>
-            <button className="btn btn-primary btn-sm">
-              <Plus size={14} />
-              新建任务
-            </button>
-          </div>
-        }
-      />
-      <TabBar tabs={tabs} activeTab={activeTab} onChange={setActiveTab} />
       <div className="page-body">
         {renderTabContent()}
       </div>
+      {actions.toastNode}
+      {actions.modalNode}
     </div>
   );
 }

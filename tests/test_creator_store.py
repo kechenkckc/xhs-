@@ -13,6 +13,7 @@ from rpa_mcp_sync.creator_store import (
     review_creator,
     score_creator,
     score_project,
+    score_values,
     score_values_batch_with_llm,
     standard_feishu_rows,
     update_creator_metrics,
@@ -21,7 +22,14 @@ from rpa_mcp_sync.creator_store import (
 )
 from rpa_mcp_sync.config_store import ROOT
 from rpa_mcp_sync.feishu_field_agent import analyze_field_mapping, apply_field_mapping
-from rpa_mcp_sync.pgy_browser import _collect_audience_profile_chart_metrics, _extract_note_cases, _extract_performance_state, _visible_text_lines
+from rpa_mcp_sync.pgy_browser import (
+    _annotate_note_cases_with_traffic_reference,
+    _collect_audience_profile_chart_metrics,
+    _extract_note_cases,
+    _extract_performance_state,
+    _merge_note_case_assets,
+    _visible_text_lines,
+)
 
 
 def test_creator_upsert_deduplicates_and_scores():
@@ -54,7 +62,7 @@ def test_creator_upsert_deduplicates_and_scores():
     assert first["creator_id"] == second["creator_id"]
     scored = score_creator(project_id, second["creator_id"], use_llm=False)
     assert scored["hard_filter_passed"] == 1
-    assert scored["total_score"] >= 75
+    assert scored["total_score"] >= 70
     assert scored["budget_score"] is not None
     assert scored["fans_score"] is not None
     assert scored["cpe_score"] is not None
@@ -72,6 +80,69 @@ def test_hard_filter_threshold_parser_handles_mixed_descriptions():
     assert _threshold_from_text("CPC 2；CPE 20，优先 CPE 10 以下", "cpe") == 20
     assert _threshold_from_text("图文笔记阅读单价 0.5～1.0", "cpc") == 1.0
     assert _threshold_from_text("图文笔记互动单价 10～20", "cpe") == 20
+
+
+def test_scoring_caps_low_recent_reads_even_when_profile_and_quote_match():
+    score = score_values(
+        {
+            "creator_id": "pytest-low-read-profile",
+            "nickname": "低阅读教育妈妈",
+            "pgy_url": "https://pgy.xiaohongshu.com/creator/low-read",
+            "followers_count": 2000,
+            "quote_price": 280,
+            "fans_35_plus_ratio": 0.5,
+            "creator_type": "教育/vlog/沉浸式/开箱",
+            "persona_tags": "12岁以上、妈妈、学生、小升初",
+            "raw_payload": {
+                "recent_notes": [
+                    {"title": "期中总结", "read_count": 79, "like_count": 4, "save_count": 2},
+                    {"title": "晚间学习", "read_count": 195, "like_count": 12, "save_count": 2},
+                    {"title": "学习方法", "read_count": 294, "like_count": 17, "save_count": 5},
+                    {"title": "刷题", "read_count": 158, "like_count": 6, "save_count": 2},
+                ]
+            },
+        }
+    )
+    assert score["total_score"] <= 79
+    assert score["initial_tier"] == "B"
+    assert "近期笔记阅读未达较好数据" in score["score_reason"]
+
+
+def test_scoring_uses_cpm_to_accept_higher_quote_when_exposure_is_good():
+    efficient = score_values(
+        {
+            "creator_id": "pytest-good-cpm",
+            "nickname": "高曝光小粉",
+            "pgy_url": "https://pgy.xiaohongshu.com/creator/good-cpm",
+            "followers_count": 2000,
+            "quote_price": 1000,
+            "daily_exposure_median": 20000,
+            "daily_read_median": 1500,
+            "fans_35_plus_ratio": 0.5,
+            "creator_type": "教育/测评",
+            "persona_tags": "妈妈、家长、学习工具、小升初",
+            "raw_payload": {"recent_notes": [{"title": "学习工具测评", "read_count": 1500, "like_count": 100, "save_count": 60}]},
+        }
+    )
+    inefficient = score_values(
+        {
+            "creator_id": "pytest-bad-cpm",
+            "nickname": "低曝光小粉",
+            "pgy_url": "https://pgy.xiaohongshu.com/creator/bad-cpm",
+            "followers_count": 2000,
+            "quote_price": 1000,
+            "daily_exposure_median": 3000,
+            "daily_read_median": 1500,
+            "fans_35_plus_ratio": 0.5,
+            "creator_type": "教育/测评",
+            "persona_tags": "妈妈、家长、学习工具、小升初",
+            "raw_payload": {"recent_notes": [{"title": "学习工具测评", "read_count": 1500, "like_count": 100, "save_count": 60}]},
+        }
+    )
+    assert "CPM 50.0 达标" in efficient["score_reason"]
+    assert "CPM 333.3 偏高" in inefficient["score_reason"]
+    assert inefficient["total_score"] <= 84
+    assert efficient["total_score"] > inefficient["total_score"]
 
 
 def test_creator_upsert_persists_full_collection_metrics():
@@ -205,6 +276,32 @@ def test_pgy_detail_note_case_parser_keeps_cooperation_brand():
     assert cases[0]["read_count"] == 9760
     assert cases[1]["brand"] == "八九间BAJOJAN"
     assert cases[1]["has_promoted_traffic"] is True
+
+
+def test_pgy_detail_note_cases_keep_cover_link_and_median_contrast():
+    cases = [
+        {"brand": "作业帮智能教育", "title": "破防了，原来告别低效抄错题这么简单啊！", "read_count": 9760, "like_count": 456, "save_count": 294, "published_at": "2026-05-07"},
+        {"brand": "八九间BAJOJAN", "title": "孩子写作业爱晃悠？换这把学习椅直接坐得住！", "read_count": 10419, "like_count": 383, "save_count": 159, "published_at": "2026-05-06"},
+    ]
+    assets = [
+        {"title": "破防了，原来告别低效抄错题这么简单啊！", "cover_url": "https://img.example/cover-1.jpg", "note_url": "https://www.xiaohongshu.com/explore/note-1"},
+        {"title": "孩子写作业爱晃悠？换这把学习椅直接坐得住！", "cover_url": "https://img.example/cover-2.jpg", "note_url": "https://www.xiaohongshu.com/explore/note-2"},
+    ]
+    merged = _merge_note_case_assets(cases, assets, "https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/abc")
+    detail = _annotate_note_cases_with_traffic_reference(
+        {
+            "cooperation_read_median": 6000,
+            "cooperation_interaction_median": 300,
+            "raw_payload": {"cooperation_note_cases": merged},
+        }
+    )
+    note = detail["raw_payload"]["cooperation_note_cases"][0]
+    assert note["cover_url"].endswith("cover-1.jpg")
+    assert note["note_url"].endswith("note-1")
+    assert note["read_vs_median"] == 1.627
+    assert note["interaction_vs_median"] == 2.5
+    assert note["has_clear_median_contrast"] is True
+    assert note["traffic_median_reference"]["source"] == "cooperation"
 
 
 def test_audience_profile_chart_metrics_extracts_full_age_distribution():

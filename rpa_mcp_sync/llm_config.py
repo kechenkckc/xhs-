@@ -104,7 +104,7 @@ def chat_json(messages: list[dict[str, str]], config: dict[str, Any] | None = No
         raise RuntimeError("未配置 API Key 或环境变量，无法调用大模型")
     base_url = str(config["base_url"]).rstrip("/")
     timeout = int(config.get("timeout_seconds") or 90)
-    max_tokens = config.get("max_tokens") or 1800
+    max_tokens = config.get("max_tokens") or 4096
     temperature = float(config.get("temperature") if config.get("temperature") is not None else 0.2)
 
     if config.get("protocol") == "gemini":

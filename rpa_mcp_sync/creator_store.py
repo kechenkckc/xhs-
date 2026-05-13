@@ -443,6 +443,52 @@ CREATE TABLE IF NOT EXISTS operation_logs (
   status TEXT,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS project_handoffs (
+  handoff_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  from_role TEXT NOT NULL,
+  to_role TEXT NOT NULL,
+  title TEXT NOT NULL,
+  summary TEXT DEFAULT '',
+  payload TEXT DEFAULT '{}',
+  status TEXT DEFAULT 'pending',
+  created_by TEXT DEFAULT '用户',
+  accepted_by TEXT DEFAULT '',
+  return_reason TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  accepted_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS project_tasks (
+  task_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  source_handoff_id TEXT DEFAULT '',
+  title TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  role TEXT DEFAULT 'executor',
+  owner TEXT DEFAULT '',
+  status TEXT DEFAULT 'todo',
+  priority TEXT DEFAULT 'medium',
+  due_at TEXT DEFAULT '',
+  blocked_reason TEXT DEFAULT '',
+  deliverables TEXT DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS project_assets (
+  asset_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  asset_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  payload TEXT DEFAULT '{}',
+  created_by TEXT DEFAULT '用户',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 
@@ -513,8 +559,16 @@ METRIC_FIELDS = [
     "audience_gender_distribution",
 ]
 
-PROJECT_STATUSES = {"待补数据", "待审核", "已通过", "备选", "已驳回", "已写回飞书", "待建联", "合作中"}
+PROJECT_STATUSES = {"待补数据", "待审核", "已通过", "备选", "已驳回", "已写回飞书", "待建联", "已邀约", "合作中"}
 POOL_STAGES = ["已合作跟进中", "合格达人待合作", "待建联达人", "观察暂缓"]
+
+MARKET_BENCHMARKS = [
+    {"key": "0-3k", "min": 0, "max": 3000, "good_read": 800, "excellent_read": 1200, "quote_good_max": 300, "quote_high_max": 500, "cpm_good_max": 80, "cpc_good_max": 2.0, "cpe_good_max": 20},
+    {"key": "3k-10k", "min": 3000, "max": 10000, "good_read": 1500, "excellent_read": 2500, "quote_good_max": 800, "quote_high_max": 1500, "cpm_good_max": 80, "cpc_good_max": 2.0, "cpe_good_max": 20},
+    {"key": "1w-5w", "min": 10000, "max": 50000, "good_read": 3000, "excellent_read": 6000, "quote_good_max": 2500, "quote_high_max": 5000, "cpm_good_max": 100, "cpc_good_max": 2.0, "cpe_good_max": 20},
+    {"key": "5w-10w", "min": 50000, "max": 100000, "good_read": 6000, "excellent_read": 10000, "quote_good_max": 8000, "quote_high_max": 15000, "cpm_good_max": 120, "cpc_good_max": 2.5, "cpe_good_max": 25},
+    {"key": "10w+", "min": 100000, "max": 10**12, "good_read": 10000, "excellent_read": 20000, "quote_good_max": 20000, "quote_high_max": 50000, "cpm_good_max": 150, "cpc_good_max": 3.0, "cpe_good_max": 30},
+]
 
 
 def is_test_project_id(project_id: str | None) -> bool:
@@ -918,8 +972,20 @@ def _json_metric(value: Any, default: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _parse_payload_json(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def _audience_distribution_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    raw = payload.get("raw_payload") if isinstance(payload.get("raw_payload"), dict) else {}
+    raw = _parse_payload_json(payload.get("raw_payload"))
     chart = raw.get("audience_profile_chart_metrics") if isinstance(raw.get("audience_profile_chart_metrics"), dict) else {}
     chart_metrics = chart.get("metrics") if isinstance(chart.get("metrics"), dict) else {}
     chart_sources = chart.get("sources") if isinstance(chart.get("sources"), list) else []
@@ -1094,6 +1160,8 @@ def stage_from_status(status: str | None, score: Any = None) -> str:
         return "已合作跟进中"
     if status in {"已通过", "备选"}:
         return "合格达人待合作"
+    if status in {"待建联", "已邀约"}:
+        return "待建联达人"
     number = parse_number(score) or 0
     if number >= 70:
         return "待建联达人"
@@ -1999,8 +2067,6 @@ def _score_information_completeness(creator: dict[str, Any]) -> float:
 
 
 def _initial_tier(total_score: Any, hard_pass: bool = True) -> str:
-    if not hard_pass:
-        return "Pass"
     score = parse_number(total_score) or 0
     if score >= 100:
         return "S"
@@ -2015,7 +2081,7 @@ def _initial_tier(total_score: Any, hard_pass: bool = True) -> str:
 
 def _detail_collection_priority(total_score: Any, bonus_score: Any, hard_pass: bool = True) -> str:
     if not hard_pass:
-        return "不补采"
+        return "筛选暂缓"
     score = parse_number(total_score) or 0
     bonus = parse_number(bonus_score) or 0
     if score >= 100:
@@ -2031,7 +2097,7 @@ def _detail_collection_priority(total_score: Any, bonus_score: Any, hard_pass: b
 
 def _recommend_level(total_score: Any, hard_pass: bool = True) -> str:
     if not hard_pass:
-        return "不推荐"
+        return "待复核"
     score = parse_number(total_score) or 0
     if score >= 100:
         return "强推荐"
@@ -2076,6 +2142,401 @@ def _score_bonus(creator: dict[str, Any]) -> tuple[float, list[str]]:
     return round(min(20, bonus), 2), reasons
 
 
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _collect_note_cases_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    cases: list[dict[str, Any]] = []
+    for key in ("recent_note_cases", "recent_notes", "cooperation_note_cases", "note_cases", "notes"):
+        cases.extend(item for item in _as_list(payload.get(key)) if isinstance(item, dict))
+    for page in _as_list(payload.get("cooperation_note_case_pages")):
+        if isinstance(page, dict):
+            cases.extend(item for item in _as_list(page.get("cases")) if isinstance(item, dict))
+    for key in ("detail", "raw_payload"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            cases.extend(_collect_note_cases_from_payload(nested))
+    return cases
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = round((len(ordered) - 1) * percentile)
+    return ordered[max(0, min(len(ordered) - 1, index))]
+
+
+def _market_benchmark_for_followers(followers: Any) -> dict[str, Any]:
+    fans = parse_number(followers) or 0
+    for item in MARKET_BENCHMARKS:
+        if item["min"] < fans <= item["max"] or (fans == 0 and item["min"] == 0):
+            return dict(item)
+    return dict(MARKET_BENCHMARKS[-1])
+
+
+def _read_reference_from_creator(creator: dict[str, Any]) -> float | None:
+    values = [
+        parse_number(creator.get("cooperation_read_median")),
+        parse_number(creator.get("daily_read_median")),
+        parse_number(creator.get("image_daily_read_median")),
+        parse_number(creator.get("video_daily_read_median")),
+    ]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
+def _exposure_reference_from_creator(creator: dict[str, Any]) -> float | None:
+    values = [
+        parse_number(creator.get("cooperation_exposure_median")),
+        parse_number(creator.get("daily_exposure_median")),
+        parse_number(creator.get("image_daily_exposure_median")),
+        parse_number(creator.get("video_daily_exposure_median")),
+    ]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
+def _first_number(*values: Any) -> float | None:
+    for value in values:
+        number = parse_number(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _efficiency_metrics(creator: dict[str, Any], read_reference: Any | None = None) -> dict[str, float | None]:
+    quote = parse_number(creator.get("quote_price"))
+    read = parse_number(read_reference) if read_reference is not None else _read_reference_from_creator(creator)
+    exposure = _exposure_reference_from_creator(creator)
+    cpm = _first_number(creator.get("image_cpm"), creator.get("video_cpm"))
+    cpc = _first_number(creator.get("natural_cpc"), creator.get("image_read_unit_price"), creator.get("video_read_unit_price"))
+    cpe = _first_number(creator.get("natural_cpe"), creator.get("image_interaction_unit_price"), creator.get("video_interaction_unit_price"))
+    estimated_cpm = quote / exposure * 1000 if quote is not None and exposure else None
+    estimated_cpc = quote / read if quote is not None and read else None
+    return {
+        "quote": quote,
+        "read": read,
+        "exposure": exposure,
+        "cpm": cpm,
+        "estimated_cpm": estimated_cpm,
+        "cpc": cpc,
+        "cpe": cpe,
+        "estimated_cpc": estimated_cpc,
+    }
+
+
+def _db_benchmark_for_followers(followers: Any, min_samples: int = 8) -> dict[str, Any] | None:
+    market = _market_benchmark_for_followers(followers)
+    try:
+        with connect() as conn:
+            rows = rows_dict(
+                conn.execute(
+                    """
+                    SELECT quote_price, natural_cpc, natural_cpe, image_cpm, video_cpm,
+                           image_read_unit_price, video_read_unit_price, image_interaction_unit_price, video_interaction_unit_price,
+                           daily_read_median, image_daily_read_median, video_daily_read_median, cooperation_read_median
+                    FROM creator_metrics_current
+                    WHERE followers_count > ? AND followers_count <= ?
+                    """,
+                    (market["min"], market["max"]),
+                ).fetchall()
+            )
+    except Exception:
+        return None
+    reads: list[float] = []
+    quotes: list[float] = []
+    cpms: list[float] = []
+    cpcs: list[float] = []
+    cpes: list[float] = []
+    for row in rows:
+        read = _read_reference_from_creator(row)
+        quote = parse_number(row.get("quote_price"))
+        efficiency = _efficiency_metrics(row, read)
+        if read is not None:
+            reads.append(read)
+        if quote is not None:
+            quotes.append(quote)
+        if efficiency["cpm"] is not None:
+            cpms.append(efficiency["cpm"])
+        if efficiency["cpc"] is not None:
+            cpcs.append(efficiency["cpc"])
+        elif efficiency["estimated_cpc"] is not None:
+            cpcs.append(efficiency["estimated_cpc"])
+        if efficiency["cpe"] is not None:
+            cpes.append(efficiency["cpe"])
+    if len(reads) < min_samples and len(quotes) < min_samples:
+        return None
+    benchmark = dict(market)
+    benchmark["source"] = "database"
+    benchmark["sample_count"] = len(rows)
+    if len(reads) >= min_samples:
+        benchmark["good_read"] = round(_percentile(reads, 0.75) or benchmark["good_read"], 2)
+        benchmark["excellent_read"] = round(max(benchmark["good_read"], _percentile(reads, 0.9) or benchmark["excellent_read"]), 2)
+    if len(quotes) >= min_samples:
+        quote_p50 = _percentile(quotes, 0.5) or benchmark["quote_good_max"]
+        quote_p75 = _percentile(quotes, 0.75) or benchmark["quote_good_max"]
+        benchmark["quote_good_max"] = round(min(benchmark["quote_good_max"], max(quote_p50, quote_p75)), 2)
+        benchmark["quote_high_max"] = round(min(benchmark["quote_high_max"], max(benchmark["quote_good_max"] * 2, quote_p75 * 1.5)), 2)
+    if len(cpms) >= min_samples:
+        benchmark["cpm_good_max"] = round(min(benchmark["cpm_good_max"], _percentile(cpms, 0.5) or benchmark["cpm_good_max"]), 2)
+    if len(cpcs) >= min_samples:
+        benchmark["cpc_good_max"] = round(min(benchmark["cpc_good_max"], _percentile(cpcs, 0.5) or benchmark["cpc_good_max"]), 2)
+    if len(cpes) >= min_samples:
+        benchmark["cpe_good_max"] = round(min(benchmark["cpe_good_max"], _percentile(cpes, 0.5) or benchmark["cpe_good_max"]), 2)
+    return benchmark
+
+
+def _scoring_benchmark_for_creator(creator: dict[str, Any]) -> dict[str, Any]:
+    followers = creator.get("followers_count")
+    benchmark = _db_benchmark_for_followers(followers)
+    if benchmark:
+        return benchmark
+    market = _market_benchmark_for_followers(followers)
+    market["source"] = "market_seed"
+    market["sample_count"] = 0
+    return market
+
+
+def _expected_good_read(followers: Any, benchmark: dict[str, Any] | None = None) -> float:
+    if benchmark:
+        return float(benchmark.get("good_read") or 1000)
+    return float(_market_benchmark_for_followers(followers).get("good_read") or 1000)
+
+
+def _efficiency_profile(creator: dict[str, Any], benchmark: dict[str, Any], read_reference: Any | None = None) -> dict[str, Any]:
+    metrics = _efficiency_metrics(creator, read_reference)
+    cpm = metrics["cpm"] if metrics["cpm"] is not None else metrics["estimated_cpm"]
+    cpc = metrics["cpc"] if metrics["cpc"] is not None else metrics["estimated_cpc"]
+    cpe = metrics["cpe"]
+    quote = metrics["quote"]
+    quote_good_max = float(benchmark.get("quote_good_max") or 0)
+    quote_high_max = float(benchmark.get("quote_high_max") or quote_good_max * 2 or 1)
+    cpm_good_max = float(benchmark.get("cpm_good_max") or 100)
+    cpc_good_max = float(benchmark.get("cpc_good_max") or 2)
+    cpe_good_max = float(benchmark.get("cpe_good_max") or 20)
+
+    score = 10.0
+    reasons: list[str] = []
+    good_efficiency = False
+    poor_efficiency = False
+
+    if quote is not None:
+        if quote <= quote_good_max:
+            reasons.append(f"报价{quote:.0f}低于量级合理线{quote_good_max:.0f}")
+        elif cpm is not None or cpc is not None or cpe is not None:
+            reasons.append(f"报价{quote:.0f}需结合效率判断")
+        elif quote > quote_high_max:
+            score -= 5
+            poor_efficiency = True
+            reasons.append(f"报价{quote:.0f}高于量级高价线{quote_high_max:.0f}")
+        else:
+            score -= 2
+            reasons.append(f"报价{quote:.0f}高于量级合理线{quote_good_max:.0f}")
+
+    if cpm is not None:
+        if cpm <= cpm_good_max:
+            score += 2
+            good_efficiency = True
+            reasons.append(f"CPM {cpm:.1f} 达标")
+        elif cpm <= cpm_good_max * 1.5:
+            score -= 1
+            reasons.append(f"CPM {cpm:.1f} 略高")
+        else:
+            score -= 5
+            poor_efficiency = True
+            reasons.append(f"CPM {cpm:.1f} 偏高")
+
+    if cpc is not None:
+        if cpc <= cpc_good_max:
+            score += 2
+            good_efficiency = True
+            reasons.append(f"CPC {cpc:.2f} 达标")
+        elif cpc <= cpc_good_max * 1.5:
+            score -= 1
+            reasons.append(f"CPC {cpc:.2f} 略高")
+        else:
+            score -= 4
+            poor_efficiency = True
+            reasons.append(f"CPC {cpc:.2f} 偏高")
+
+    if cpe is not None:
+        if cpe <= cpe_good_max:
+            score += 1
+            good_efficiency = True
+            reasons.append(f"CPE {cpe:.1f} 达标")
+        elif cpe <= cpe_good_max * 1.5:
+            score -= 1
+            reasons.append(f"CPE {cpe:.1f} 略高")
+        else:
+            score -= 3
+            poor_efficiency = True
+            reasons.append(f"CPE {cpe:.1f} 偏高")
+
+    if quote is not None and quote > quote_good_max and good_efficiency:
+        reasons.append("报价偏高但效率指标可接受")
+    return {
+        **metrics,
+        "effective_cpm": cpm,
+        "effective_cpc": cpc,
+        "score": round(max(0, min(12, score)), 2),
+        "good_efficiency": good_efficiency,
+        "poor_efficiency": poor_efficiency,
+        "reasons": reasons,
+    }
+
+
+def _follower_scale_fit(followers: Any) -> float:
+    fans = parse_number(followers)
+    if fans is None:
+        return 8
+    if 3000 <= fans <= 100000:
+        return 15
+    if 1000 <= fans < 3000 or 100000 < fans <= 200000:
+        return 12
+    if 500 <= fans < 1000:
+        return 8
+    return 5
+
+
+def _precision_fans_fit(creator: dict[str, Any]) -> tuple[float, bool]:
+    fans35 = ratio(creator.get("fans_35_plus_ratio"))
+    female = ratio(creator.get("female_fans_ratio"))
+    text = _text_blob(creator)
+    score = 8.0
+    if fans35 is not None:
+        score = 15 if fans35 >= 0.5 else 13 if fans35 >= 0.4 else 4
+    if female is not None and female >= 0.65:
+        score = min(15, score + 1)
+    if _contains_any(text, ["妈妈", "家长", "宝妈", "陪读", "大孩", "小升初", "初中", "高中"]):
+        score = min(15, score + 1)
+    return round(score, 2), score >= 13
+
+
+def _verticality_fit(creator: dict[str, Any]) -> tuple[float, float, bool]:
+    text = _text_blob(creator)
+    persona = 18
+    if _contains_any(text, ["教育", "学习", "亲子", "家庭", "母婴", "成长", "知识", "教师", "老师", "测评", "生活方式"]):
+        persona += 8
+    if _contains_any(text, ["低质", "搬运", "无关", "娱乐八卦"]):
+        persona -= 8
+    persona = max(0, min(30, persona))
+
+    content = 10
+    if _contains_any(text, ["孩子", "家长", "妈妈", "爸爸", "小升初", "初中", "高中", "大孩", "升学", "备考"]):
+        content += 7
+    if _contains_any(text, ["使用场景", "学习场景", "真实家庭", "陪读", "作业"]):
+        content += 3
+    content = max(0, min(20, content))
+    return persona, content, persona >= 24 and content >= 17
+
+
+def _recent_note_data_profile(creator: dict[str, Any]) -> dict[str, Any]:
+    raw_payload = _parse_payload_json(creator.get("raw_payload"))
+    note_cases = _collect_note_cases_from_payload(raw_payload)
+    reads: list[float] = []
+    interactions: list[float] = []
+    for item in note_cases:
+        read = parse_number(item.get("read_count") or item.get("readCount") or item.get("read"))
+        if read is not None:
+            reads.append(read)
+        interaction_values = [
+            parse_number(item.get("like_count") or item.get("likeCount") or item.get("likes")),
+            parse_number(item.get("save_count") or item.get("saveCount") or item.get("saves")),
+            parse_number(item.get("comment_count") or item.get("commentCount") or item.get("comments")),
+            parse_number(item.get("share_count") or item.get("shareCount") or item.get("shares")),
+        ]
+        interaction = sum(value for value in interaction_values if value is not None)
+        if interaction:
+            interactions.append(interaction)
+
+    has_recent_notes = bool(reads)
+    source = "recent_notes" if has_recent_notes else ""
+    if not reads:
+        for key in ("cooperation_read_median", "daily_read_median", "image_daily_read_median", "video_daily_read_median"):
+            read = parse_number(creator.get(key))
+            if read is not None:
+                reads.append(read)
+        source = "median_metrics" if reads else ""
+    if not interactions:
+        for key in ("cooperation_interaction_median", "daily_interaction_median", "image_daily_interaction_median", "video_daily_interaction_median"):
+            interaction = parse_number(creator.get(key))
+            if interaction is not None:
+                interactions.append(interaction)
+
+    followers = parse_number(creator.get("followers_count"))
+    benchmark = _scoring_benchmark_for_creator(creator)
+    expected = _expected_good_read(followers, benchmark)
+    median_read = _median(reads)
+    avg_read = round(sum(reads) / len(reads), 2) if reads else None
+    max_read = max(reads) if reads else None
+    avg_interaction = round(sum(interactions) / len(interactions), 2) if interactions else None
+    read_fans_ratio = median_read / followers if median_read is not None and followers else None
+
+    best_read = max(value for value in [median_read, avg_read, max_read] if value is not None) if reads else 0
+    if not reads:
+        data_score = 7.0
+    elif median_read >= expected * 1.5 or avg_read >= expected * 1.5 or max_read >= expected * 2:
+        data_score = 30.0
+    elif median_read >= expected or avg_read >= expected or max_read >= expected * 1.5:
+        data_score = 24.0
+    elif median_read >= expected * 0.6 or avg_read >= expected * 0.6 or max_read >= expected:
+        data_score = 16.0
+    elif max_read >= expected * 0.5:
+        data_score = 10.0
+    else:
+        data_score = 4.0
+    if avg_interaction is not None and avg_interaction >= 50:
+        data_score = min(30, data_score + 2)
+    if source == "median_metrics":
+        data_score = min(24, data_score)
+
+    good_data = bool(reads) and data_score >= 24
+    weak_recent_data = has_recent_notes and data_score < 16
+    return {
+        "source": source,
+        "benchmark": benchmark,
+        "has_recent_notes": has_recent_notes,
+        "expected_read": expected,
+        "median_read": median_read,
+        "avg_read": avg_read,
+        "max_read": max_read,
+        "best_read": best_read,
+        "avg_interaction": avg_interaction,
+        "read_fans_ratio": read_fans_ratio,
+        "data_score": round(data_score, 2),
+        "good_data": good_data,
+        "weak_recent_data": weak_recent_data,
+    }
+
+
+def _apply_quality_gate(total: float, profile: dict[str, Any], reasons: list[str]) -> float:
+    efficiency = profile.get("efficiency") if isinstance(profile.get("efficiency"), dict) else {}
+    if efficiency.get("poor_efficiency") and total > 84:
+        reasons.append("CPM/CPC/CPE效率偏差，高分封顶到B+档")
+        return 84.0
+    if profile["weak_recent_data"] and total > 79:
+        reasons.append("近期笔记阅读未达较好数据，高分封顶到B档")
+        return 79.0
+    if profile.get("source") and not profile["good_data"] and total > 89:
+        reasons.append("缺少较好阅读数据支撑，暂不进入A档")
+        return 89.0
+    return total
+
+
 def score_values(creator: dict[str, Any]) -> dict[str, Any]:
     quote = creator.get("quote_price")
     fans35 = creator.get("fans_35_plus_ratio")
@@ -2086,6 +2547,9 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
     stability = str(creator.get("traffic_stability") or "")
     text = _text_blob(creator)
     has_pgy = bool(creator.get("pgy_url") and creator.get("pgy_url") != "待填")
+    data_profile = _recent_note_data_profile(creator)
+    efficiency_profile = _efficiency_profile(creator, data_profile["benchmark"], data_profile.get("median_read") or data_profile.get("avg_read"))
+    data_profile["efficiency"] = efficiency_profile
 
     hard_issues = []
     if quote is not None and quote > 20000:
@@ -2096,30 +2560,20 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
         hard_issues.append("存在明确高风险信号")
     hard_pass = not hard_issues
 
-    persona = 18
-    if _contains_any(text, ["教育", "学习", "亲子", "家庭", "母婴", "成长", "知识", "教师", "老师", "测评", "生活方式"]):
-        persona += 8
-    if _contains_any(text, ["低质", "搬运", "无关", "娱乐八卦"]):
-        persona -= 8
-    persona = max(0, min(30, persona))
-
-    family = 10
-    if _contains_any(text, ["孩子", "家长", "妈妈", "爸爸", "小升初", "初中", "高中", "大孩", "升学", "备考"]):
-        family += 7
-    if _contains_any(text, ["使用场景", "学习场景", "真实家庭", "陪读", "作业"]):
-        family += 3
-    family = max(0, min(20, family))
-
-    fans = 10 if fans35 is None else 15 if fans35 >= 0.5 else 13 if fans35 >= 0.4 else 4
+    persona, family, vertical_fit = _verticality_fit(creator)
+    precision_fans, precise_fans = _precision_fans_fit(creator)
+    scale_fit = _follower_scale_fit(creator.get("followers_count"))
+    fans = round((precision_fans * 0.7) + (scale_fit * 0.3), 2)
 
     traffic = 9 if search is None else 15 if search >= 0.55 else 13 if search >= 0.45 else 11 if search >= 0.4 else 6
+    traffic = max(traffic, round(data_profile["data_score"] / 2, 2))
     if _contains_any(stability, ["稳定", "良好"]):
         traffic += 1
     if _contains_any(stability, ["波动", "下滑", "异常"]) or _contains_any(risk, ["中风险", "限流"]):
         traffic -= 4
     traffic = max(0, min(15, traffic))
 
-    efficiency = 10 if quote is None else 10 if quote <= 12000 else 8 if quote <= 18000 else 6 if quote <= 20000 else 0
+    efficiency = efficiency_profile["score"]
     if cpc is not None:
         efficiency -= 2 if cpc >= 2 else 0
         efficiency += 1 if cpc < 1.5 else 0
@@ -2155,6 +2609,32 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
         reasons.append("CPC/CPE待补")
     if search is None:
         reasons.append("搜索+推荐占比待补")
+    if efficiency_profile["reasons"]:
+        reasons.append(f"效率判断：{'、'.join(efficiency_profile['reasons'][:4])}")
+    if data_profile["source"]:
+        reads = []
+        if data_profile["median_read"] is not None:
+            reads.append(f"中位阅读{data_profile['median_read']:.0f}")
+        if data_profile["avg_read"] is not None:
+            reads.append(f"均读{data_profile['avg_read']:.0f}")
+        if data_profile["max_read"] is not None:
+            reads.append(f"最高阅读{data_profile['max_read']:.0f}")
+        reasons.append(f"近期/合作数据：{'、'.join(reads)}，达标线{data_profile['expected_read']:.0f}")
+    else:
+        reasons.append("近期笔记阅读数据待补")
+
+    combination_match = any(
+        [
+            data_profile["has_recent_notes"] and data_profile["good_data"] and scale_fit >= 12,
+            vertical_fit and data_profile["good_data"],
+            data_profile["good_data"] and precise_fans,
+        ]
+    )
+    if combination_match:
+        reasons.append("高分依据：最近笔记数据+粉丝量/内容垂直度/粉丝精准至少一组匹配")
+    total = round(_apply_quality_gate(total, data_profile, reasons), 2)
+    tier = _initial_tier(total, hard_pass)
+    priority = _detail_collection_priority(total, bonus, hard_pass)
     if bonus_reasons:
         reasons.append(f"加成：{'、'.join(bonus_reasons[:3])}")
     if not reasons:
@@ -2193,6 +2673,10 @@ def _project_screening_plan(project_id: str) -> dict[str, Any]:
 
 
 def _project_hard_filter_issues(project_id: str, creator: dict[str, Any]) -> list[str]:
+    raw_payload = _parse_payload_json(creator.get("raw_payload"))
+    collection_issues = raw_payload.get("collection_hard_filter_issues")
+    if isinstance(collection_issues, list) and collection_issues:
+        return [str(item) for item in collection_issues if item]
     screening_plan = _project_screening_plan(project_id)
     scoring_criteria = screening_plan.get("scoringCriteria") if isinstance(screening_plan.get("scoringCriteria"), dict) else {}
     hard_filters = (
@@ -2260,7 +2744,7 @@ def generate_test_stage_score(project_id: str, creator: dict[str, Any]) -> tuple
     issues = _project_hard_filter_issues(project_id, creator)
     if issues:
         score["hard_filter_passed"] = 0
-        score["initial_tier"] = _initial_tier(score["total_score"], False)
+        score["initial_tier"] = _initial_tier(score["total_score"], True)
         score["detail_collection_priority"] = _detail_collection_priority(score["total_score"], score.get("bonus_score", 0), False)
         score["recommend_level"] = _recommend_level(score["total_score"], False)
         score["score_reason"] = "；".join([*issues, score["score_reason"]])
@@ -2366,11 +2850,21 @@ def _normalize_llm_score(result: dict[str, Any], fallback: dict[str, Any], creat
         completeness = completeness / 100
     completeness = max(0, min(1, completeness))
     initial_tier = str(result.get("initialTier") or result.get("initial_tier") or _initial_tier(total, hard_pass_bool))
+    if initial_tier not in {"S", "A", "B+", "B", "C"}:
+        initial_tier = _initial_tier(total, True)
     detail_priority = str(
         result.get("detailCollectionPriority")
         or result.get("detail_collection_priority")
         or _detail_collection_priority(total, bonus_score, hard_pass_bool)
     )
+    gate_reasons: list[str] = []
+    if creator:
+        total = _apply_quality_gate(total, _recent_note_data_profile(creator), gate_reasons)
+        if gate_reasons:
+            reasons = "；".join([str(reasons).strip(), *gate_reasons])
+        initial_tier = _initial_tier(total, hard_pass_bool)
+        detail_priority = _detail_collection_priority(total, bonus_score, hard_pass_bool)
+        recommend_level = _recommend_level(total, hard_pass_bool)
     cooperation_direction = _extract_cooperation_direction(result, creator or {}, str(recommend_level))
     return {
         "total_score": round(total, 2),
@@ -2407,12 +2901,18 @@ def _creator_score_payload(creator: dict[str, Any]) -> dict[str, Any]:
         "natural_cpe": creator.get("natural_cpe"),
         "daily_read_median": creator.get("daily_read_median"),
         "daily_interaction_median": creator.get("daily_interaction_median"),
+        "image_daily_read_median": creator.get("image_daily_read_median"),
+        "image_daily_interaction_median": creator.get("image_daily_interaction_median"),
+        "video_daily_read_median": creator.get("video_daily_read_median"),
+        "video_daily_interaction_median": creator.get("video_daily_interaction_median"),
+        "video_completion_rate": creator.get("video_completion_rate"),
         "cooperation_read_median": creator.get("cooperation_read_median"),
         "cooperation_interaction_median": creator.get("cooperation_interaction_median"),
         "image_read_unit_price": creator.get("image_read_unit_price"),
         "image_interaction_unit_price": creator.get("image_interaction_unit_price"),
         "video_read_unit_price": creator.get("video_read_unit_price"),
         "video_interaction_unit_price": creator.get("video_interaction_unit_price"),
+        "liked_collected_count": creator.get("liked_collected_count"),
         "active_fans_ratio": creator.get("active_fans_ratio"),
         "interaction_fans_ratio": creator.get("interaction_fans_ratio"),
         "reply_rate_48h": creator.get("reply_rate_48h"),
@@ -2464,8 +2964,8 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
                     "bonusScore": "0-20 加成分，只奖励稀缺人设、强话题、城市/受众/性价比/组合价值等亮点",
                     "totalScore": "0-120 初筛总分，等于 baseScore + bonusScore",
                     "informationCompleteness": "0-1，关键初筛字段的信息完整度；未知字段不直接淘汰，但要说明待补",
-                    "initialTier": "S|A|B+|B|C|Pass；S≥100，A=90-99，B+=80-89，B=70-79，C<70，硬性不符为Pass",
-                    "detailCollectionPriority": "必须补采|优先补采|高潜补采|暂缓补采|不补采；只让高分或高潜达人进入详情页补采",
+                    "initialTier": "S|A|B+|B|C；S≥100，A=90-99，B+=80-89，B=70-79，C<70；硬性不符也必须保留分数档位，不要输出Pass",
+                    "detailCollectionPriority": "必须补采|优先补采|高潜补采|暂缓补采|不补采|筛选暂缓；只让高分或高潜达人进入详情页补采，硬性不符用筛选暂缓",
                     "dimensionScores": {
                         "budget": "0-100 预算/报价匹配，对应基础分中的成本效率部分",
                         "fans": "0-100 粉丝画像/目标受众匹配",
@@ -2476,7 +2976,7 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
                     },
                     "hardFilterPassed": "boolean，是否没有命中当前项目明确硬性淘汰项；未知项不要当成硬性不符",
                     "recommendLevel": "强推荐|推荐|备选|不推荐",
-                    "reason": "120字以内，说明基础分依据、加成依据、缺失待补字段与主要风险",
+                    "reason": "220字以内，按【数据表现】【人设匹配】【内容贴合】【风险/动作】四段输出。必须结合该达人的粉丝/报价/CPC/CPE/互动/视频或笔记表现、人设标签、个人简介、笔记案例或原始详情；不得只写泛泛的初筛结论。缺失字段要明确说明待补。",
                     "cooperationDirection": "80字以内，给出适合该达人的合作方向/内容角度/投放角色",
                 }
             ]
@@ -2506,6 +3006,8 @@ def score_values_batch_with_llm(project_id: str, creators: list[dict[str, Any]])
         "所有项目都使用同一套初筛评分协议：基础分 baseScore 满分100，加成分 bonusScore 满分20，总分 totalScore 满分120。"
         "基础分评估项目适配度，未知字段只标记待补采并影响 informationCompleteness，不要因为信息不全把大部分候选人打成不及格；"
         "加成分只奖励稀缺人设、强话题、城市/人群优势、讨论度、低成本潜力和组合补位价值。"
+        "推荐理由必须像资深媒介审号结论：逐个达人结合数据表现、人设匹配、视频/图文笔记内容贴合度、内容证据和风险动作判断；"
+        "不要输出'适合教育场景'这类通用话术，不要把蒲公英筛选条件复述成结论。"
         "请输出 initialTier 和 detailCollectionPriority，用于决定哪些高分/高潜达人进入详情页补采。"
         "不要把当前项目 Brief 写死成有道答疑笔；不同项目必须按传入 Brief 和 scoringCriteria 适配。"
         "蒲公英 collectionSchemeSummary 只用于理解达人来源，不得把页面筛选条件直接当作最终评分结论。"
@@ -2624,7 +3126,7 @@ def _persist_creator_score(
                 creator_id,
             ),
         )
-        if creator["status"] == "待补数据" and score["hard_filter_passed"]:
+        if creator["status"] == "待补数据":
             conn.execute("UPDATE creators SET status='待审核', updated_at=? WHERE creator_id=?", (ts, creator_id))
             conn.execute(
                 "UPDATE project_creators SET review_status='待审核', pool_stage=?, updated_at=? WHERE project_id=? AND creator_id=?",
@@ -2996,6 +3498,402 @@ def list_logs(project_id: str) -> list[dict[str, Any]]:
     init_db()
     with connect() as conn:
         return rows_dict(conn.execute("SELECT * FROM operation_logs WHERE project_id=? ORDER BY created_at DESC LIMIT 200", (project_id,)).fetchall())
+
+
+def _json_value(value: Any, default: Any) -> Any:
+    if value in (None, ""):
+        return default
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return default
+
+
+def _handoff_dict(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["payload"] = _json_value(item.get("payload"), {})
+    return item
+
+
+def _task_dict(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["deliverables"] = _json_value(item.get("deliverables"), [])
+    return item
+
+
+def list_handoffs(project_id: str, to_role: str | None = None, from_role: str | None = None) -> list[dict[str, Any]]:
+    init_db()
+    where = ["project_id=?"]
+    params: list[Any] = [project_id]
+    if to_role:
+        where.append("to_role=?")
+        params.append(to_role)
+    if from_role:
+        where.append("from_role=?")
+        params.append(from_role)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM project_handoffs WHERE {' AND '.join(where)} ORDER BY created_at DESC",
+            params,
+        ).fetchall()
+    return [_handoff_dict(row) for row in rows]
+
+
+def create_handoff(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    init_db()
+    ts = now()
+    handoff_id = payload.get("handoff_id") or str(uuid.uuid4())
+    from_role = payload.get("from_role") or "planner"
+    to_role = payload.get("to_role") or "executor"
+    title = payload.get("title") or "项目交接单"
+    summary = payload.get("summary") or ""
+    body = payload.get("payload") or {}
+    with connect() as conn:
+        ensure_project(conn, project_id)
+        conn.execute(
+            """
+            INSERT INTO project_handoffs(
+              handoff_id, project_id, from_role, to_role, title, summary, payload,
+              status, created_by, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                handoff_id,
+                project_id,
+                from_role,
+                to_role,
+                title,
+                summary,
+                _json_text(body, {}),
+                payload.get("status") or "pending",
+                payload.get("created_by") or "用户",
+                ts,
+                ts,
+            ),
+        )
+        log(conn, project_id, "handoff", "提交交接", title, payload.get("created_by") or "用户", f"{from_role} -> {to_role}: {summary}", "success")
+    return get_handoff(project_id, handoff_id) or {}
+
+
+def get_handoff(project_id: str, handoff_id: str) -> dict[str, Any] | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM project_handoffs WHERE project_id=? AND handoff_id=?",
+            (project_id, handoff_id),
+        ).fetchone()
+    return _handoff_dict(row) if row else None
+
+
+def update_handoff_status(
+    project_id: str,
+    handoff_id: str,
+    status: str,
+    *,
+    operator: str = "用户",
+    return_reason: str = "",
+) -> dict[str, Any]:
+    init_db()
+    existing = get_handoff(project_id, handoff_id)
+    if not existing:
+        raise KeyError(handoff_id)
+    ts = now()
+    accepted_at = ts if status in {"accepted", "in_progress", "completed"} and not existing.get("accepted_at") else existing.get("accepted_at")
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE project_handoffs
+            SET status=?, accepted_by=?, return_reason=?, accepted_at=?, updated_at=?
+            WHERE project_id=? AND handoff_id=?
+            """,
+            (status, operator if status != "returned" else existing.get("accepted_by") or "", return_reason, accepted_at, ts, project_id, handoff_id),
+        )
+        action = "退回交接" if status == "returned" else "接收交接"
+        detail = return_reason or f"交接状态更新为 {status}"
+        log(conn, project_id, "handoff", action, existing.get("title") or handoff_id, operator, detail, "success")
+    return get_handoff(project_id, handoff_id) or {}
+
+
+def list_tasks(project_id: str, role: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+    init_db()
+    where = ["project_id=?"]
+    params: list[Any] = [project_id]
+    if role:
+        where.append("role=?")
+        params.append(role)
+    if status:
+        where.append("status=?")
+        params.append(status)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM project_tasks WHERE {' AND '.join(where)} ORDER BY created_at DESC",
+            params,
+        ).fetchall()
+    return [_task_dict(row) for row in rows]
+
+
+def create_task(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    init_db()
+    ts = now()
+    task_id = payload.get("task_id") or str(uuid.uuid4())
+    with connect() as conn:
+        ensure_project(conn, project_id)
+        conn.execute(
+            """
+            INSERT INTO project_tasks(
+              task_id, project_id, source_handoff_id, title, description, role,
+              owner, status, priority, due_at, blocked_reason, deliverables,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                project_id,
+                payload.get("source_handoff_id") or "",
+                payload.get("title") or "未命名任务",
+                payload.get("description") or "",
+                payload.get("role") or "executor",
+                payload.get("owner") or "",
+                payload.get("status") or "todo",
+                payload.get("priority") or "medium",
+                payload.get("due_at") or "",
+                payload.get("blocked_reason") or "",
+                _json_text(payload.get("deliverables"), []),
+                ts,
+                ts,
+            ),
+        )
+        log(conn, project_id, "task", "创建任务", payload.get("title") or task_id, payload.get("operator") or "用户", payload.get("description") or "任务已创建", "success")
+    return get_task(project_id, task_id) or {}
+
+
+def get_task(project_id: str, task_id: str) -> dict[str, Any] | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM project_tasks WHERE project_id=? AND task_id=?",
+            (project_id, task_id),
+        ).fetchone()
+    return _task_dict(row) if row else None
+
+
+def update_task(project_id: str, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    init_db()
+    existing = get_task(project_id, task_id)
+    if not existing:
+        raise KeyError(task_id)
+    allowed = {
+        "title",
+        "description",
+        "role",
+        "owner",
+        "status",
+        "priority",
+        "due_at",
+        "blocked_reason",
+    }
+    fields = [key for key in allowed if key in payload]
+    assignments = [f"{key}=?" for key in fields]
+    values = [payload[key] for key in fields]
+    if "deliverables" in payload:
+        assignments.append("deliverables=?")
+        values.append(_json_text(payload.get("deliverables"), []))
+    completed_at = now() if payload.get("status") == "done" and not existing.get("completed_at") else existing.get("completed_at")
+    assignments.extend(["completed_at=?", "updated_at=?"])
+    values.extend([completed_at, now(), project_id, task_id])
+    with connect() as conn:
+        conn.execute(
+            f"UPDATE project_tasks SET {', '.join(assignments)} WHERE project_id=? AND task_id=?",
+            values,
+        )
+        log(conn, project_id, "task", "更新任务", existing.get("title") or task_id, payload.get("operator") or "用户", f"状态更新为 {payload.get('status') or existing.get('status')}", "success")
+    return get_task(project_id, task_id) or {}
+
+
+def create_tasks_from_handoff(project_id: str, handoff_id: str, operator: str = "用户") -> list[dict[str, Any]]:
+    handoff = get_handoff(project_id, handoff_id)
+    if not handoff:
+        raise KeyError(handoff_id)
+    body = handoff.get("payload") or {}
+    suggestions = body.get("execution_tasks") or body.get("tasks") or []
+    if not suggestions:
+        suggestions = [
+            {"title": f"拆解{handoff.get('title')}", "description": handoff.get("summary") or "", "priority": "high"},
+            {"title": "确认交付物与时间节点", "description": "基于交接单补齐负责人、截止时间和验收口径。", "priority": "medium"},
+        ]
+    tasks = []
+    for item in suggestions:
+        tasks.append(
+            create_task(
+                project_id,
+                {
+                    "source_handoff_id": handoff_id,
+                    "title": item.get("title") or item.get("name") or "交接生成任务",
+                    "description": item.get("description") or item.get("note") or handoff.get("summary") or "",
+                    "role": "executor",
+                    "owner": item.get("owner") or "",
+                    "status": item.get("status") or "todo",
+                    "priority": item.get("priority") or "medium",
+                    "due_at": item.get("due_at") or item.get("deadline") or "",
+                    "operator": operator,
+                },
+            )
+        )
+    update_handoff_status(project_id, handoff_id, "in_progress", operator=operator)
+    return tasks
+
+
+def list_assets(project_id: str, asset_type: str | None = None) -> list[dict[str, Any]]:
+    init_db()
+    where = ["project_id=?"]
+    params: list[Any] = [project_id]
+    if asset_type:
+        where.append("asset_type=?")
+        params.append(asset_type)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM project_assets WHERE {' AND '.join(where)} ORDER BY created_at DESC",
+            params,
+        ).fetchall()
+    assets = rows_dict(rows)
+    for asset in assets:
+        asset["payload"] = _json_value(asset.get("payload"), {})
+    return assets
+
+
+def create_asset(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    init_db()
+    ts = now()
+    asset_id = payload.get("asset_id") or str(uuid.uuid4())
+    with connect() as conn:
+        ensure_project(conn, project_id)
+        conn.execute(
+            """
+            INSERT INTO project_assets(asset_id, project_id, asset_type, title, payload, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                asset_id,
+                project_id,
+                payload.get("asset_type") or "document",
+                payload.get("title") or "未命名资产",
+                _json_text(payload.get("payload"), {}),
+                payload.get("created_by") or "用户",
+                ts,
+                ts,
+            ),
+        )
+        log(conn, project_id, "asset", "保存资产", payload.get("title") or asset_id, payload.get("created_by") or "用户", payload.get("asset_type") or "document", "success")
+    assets = [asset for asset in list_assets(project_id) if asset.get("asset_id") == asset_id]
+    return assets[0] if assets else {}
+
+
+def project_metrics(project_id: str) -> dict[str, Any]:
+    project = get_project(project_id)
+    if not project:
+        raise KeyError(project_id)
+    handoffs = list_handoffs(project_id)
+    tasks = list_tasks(project_id)
+    assets = list_assets(project_id)
+    logs = list_logs(project_id)
+    creator_pool_count = int(project.get("creator_pool_count") or 0)
+    qualified_count = int(project.get("qualified_creator_count") or 0)
+    task_total = len(tasks)
+    task_done = len([task for task in tasks if task.get("status") == "done"])
+    blocked = len([task for task in tasks if task.get("status") == "blocked"])
+    pending_handoffs = len([item for item in handoffs if item.get("status") == "pending"])
+    returned_handoffs = len([item for item in handoffs if item.get("status") == "returned"])
+    brief_assets = len([asset for asset in assets if asset.get("asset_type") == "brief"])
+    strategy_assets = len([asset for asset in assets if asset.get("asset_type") == "strategy"])
+    strategy_score = min(100, 35 + brief_assets * 25 + strategy_assets * 25)
+    execution_score = 100 if task_total == 0 else round((task_done / task_total) * 100)
+    creator_score = min(100, round((qualified_count / max(int(project.get("target_qualified_creator_count") or 10), 1)) * 100))
+    risk_penalty = blocked * 12 + pending_handoffs * 5 + returned_handoffs * 8
+    health_score = max(0, min(100, round((strategy_score + execution_score + creator_score + 75) / 4 - risk_penalty)))
+    return {
+        "project_id": project_id,
+        "project": project,
+        "summary": {
+            "health_score": health_score,
+            "strategy_score": strategy_score,
+            "execution_score": execution_score,
+            "creator_pool_score": creator_score,
+            "task_total": task_total,
+            "task_done": task_done,
+            "blocked_tasks": blocked,
+            "pending_handoffs": pending_handoffs,
+            "returned_handoffs": returned_handoffs,
+            "asset_count": len(assets),
+            "timeline_count": len(logs),
+            "creator_pool_count": creator_pool_count,
+            "qualified_creator_count": qualified_count,
+        },
+        "role_efficiency": {
+            "planner": {"brief_assets": brief_assets, "strategy_assets": strategy_assets, "handoffs": len([item for item in handoffs if item.get("from_role") == "planner"])},
+            "executor": {"task_completion_rate": execution_score, "blocked_tasks": blocked, "tasks": task_total},
+            "screening": {"candidate_count": creator_pool_count, "qualified_count": qualified_count, "qualified_rate": creator_score},
+        },
+        "risks": [
+            *[
+                {
+                    "risk_id": task.get("task_id"),
+                    "project_id": project_id,
+                    "title": task.get("blocked_reason") or f"{task.get('title')} 阻塞",
+                    "type": "任务阻塞",
+                    "level": "high",
+                    "status": "handling",
+                    "source_id": task.get("task_id"),
+                }
+                for task in tasks
+                if task.get("status") == "blocked"
+            ],
+            *[
+                {
+                    "risk_id": item.get("handoff_id"),
+                    "project_id": project_id,
+                    "title": item.get("return_reason") or f"{item.get('title')} 被退回",
+                    "type": "交接阻塞",
+                    "level": "medium",
+                    "status": "tracking",
+                    "source_id": item.get("handoff_id"),
+                }
+                for item in handoffs
+                if item.get("status") == "returned"
+            ],
+        ],
+    }
+
+
+def management_overview() -> dict[str, Any]:
+    projects = list_projects(include_archived=True)
+    project_items = []
+    all_risks = []
+    for project in projects:
+        metrics = project_metrics(project["project_id"])
+        summary = metrics["summary"]
+        project_items.append({"project": project, "metrics": summary})
+        all_risks.extend(metrics["risks"])
+    active = [item for item in project_items if not item["project"].get("archived_at")]
+    completed = [item for item in project_items if item["project"].get("archived_at")]
+    warn = [item for item in active if item["metrics"]["health_score"] < 60 or item["metrics"]["blocked_tasks"] > 0]
+    return {
+        "projects": project_items,
+        "overview": {
+            "project_total": len(project_items),
+            "active_projects": len(active),
+            "warning_projects": len(warn),
+            "completed_projects": len(completed),
+            "asset_total": sum(item["metrics"]["asset_count"] for item in project_items),
+            "task_total": sum(item["metrics"]["task_total"] for item in project_items),
+            "pending_handoffs": sum(item["metrics"]["pending_handoffs"] for item in project_items),
+            "average_health": round(sum(item["metrics"]["health_score"] for item in project_items) / max(len(project_items), 1), 1),
+        },
+        "risks": all_risks,
+    }
 
 
 def _as_float(value: Any) -> float | None:

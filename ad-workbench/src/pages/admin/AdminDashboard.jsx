@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import {
   Users, FolderOpen, Bot, Cpu, Shield, LayoutDashboard,
   UserPlus, Search, Edit3, ChevronLeft, ChevronRight,
@@ -14,6 +15,9 @@ import ProgressBar from '../../components/ProgressBar';
 import TabBar from '../../components/TabBar';
 import PageHeader from '../../components/PageHeader';
 import AgentCard from '../../components/AgentCard';
+import ProjectWorkspacePanel from '../../components/ProjectWorkspacePanel';
+import { ClickSurface, useWorkbenchActions } from '../../components/WorkbenchActionKit';
+import { useProjectWorkspace } from '../../shared/projectWorkspace';
 
 /* ============================================================
    Mock Data
@@ -193,7 +197,8 @@ const agentStatusBadgeMap = {
 /* ============================================================
    Tab 1: 系统概览
    ============================================================ */
-function TabOverview() {
+function TabOverview({ actions, workspace }) {
+  const summary = workspace.metrics?.summary || {};
   const eventColumns = [
     { key: 'time', label: '时间', render: (val) => <span className="font-mono text-xs text-muted">{val}</span> },
     { key: 'event', label: '事件', render: (val) => <span className="text-sm font-medium text-primary">{val}</span> },
@@ -212,33 +217,18 @@ function TabOverview() {
     <div className="flex flex-col gap-6">
       {/* 顶部 4 个 StatCard */}
       <div className="grid grid-cols-4 gap-4">
-        <StatCard
-          title="注册用户"
-          value="48"
-          change={5}
-          changeLabel="本月"
-          icon={Users}
-          color="blue"
-        />
-        <StatCard
-          title="活跃项目"
-          value="20"
-          icon={FolderOpen}
-          color="green"
-        />
-        <StatCard
-          title="Agent 运行"
-          value="12/18"
-          subtitle="运行中 / 总数"
-          icon={Bot}
-          color="cyan"
-        />
-        <StatCard
-          title="系统负载"
-          value="67%"
-          icon={Cpu}
-          color="amber"
-        />
+        <ClickSurface onClick={() => actions.openDetail('注册用户', { 用户数: 48, 本月新增: 5, 活跃率: '87%' })}>
+          <StatCard title="注册用户" value="48" change={5} changeLabel="本月" icon={Users} color="blue" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('活跃项目', { 项目数: 20, 进行中: 8, 预警: 3 })}>
+          <StatCard title="活跃项目" value={workspace.projects.filter((item) => !item.archived_at).length} icon={FolderOpen} color="green" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('Agent 运行', { 运行中: 12, 总数: 18, 异常: 1 })}>
+          <StatCard title="Agent 运行" value="12/18" subtitle="运行中 / 总数" icon={Bot} color="cyan" />
+        </ClickSurface>
+        <ClickSurface onClick={() => actions.openDetail('系统负载', { CPU: '67%', 内存: '80%', API: '60%' })}>
+          <StatCard title="当前项目健康" value={`${summary.health_score || 0}%`} icon={Cpu} color="amber" />
+        </ClickSurface>
       </div>
 
       {/* 系统资源监控 */}
@@ -308,7 +298,7 @@ function TabOverview() {
       {/* 最近系统事件 */}
       <div>
         <div className="section-title">最近系统事件</div>
-        <DataTable columns={eventColumns} data={systemEventsData} />
+        <DataTable columns={eventColumns} data={systemEventsData} onRowClick={(row) => actions.openDetail(row.event, row)} />
       </div>
     </div>
   );
@@ -317,7 +307,7 @@ function TabOverview() {
 /* ============================================================
    Tab 2: 账号管理
    ============================================================ */
-function TabAccounts() {
+function TabAccounts({ actions }) {
   const [searchText, setSearchText] = useState('');
 
   const filteredAccounts = accountData.filter((acc) =>
@@ -408,7 +398,7 @@ function TabAccounts() {
       <div className="flex gap-4" style={{ alignItems: 'flex-start' }}>
         {/* 账号列表 */}
         <div className="flex-1">
-          <DataTable columns={accountColumns} data={filteredAccounts} />
+          <DataTable columns={accountColumns} data={filteredAccounts} onRowClick={(row) => actions.openForm(`${row.name}账号管理`, ['账号动作', '系统角色', '数据范围', '备注'], row)} />
         </div>
 
         {/* 右侧浮动面板：账号统计 */}
@@ -485,7 +475,7 @@ function TabAccounts() {
 /* ============================================================
    Tab 3: 权限配置
    ============================================================ */
-function TabPermissions() {
+function TabPermissions({ actions, workspace }) {
   return (
     <div className="flex flex-col gap-6">
       {/* 顶部说明 */}
@@ -517,10 +507,14 @@ function TabPermissions() {
         <div className="card-body">
           <div className="flex flex-col gap-0">
             {systemRoles.map((role, index) => (
-              <div
+              <button
+                type="button"
                 key={role.id}
                 className="flex items-center gap-4 py-4"
+                onClick={() => actions.openForm(`${role.name}权限配置`, ['权限动作', '权限模块', '适用人员', '备注'], role)}
                 style={{
+                  width: '100%',
+                  textAlign: 'left',
                   borderBottom: index < systemRoles.length - 1 ? '1px solid var(--border-subtle)' : 'none',
                 }}
               >
@@ -548,7 +542,7 @@ function TabPermissions() {
                   <Edit3 size={14} />
                   <span>编辑</span>
                 </button>
-              </div>
+              </button>
             ))}
           </div>
         </div>
@@ -565,10 +559,14 @@ function TabPermissions() {
         <div className="card-body">
           <div className="flex flex-col gap-0">
             {businessRoles.map((role, index) => (
-              <div
+              <button
+                type="button"
                 key={role.id}
                 className="py-4"
+                onClick={() => actions.openForm(`${role.name}业务权限`, ['授权模块', '数据范围', '适用项目', '备注'], role)}
                 style={{
+                  width: '100%',
+                  textAlign: 'left',
                   borderBottom: index < businessRoles.length - 1 ? '1px solid var(--border-subtle)' : 'none',
                 }}
               >
@@ -595,7 +593,7 @@ function TabPermissions() {
                     </span>
                   ))}
                 </div>
-              </div>
+              </button>
             ))}
           </div>
         </div>
@@ -612,10 +610,14 @@ function TabPermissions() {
         <div className="card-body">
           <div className="flex flex-col gap-0">
             {dataScopes.map((scope, index) => (
-              <div
+              <button
+                type="button"
                 key={scope.id}
                 className="flex items-center gap-4 py-4"
+                onClick={() => actions.openForm(`${scope.name}数据范围`, ['范围动作', '适用角色', '项目组', '备注'], scope)}
                 style={{
+                  width: '100%',
+                  textAlign: 'left',
                   borderBottom: index < dataScopes.length - 1 ? '1px solid var(--border-subtle)' : 'none',
                 }}
               >
@@ -642,9 +644,36 @@ function TabPermissions() {
                     ))}
                   </div>
                 </div>
-              </div>
+              </button>
             ))}
           </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div className="flex items-center gap-2">
+            <FolderOpen size={16} className="text-secondary" />
+            <h3>项目可见范围</h3>
+          </div>
+          <Badge variant="blue">{workspace.projects.length} 个项目</Badge>
+        </div>
+        <div className="card-body">
+          <DataTable
+            columns={[
+              { key: 'project_name', label: '项目' },
+              { key: 'project_id', label: 'Project ID', render: (val) => <span className="font-mono text-muted">{val}</span> },
+              { key: 'period_start', label: '开始' },
+              { key: 'period_end', label: '结束' },
+              { key: 'creator_pool_count', label: '达人池' },
+            ]}
+            data={workspace.projects}
+            onRowClick={(row) => {
+              workspace.selectProject(row.project_id);
+              actions.notify(`已切换到 ${row.project_name}`);
+            }}
+            emptyText="暂无项目"
+          />
         </div>
       </div>
     </div>
@@ -654,7 +683,7 @@ function TabPermissions() {
 /* ============================================================
    Tab 4: Agent 编排
    ============================================================ */
-function TabAgents() {
+function TabAgents({ actions }) {
   const agentColumns = [
     { key: 'time', label: '时间', render: (val) => <span className="font-mono text-xs text-muted">{val}</span> },
     { key: 'agent', label: 'Agent', render: (val) => <span className="text-sm font-medium text-primary">{val}</span> },
@@ -698,61 +727,25 @@ function TabAgents() {
       <div>
         <div className="section-title">Agent 列表</div>
         <div className="grid grid-cols-3 gap-4">
-          <AgentCard
-            name="Insight Node"
-            type="数据采集"
-            status="running"
-            description="舆情数据抓取正常"
-            lastRun="2026-04-13 14:30"
-            output="抓取 1,234 条舆情数据"
-          />
-          <AgentCard
-            name="Brief Parser"
-            type="文档解析"
-            status="running"
-            description="已处理 156 份 Brief"
-            lastRun="2026-04-13 14:25"
-            output="解析完成，生成 3 个创意方向"
-          />
-          <AgentCard
-            name="Schedule Agent"
-            type="排期管理"
-            status="running"
-            description="排期生成中"
-            lastRun="2026-04-13 14:20"
-            output="生成 5 月排期表"
-          />
-          <AgentCard
-            name="Report Agent"
-            type="报告生成"
-            status="idle"
-            description="等待下次定时任务"
-            lastRun="2026-04-13 13:50"
-            output="生成 8 份项目日报"
-          />
-          <AgentCard
-            name="Sync Agent"
-            type="数据同步"
-            status="running"
-            description="飞书同步正常"
-            lastRun="2026-04-13 14:00"
-            output="同步 156 条任务数据"
-          />
-          <AgentCard
-            name="Budget Agent"
-            type="预算管理"
-            status="error"
-            description="API 连接超时"
-            lastRun="2026-04-13 14:10"
-            output="同步失败，需人工介入"
-          />
+          {[
+            { name: 'Insight Node', type: '数据采集', status: 'running', description: '舆情数据抓取正常', lastRun: '2026-04-13 14:30', output: '抓取 1,234 条舆情数据' },
+            { name: 'Brief Parser', type: '文档解析', status: 'running', description: '已处理 156 份 Brief', lastRun: '2026-04-13 14:25', output: '解析完成，生成 3 个创意方向' },
+            { name: 'Schedule Agent', type: '排期管理', status: 'running', description: '排期生成中', lastRun: '2026-04-13 14:20', output: '生成 5 月排期表' },
+            { name: 'Report Agent', type: '报告生成', status: 'idle', description: '等待下次定时任务', lastRun: '2026-04-13 13:50', output: '生成 8 份项目日报' },
+            { name: 'Sync Agent', type: '数据同步', status: 'running', description: '飞书同步正常', lastRun: '2026-04-13 14:00', output: '同步 156 条任务数据' },
+            { name: 'Budget Agent', type: '预算管理', status: 'error', description: 'API 连接超时', lastRun: '2026-04-13 14:10', output: '同步失败，需人工介入' },
+          ].map((agent) => (
+            <ClickSurface key={agent.name} onClick={() => actions.openForm(`${agent.name}编排`, ['操作类型', '调度周期', '通知对象', '备注'], agent)}>
+              <AgentCard {...agent} />
+            </ClickSurface>
+          ))}
         </div>
       </div>
 
       {/* Agent 执行日志 */}
       <div>
         <div className="section-title">Agent 执行日志</div>
-        <DataTable columns={agentColumns} data={agentLogData} />
+        <DataTable columns={agentColumns} data={agentLogData} onRowClick={(row) => actions.openDetail(`${row.agent}日志`, row)} />
       </div>
     </div>
   );
@@ -891,6 +884,13 @@ function TabApiSettings() {
     { label: '配置文件', value: meta.path },
     { label: 'Key 状态', value: meta.api_key_configured ? '已配置' : '待配置' },
     { label: 'Key 来源', value: meta.api_key_source === 'inline' ? '配置文件' : (config.api_key_env || '未配置') },
+  ];
+  const aiCapabilities = [
+    { name: 'Brief 拆解', endpoint: '/api/projects/{id}/ai/brief', roles: '策划' },
+    { name: '创意策略生成', endpoint: '/api/projects/{id}/ai/strategy', roles: '策划' },
+    { name: '岗位交接生成', endpoint: '/api/projects/{id}/ai/handoff', roles: '策划 / 执行' },
+    { name: '执行任务拆解', endpoint: '/api/projects/{id}/ai/tasks', roles: '执行' },
+    { name: '管理层经营解读', endpoint: '/api/projects/{id}/ai/management-advice', roles: '管理层' },
   ];
 
   return (
@@ -1050,6 +1050,29 @@ function TabApiSettings() {
           </div>
         </div>
       </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div className="flex items-center gap-2">
+            <Bot size={16} className="text-secondary" />
+            <h3>业务 AI 能力注册</h3>
+          </div>
+          <Badge variant={meta.api_key_configured ? 'green' : 'amber'}>
+            {meta.api_key_configured ? '统一网关可用' : '等待配置'}
+          </Badge>
+        </div>
+        <div className="card-body">
+          <DataTable
+            columns={[
+              { key: 'name', label: '能力' },
+              { key: 'roles', label: '使用工作台' },
+              { key: 'endpoint', label: '统一入口', render: (val) => <span className="font-mono text-muted">{val}</span> },
+              { key: 'status', label: '状态', render: () => <Badge variant={meta.api_key_configured ? 'green' : 'amber'}>{meta.api_key_configured ? '已接入' : '配置后启用'}</Badge> },
+            ]}
+            data={aiCapabilities}
+          />
+        </div>
+      </div>
     </div>
   );
 }
@@ -1057,7 +1080,7 @@ function TabApiSettings() {
 /* ============================================================
    Tab 5: 审计日志
    ============================================================ */
-function TabAudit() {
+function TabAudit({ actions }) {
   const [timeRange, setTimeRange] = useState('today');
   const [actionType, setActionType] = useState('all');
   const [currentPage, setCurrentPage] = useState(1);
@@ -1152,7 +1175,7 @@ function TabAudit() {
       </div>
 
       {/* 审计日志表格 */}
-      <DataTable columns={auditColumns} data={pagedLogs} />
+      <DataTable columns={auditColumns} data={pagedLogs} onRowClick={(row) => actions.openDetail(`${row.operator} ${row.action}`, row)} />
 
       {/* 分页控件 */}
       <div className="flex items-center justify-between">
@@ -1197,35 +1220,47 @@ function TabAudit() {
 /* ============================================================
    Main Component
    ============================================================ */
-export default function AdminDashboard() {
-  const [activeTab, setActiveTab] = useState('overview');
+export default function AdminDashboard({ selectedProjectId, onSelectedProjectIdChange }) {
+  const navigate = useNavigate();
+  const { tab } = useParams();
+  const navToTab = { permissions: 'permissions', 'agent-config': 'agents', settings: 'api-settings' };
+  const tabToNav = { agents: 'agent-config', 'api-settings': 'settings' };
+  const initialTab = navToTab[tab] || (tabs.some((item) => item.key === tab) ? tab : 'overview');
+  const [activeTab, setActiveTab] = useState(initialTab);
+  const actions = useWorkbenchActions();
+  const workspace = useProjectWorkspace(selectedProjectId, onSelectedProjectIdChange);
+
+  useEffect(() => {
+    const nextTab = navToTab[tab] || tab;
+    if (tabs.some((item) => item.key === nextTab)) {
+      setActiveTab(nextTab);
+    }
+  }, [tab]);
+
+  const handleTabChange = (nextTab) => {
+    setActiveTab(nextTab);
+    navigate(`/workbench/admin/${tabToNav[nextTab] || nextTab}`);
+  };
 
   const renderTabContent = () => {
     switch (activeTab) {
-      case 'overview': return <TabOverview />;
-      case 'accounts': return <TabAccounts />;
-      case 'permissions': return <TabPermissions />;
-      case 'agents': return <TabAgents />;
+      case 'overview': return <TabOverview actions={actions} workspace={workspace} />;
+      case 'accounts': return <TabAccounts actions={actions} />;
+      case 'permissions': return <TabPermissions actions={actions} workspace={workspace} />;
+      case 'agents': return <TabAgents actions={actions} />;
       case 'api-settings': return <TabApiSettings />;
-      case 'audit': return <TabAudit />;
-      default: return <TabOverview />;
+      case 'audit': return <TabAudit actions={actions} />;
+      default: return <TabOverview actions={actions} workspace={workspace} />;
     }
   };
 
   return (
     <div className="flex flex-col h-full">
-      <PageHeader
-        title="超级管理员工作台"
-        subtitle="账号管理 | 权限配置 | Agent 编排 | API 配置 | 审计日志"
-        breadcrumbs={[
-          { label: '工作台' },
-          { label: '超级管理员工作台' },
-        ]}
-      />
-      <TabBar tabs={tabs} activeTab={activeTab} onChange={setActiveTab} />
       <div className="page-body">
         {renderTabContent()}
       </div>
+      {actions.toastNode}
+      {actions.modalNode}
     </div>
   );
 }

@@ -198,16 +198,15 @@ function SidebarUser({ role, onLogout }) {
 function Header({
   role,
   currentPath,
-  screeningProjects = [],
-  selectedScreeningProjectId,
-  onSelectScreeningProject,
+  projects = [],
+  selectedProjectId,
+  onSelectProject,
 }) {
   const roleInfo = roleConfig[role];
   const navItems = navConfig[role] || [];
   const currentPage = navItems.find((item) => item.path === currentPath);
-  const isScreeningRole = role === 'screening';
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
-  const selectedProject = screeningProjects.find(project => project.project_id === selectedScreeningProjectId) || screeningProjects[0];
+  const selectedProject = projects.find(project => project.project_id === selectedProjectId) || projects[0];
 
   return (
     <header
@@ -219,7 +218,7 @@ function Header({
       }}
     >
       {/* 面包屑导航 */}
-      {isScreeningRole ? (
+      {projects.length > 0 ? (
         <div className="breadcrumb project-switcher">
           <span className="breadcrumb-item">当前项目</span>
           <span className="breadcrumb-separator">/</span>
@@ -234,8 +233,8 @@ function Header({
           {projectMenuOpen && (
             <div className="project-switcher-menu">
               <div className="project-switcher-title">点击切换项目</div>
-              {screeningProjects.length > 0 ? (
-                screeningProjects.map((project) => {
+              {projects.length > 0 ? (
+                projects.map((project) => {
                   const isSelected = project.project_id === selectedProject?.project_id;
                   return (
                     <button
@@ -243,7 +242,7 @@ function Header({
                       key={project.project_id}
                       className={`project-switcher-option ${isSelected ? 'active' : ''}`}
                       onClick={() => {
-                        onSelectScreeningProject?.(project.project_id);
+                        onSelectProject?.(project.project_id);
                         setProjectMenuOpen(false);
                       }}
                     >
@@ -331,10 +330,10 @@ export default function WorkbenchLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
-  const [screeningProjects, setScreeningProjects] = useState([]);
-  const [selectedScreeningProjectId, setSelectedScreeningProjectId] = useState(() => {
+  const [projects, setProjects] = useState([]);
+  const [selectedProjectId, setSelectedProjectId] = useState(() => {
     try {
-      return window.localStorage.getItem('adflow-selected-screening-project') || '';
+      return window.localStorage.getItem('adflow-selected-project') || window.localStorage.getItem('adflow-selected-screening-project') || '';
     } catch {
       return '';
     }
@@ -349,42 +348,41 @@ export default function WorkbenchLayout() {
   };
 
   useEffect(() => {
-    if (role !== 'screening') return;
-
     let cancelled = false;
     fetch('/api/projects')
       .then((response) => response.json())
       .then((payload) => {
         if (cancelled) return;
         const nextProjects = payload.projects || [];
-        setScreeningProjects(nextProjects);
-        setSelectedScreeningProjectId((currentId) => (
+        setProjects(nextProjects);
+        setSelectedProjectId((currentId) => (
           currentId || nextProjects[0]?.project_id || 'youdao_001'
         ));
       })
       .catch(() => {
         if (!cancelled) {
-          setScreeningProjects([]);
+          setProjects([]);
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [role]);
+  }, []);
 
   useEffect(() => {
-    if (!selectedScreeningProjectId) return;
+    if (!selectedProjectId) return;
     try {
-      window.localStorage.setItem('adflow-selected-screening-project', selectedScreeningProjectId);
+      window.localStorage.setItem('adflow-selected-project', selectedProjectId);
+      window.localStorage.setItem('adflow-selected-screening-project', selectedProjectId);
     } catch {
       // Local storage is optional; the page still works without persistence.
     }
-  }, [selectedScreeningProjectId]);
+  }, [selectedProjectId]);
 
-  const handleSelectScreeningProject = (projectId) => {
-    setSelectedScreeningProjectId(projectId);
-    if (currentPath === 'projects') {
+  const handleSelectProject = (projectId) => {
+    setSelectedProjectId(projectId);
+    if (role === 'screening' && currentPath === 'projects') {
       navigate('/workbench/screening/overview');
     }
   };
@@ -411,9 +409,9 @@ export default function WorkbenchLayout() {
         <Header
           role={role}
           currentPath={currentPath}
-          screeningProjects={screeningProjects}
-          selectedScreeningProjectId={selectedScreeningProjectId}
-          onSelectScreeningProject={handleSelectScreeningProject}
+          projects={projects}
+          selectedProjectId={selectedProjectId}
+          onSelectProject={handleSelectProject}
         />
         <div className="page-body">
           <Suspense fallback={<div style={{
@@ -426,8 +424,8 @@ export default function WorkbenchLayout() {
           }}>加载面板中...</div>}>
             <DashboardComponent
               key={currentPath}
-              selectedProjectId={selectedScreeningProjectId}
-              onSelectedProjectIdChange={setSelectedScreeningProjectId}
+              selectedProjectId={selectedProjectId}
+              onSelectedProjectIdChange={setSelectedProjectId}
             />
           </Suspense>
         </div>

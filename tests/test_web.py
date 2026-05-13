@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from rpa_mcp_sync.creator_store import connect
 from rpa_mcp_sync.config_store import AI_PROVIDER_PATH, feishu_connection_path
 from rpa_mcp_sync.pgy_browser import build_collection_plan
-from rpa_mcp_sync.web import app
+from rpa_mcp_sync.web import app, _filter_creators_by_hard_filters, _scheme_plan
 
 
 client = TestClient(app)
@@ -154,7 +154,7 @@ def test_pgy_collect_batch_persists_strategy_snapshot(monkeypatch):
         }
 
     monkeypatch.setattr("rpa_mcp_sync.web.collect_visible_list", fake_collect_visible_list)
-    monkeypatch.setattr("rpa_mcp_sync.web.score_project", lambda project_id, **kwargs: {"scored": 1})
+    monkeypatch.setattr("rpa_mcp_sync.web.score_project", lambda project_id, **kwargs: {"scored": len(kwargs.get("creator_ids") or [])})
 
     collect = client.post(
         "/api/pgy/collect/batch",
@@ -190,7 +190,7 @@ def test_pgy_collect_batch_persists_strategy_snapshot(monkeypatch):
     client.delete(f"/api/projects/{project_id}")
 
 
-def test_pgy_collect_batch_runs_multiple_schemes(monkeypatch):
+def test_pgy_collect_batch_stops_after_first_collectable_scheme(monkeypatch):
     project_id = "pytest_collect_multi_scheme"
     plan = {
         "pgyCollectionPlan": {
@@ -268,12 +268,10 @@ def test_pgy_collect_batch_runs_multiple_schemes(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
-    assert [item["scheme_id"] for item in payload["scheme_results"]] == ["education_core", "parent_family"]
+    assert [item["scheme_id"] for item in payload["scheme_results"]] == ["education_core"]
     assert calls == [
-        {"scheme": "education_core", "reset": False},
         {"scheme": "education_core", "reset": True},
-        {"scheme": "parent_family", "reset": True},
-        {"scheme": "parent_family", "reset": True},
+        {"scheme": "education_core", "reset": False},
     ]
     assert payload["batch"]["total_count"] == 2
     assert payload["batch"]["success_count"] == 2
@@ -331,6 +329,109 @@ def test_pgy_collect_batch_skips_scheme_when_preflight_count_too_many(monkeypatc
     assert preflight["collected_after_preflight"] is False
     assert payload["batch"]["error_message"]
     client.delete(f"/api/projects/{project_id}")
+
+
+def test_pgy_collect_batch_adds_additional_filters_in_order_until_count_ok(monkeypatch):
+    project_id = "pytest_collect_additional_order"
+    plan = {
+        "pgyCollectionPlan": {
+            "target_count_range": "50-2000",
+            "schemes": [
+                {
+                    "scheme_id": "ordered",
+                    "name": "顺序附加方案",
+                    "target_count_range": "50-2000",
+                    "required_filters": [
+                        {"field": "博主类目", "value": "教育"},
+                        {"field": "粉丝量", "value": "1万～10万"},
+                        {"field": "粉丝年龄", "value": "35～44 占比高"},
+                        {"field": "合作报价", "value": "图文笔记：0.1万～2万"},
+                    ],
+                    "additional_filters": [
+                        {"field": "预估阅读单价", "value": "图文笔记阅读单价≤2"},
+                        {"field": "预估互动单价", "value": "图文笔记互动单价≤20"},
+                    ],
+                }
+            ],
+        }
+    }
+    client.post(f"/api/projects/{project_id}", json={"project_name": project_id, "brief": "有道答疑笔", "screening_plan": plan})
+    counts = [5000, 800]
+    calls = []
+
+    def fake_collect_visible_list(**kwargs):
+        pgy_plan = kwargs["screening_plan"]["pgyCollectionPlan"]
+        fields = [item["field"] for item in pgy_plan["filters"]]
+        calls.append({"preflight": bool(kwargs.get("preflight_only")), "reset": kwargs.get("reset_filters"), "fields": fields})
+        if kwargs.get("preflight_only"):
+            count = counts.pop(0)
+            return {
+                "ok": True,
+                "collection_plan": pgy_plan,
+                "applied_filters": [{"field": field, "value": field} for field in fields],
+                "skipped_filters": [],
+                "selected_metrics": [],
+                "skipped_metrics": [],
+                "actual_recommend_count": count,
+                "actual_count_text": f"推荐 {count} 位博主",
+                "export_result": {"status": "skipped"},
+            }
+        return {
+            "ok": True,
+            "creators": [{"creator_id": "ordered-creator", "nickname": "顺序达人", "pgy_url": "https://pgy.xiaohongshu.com/creator/ordered"}],
+            "collection_plan": pgy_plan,
+            "applied_filters": [{"field": field, "value": field} for field in fields],
+            "skipped_filters": [],
+            "selected_metrics": [],
+            "skipped_metrics": [],
+            "export_result": {"status": "skipped"},
+        }
+
+    monkeypatch.setattr("rpa_mcp_sync.web.collect_visible_list", fake_collect_visible_list)
+    monkeypatch.setattr("rpa_mcp_sync.web.score_project", lambda project_id, **kwargs: {"scored": len(kwargs.get("creator_ids") or [])})
+
+    response = client.post("/api/pgy/collect/batch", json={"project_id": project_id, "screening_plan": plan})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert calls == [
+        {"preflight": True, "reset": True, "fields": ["博主类目", "粉丝量", "粉丝年龄", "合作报价"]},
+        {"preflight": True, "reset": False, "fields": ["博主类目", "粉丝量", "粉丝年龄", "合作报价", "预估阅读单价"]},
+        {"preflight": False, "reset": False, "fields": ["博主类目", "粉丝量", "粉丝年龄", "合作报价", "预估阅读单价"]},
+    ]
+    preflight = payload["scheme_results"][0]["preflight"]
+    assert [step["actual_recommend_count"] for step in preflight["steps"]] == [5000, 800]
+    assert [item["field"] for item in preflight["active_additional_filters"]] == ["预估阅读单价"]
+    client.delete(f"/api/projects/{project_id}")
+
+
+def test_scheme_plan_uses_required_filters_and_manual_only_user_filters():
+    screening_plan = {
+        "pgyCollectionPlan": {
+            "filters": [
+                {"field": "特色背景", "value": "备考经验"},
+                {"field": "职业身份", "value": "教育科研", "manual": True, "source": "frontend"},
+            ]
+        }
+    }
+    scheme = {
+        "scheme_id": "clean",
+        "required_filters": [
+            {"field": "博主类目", "value": "教育"},
+            {"field": "粉丝量", "value": "1万～10万"},
+            {"field": "粉丝年龄", "value": "35～44 占比高"},
+            {"field": "合作报价", "value": "图文笔记：0.1万～2万"},
+        ],
+        "additional_filters": [{"field": "预估互动单价", "value": "图文笔记互动单价≤20"}],
+    }
+
+    plan = _scheme_plan(screening_plan, scheme)
+    pgy_plan = plan["pgyCollectionPlan"]
+
+    assert [item["field"] for item in pgy_plan["required_filters"]] == ["博主类目", "粉丝量", "粉丝年龄", "合作报价"]
+    assert [item["field"] for item in pgy_plan["additional_filters"]] == ["预估互动单价"]
+    assert [item["field"] for item in pgy_plan["filters"]] == ["博主类目", "粉丝量", "粉丝年龄", "合作报价", "职业身份"]
 
 
 def test_pgy_scheme_memory_blends_next_expected_count(monkeypatch):
@@ -478,15 +579,18 @@ def test_pgy_collect_uses_hard_filters_as_collection_gate(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["batch"]["total_count"] == 3
-    assert payload["batch"]["success_count"] == 1
-    assert payload["batch"]["failed_count"] == 2
-    assert [creator["nickname"] for creator in payload["creators"]] == ["精准入库达人"]
+    assert payload["batch"]["success_count"] == 3
+    assert payload["batch"]["failed_count"] == 0
+    assert [creator["nickname"] for creator in payload["creators"]] == ["精准入库达人", "超预算达人", "粉丝年龄不符达人"]
     assert {item["nickname"] for item in payload["rejected_by_hard_filters"]} == {"超预算达人", "粉丝年龄不符达人"}
-    assert any(item["field"] == "硬性条件拦截" for item in payload["skipped_filters"])
+    assert payload["flagged_by_hard_filters"] == payload["rejected_by_hard_filters"]
+    assert any(item["field"] == "筛选工作台标记" for item in payload["skipped_filters"])
     assert captured["screening_plan"]["hardFilters"] == plan["hardFilters"]
 
     creators = client.get(f"/api/projects/{project_id}/creators").json()["creators"]
-    assert [creator["nickname"] for creator in creators] == ["精准入库达人"]
+    assert {creator["nickname"] for creator in creators} == {"精准入库达人", "超预算达人", "粉丝年龄不符达人"}
+    flagged = next(creator for creator in creators if creator["nickname"] == "超预算达人")
+    assert "collection_hard_filter_issues" in json.loads(flagged["raw_payload"])
     client.delete(f"/api/projects/{project_id}")
 
 
@@ -542,7 +646,7 @@ def test_pgy_collect_hard_filters_parse_loose_multi_value_rules(monkeypatch):
     response = client.post("/api/pgy/collect/batch", json={"project_id": project_id, "screening_plan": plan, "limit": 20})
     assert response.status_code == 200
     payload = response.json()
-    assert [creator["creator_id"] for creator in payload["creators"]] == ["loose-pass"]
+    assert [creator["creator_id"] for creator in payload["creators"]] == ["loose-pass", "loose-fail"]
     assert payload["rejected_by_hard_filters"][0]["creator_id"] == "loose-fail"
     pgy_filters = captured["collection_plan"]["filters"]
     assert next(item for item in pgy_filters if item["field"] == "合作报价")["max"] == 20000
@@ -576,9 +680,50 @@ def test_structured_hard_filters_map_directly_to_pgy_filters():
     }
     collection_plan = build_collection_plan("教育达人", plan)
     assert collection_plan["filters"][0]["field"] == "粉丝年龄"
-    assert collection_plan["filters"][0]["value"] == "35～44 占比高、>44 占比高"
-    assert collection_plan["filters"][1]["field"] == "合作报价"
-    assert collection_plan["filters"][1]["sub_field"] == "图文笔记"
+    assert collection_plan["filters"][0]["value"] == "35～44 占比高"
+    assert collection_plan["filters"][1]["field"] == "粉丝年龄"
+    assert collection_plan["filters"][1]["value"] == ">44 占比高"
+    assert collection_plan["filters"][2]["field"] == "合作报价"
+    assert collection_plan["filters"][2]["sub_field"] == "图文笔记"
+    assert collection_plan["filters"][2]["max"] == 20000
+    assert collection_plan["filters"][2]["min"] == 1000
+
+
+def test_pgy_quote_range_text_parses_to_yuan_values():
+    from rpa_mcp_sync.pgy_browser import _normalize_pgy_filters, _range_numbers_from_text
+
+    assert _range_numbers_from_text("图文笔记：0.1万～2万") == (1000, 20000)
+    assert _range_numbers_from_text("图文笔记阅读单价≤2") == (None, 2)
+    normalized = _normalize_pgy_filters([
+        {"field": "合作报价", "value": "图文笔记：0.1万～2万"},
+        {"field": "粉丝年龄", "value": "35～44 占比高"},
+        {"field": "粉丝量", "value": "1万～10万"},
+    ])
+    assert normalized[0]["min"] == 1000
+    assert normalized[0]["max"] == 20000
+    assert normalized[0]["sub_fields"] == ["图文笔记"]
+    assert normalized[1]["control_type"] == "dropdown"
+    assert normalized[2]["control_type"] == "preset_or_number_range"
+    ambiguous = _normalize_pgy_filters([{"field": "合作报价", "value": "0.1万～2万"}])[0]
+    assert ambiguous["sub_fields"] == ["图文笔记", "视频笔记"]
+    video = _normalize_pgy_filters([{"field": "合作报价", "value": "视频笔记：0.1万～2万"}])[0]
+    assert video["sub_fields"] == ["视频笔记"]
+
+
+def test_pgy_row_parser_ignores_empty_state_as_creator():
+    from rpa_mcp_sync.pgy_browser import _parse_row_text
+
+    assert _parse_row_text("暂无数据\n暂未发现相关博主\n放宽条件才能找到更多的博主", "https://pgy.xiaohongshu.com/solar/pre-trade/note/kol") is None
+
+
+def test_collection_only_marketing_goal_does_not_block_creator_gate():
+    creators = [{"creator_id": "c1", "nickname": "教育学硕士妈妈", "source": "pgy", "raw_payload": {"collection_page": 1}}]
+    hard_filters = [{"field": "营销目标", "condition": "包含", "value": "种草", "required": True, "pgyField": "营销目标"}]
+
+    accepted, rejected = _filter_creators_by_hard_filters("pytest_collection_only_goal", creators, hard_filters)
+
+    assert accepted == creators
+    assert rejected == []
 
 
 def test_hard_filters_parse_multi_choice_text_rules(monkeypatch):
@@ -610,7 +755,7 @@ def test_hard_filters_parse_multi_choice_text_rules(monkeypatch):
     response = client.post("/api/pgy/collect/batch", json={"project_id": project_id, "screening_plan": plan, "limit": 20})
     assert response.status_code == 200
     payload = response.json()
-    assert [creator["creator_id"] for creator in payload["creators"]] == ["text-pass"]
+    assert [creator["creator_id"] for creator in payload["creators"]] == ["text-pass", "text-fail"]
     assert payload["rejected_by_hard_filters"][0]["creator_id"] == "text-fail"
     client.delete(f"/api/projects/{project_id}")
 
@@ -1104,6 +1249,26 @@ def test_collection_plan_uses_first_scheme_when_default_filters_missing():
     assert plan["schemes"][0]["scheme_id"] == "education_core"
 
 
+def test_relaxed_collection_plan_keeps_broad_filters_when_empty():
+    from rpa_mcp_sync.pgy_browser import _relaxed_collection_plan
+
+    plan = {
+        "filters": [
+            {"field": "营销目标", "value": "种草"},
+            {"field": "博主类目", "value": "教育"},
+            {"field": "粉丝年龄", "value": "35～44 占比高"},
+            {"field": "预估互动单价", "value": "图文笔记互动单价≤20"},
+        ],
+        "display_metrics": ["全部非直播指标"],
+    }
+
+    relaxed = _relaxed_collection_plan(plan, "broad")
+
+    assert relaxed["auto_relaxed"] is True
+    assert [item["field"] for item in relaxed["filters"]] == ["营销目标", "博主类目"]
+    assert [item["field"] for item in relaxed["relaxation"]["removed_filters"]] == ["粉丝年龄", "预估互动单价"]
+
+
 def test_creator_pool_api_and_csv_export():
     project_id = "pytest_web_pool"
     create = client.post(
@@ -1142,3 +1307,47 @@ def test_creator_pool_api_and_csv_export():
     export = client.get(f"/api/projects/{project_id}/exports/creator-pool.csv")
     assert export.status_code == 200
     assert "接口达人池测试" in export.text
+
+
+def test_pgy_invite_api_marks_creators_invited():
+    project_id = "pytest_pgy_invite"
+    create = client.post(
+        f"/api/projects/{project_id}/creators",
+        json={
+            "data": {
+                "creator_id": "pytest-pgy-invite-001",
+                "nickname": "蒲公英邀约测试",
+                "pgy_url": "https://pgy.xiaohongshu.com/creator/invite-001",
+                "quote_price": 9000,
+            }
+        },
+    )
+    assert create.status_code == 200
+
+    invite = client.post(
+        f"/api/projects/{project_id}/creators/invite",
+        json={
+            "creator_ids": ["pytest-pgy-invite-001"],
+            "brand_name": "有道",
+            "cooperation_type": "图文笔记一口价",
+            "product_name": "答疑笔",
+            "expected_start_date": "2026-05-20",
+            "expected_end_date": "2026-05-30",
+            "content_intro": "围绕家庭学习场景介绍产品。",
+            "contact_type": "微信",
+            "contact_info": "youdao-test",
+            "source": "pytest",
+            "operator": "pytest",
+            "channel": "pgy",
+        },
+    )
+
+    assert invite.status_code == 200
+    payload = invite.json()
+    assert payload["channel"] == "pgy"
+    assert payload["invited_count"] == 1
+    assert payload["creators"][0]["status"] == "已邀约"
+    pool = client.get(f"/api/projects/{project_id}/creator-pool")
+    assert pool.status_code == 200
+    assert pool.json()["groups"]["待建联达人"][0]["review_status"] == "已邀约"
+    client.delete(f"/api/projects/{project_id}")
