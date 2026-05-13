@@ -103,7 +103,7 @@ const navConfig = {
     { icon: Users, label: '筛选工作台', path: 'screening-review' },
     { icon: UserCheck, label: '审号工作台', path: 'creator-audit' },
     { icon: BarChart3, label: '项目达人池', path: 'score-preview' },
-    { icon: FolderPlus, label: '立项 + 标准 + 飞书绑定', path: 'project-setup' },
+    { icon: FolderPlus, label: '项目配置', path: 'project-setup' },
     { divider: true },
     { icon: ScrollText, label: '操作日志', path: 'audit-log' },
     { icon: ExternalLink, label: '高级配置（原工作台）', path: 'legacy' },

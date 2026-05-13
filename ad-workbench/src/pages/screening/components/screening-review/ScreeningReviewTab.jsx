@@ -21,8 +21,8 @@ import { getReviewVariant, getScoreColor, getScoreTier } from '../../utils/creat
 import { mergeOptionItems } from '../../utils/pgyFilters';
 import { hardFilterOptionsFor, normalizeWorkbenchPlan, syncScreeningCriteria } from '../../utils/screeningPlan';
 import { getCreatorAvatarUrl, getPgyUrl } from '../../utils/creatorMappers';
-import { HardFilterEditor } from '../filters/HardFilterEditor';
 import { SelectedChips } from '../filters/SelectedChips';
+import { HardFilterCheckPanel } from '../filters/HardFilterCheckPanel';
 import { CreatorDetailModal } from './CreatorDetailModal';
 import { PgyInviteModal } from '../pgy-invite/PgyInviteModal';
 
@@ -232,20 +232,20 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
     });
   };
 
-  const applyScoringPlan = async (runScore = false) => {
-    setPlanStatus(runScore ? '正在应用评分筛选条件并重新评分...' : '正在应用评分筛选条件...');
+  const saveScoringPlan = async (runScore = false) => {
+    setPlanStatus(runScore ? '正在保存评分筛选条件并重新评分...' : '正在保存评分筛选条件...');
     try {
       const nextPlan = syncScreeningCriteria(planDraft);
       await onSavePlan?.(nextPlan);
       setPlanDraft(normalizeWorkbenchPlan(nextPlan));
       if (runScore) {
         await onScore?.();
-        setPlanStatus('评分筛选条件已应用，并已触发重新评分');
+        setPlanStatus('评分筛选条件已保存，并已触发重新评分');
       } else {
-        setPlanStatus('评分筛选条件已应用，后续评分会使用当前条件');
+        setPlanStatus('评分筛选条件已保存，并同步到项目配置');
       }
     } catch (error) {
-      setPlanStatus(error.message || '评分筛选条件应用失败');
+      setPlanStatus(error.message || '评分筛选条件保存失败');
     }
   };
 
@@ -371,25 +371,25 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
                 <div className="collection-plan-subtitle">用于初筛评分、硬性不符判断和 AI 推荐理由，不影响蒲公英页面采集条件。</div>
               </div>
             </div>
-            <HardFilterEditor
+            <HardFilterCheckPanel
               filters={planDraft.scoringHardFilters || []}
               options={scoringHardFilterOptions}
-              onChange={(filters) => setPlanDraft(old => ({ ...old, scoringHardFilters: filters }))}
+              onChange={(filters) => {
+                setPlanStatus('');
+                setPlanDraft(old => ({ ...old, scoringHardFilters: filters }));
+              }}
               emptyText="暂无评分筛选条件，可从可选项添加。"
-              fieldHeader="评分筛选项"
-              evidenceHeader="评分依据字段"
-              evidencePlaceholder="关联评分/飞书字段"
             />
           </div>
         )}
         <div className="collection-plan-actions">
-          <span className={planStatus.includes('失败') ? 'is-error' : ''}>{planStatus || '平时折叠；修改后应用，重新评分会使用当前条件。'}</span>
+          <span className={planStatus.includes('失败') ? 'is-error' : ''}>{planStatus || '平时折叠；修改后保存，重新评分会使用当前条件。'}</span>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button className="btn btn-secondary" onClick={() => applyScoringPlan(false)} disabled={!planDirty && planStatus.includes('已应用')}>
-              <Save size={14} style={{ marginRight: 4 }} />应用条件
+            <button className="btn btn-secondary" onClick={() => saveScoringPlan(false)} disabled={!planDirty && planStatus.includes('已保存')}>
+              <Save size={14} style={{ marginRight: 4 }} />保存条件
             </button>
-            <button className="btn btn-primary" onClick={() => applyScoringPlan(true)}>
-              <Sparkles size={14} style={{ marginRight: 4 }} />应用并重新评分
+            <button className="btn btn-primary" onClick={() => saveScoringPlan(true)}>
+              <Sparkles size={14} style={{ marginRight: 4 }} />保存并重新评分
             </button>
           </div>
         </div>

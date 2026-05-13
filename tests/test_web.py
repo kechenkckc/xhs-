@@ -686,7 +686,76 @@ def test_structured_hard_filters_map_directly_to_pgy_filters():
     assert collection_plan["filters"][2]["field"] == "合作报价"
     assert collection_plan["filters"][2]["sub_field"] == "图文笔记"
     assert collection_plan["filters"][2]["max"] == 20000
-    assert collection_plan["filters"][2]["min"] == 1000
+    assert collection_plan["filters"][2]["min"] == 10000
+
+
+def test_structured_image_and_video_quote_filters_are_preserved():
+    plan = {
+        "collectionHardFilters": [
+            {
+                "field": "合作报价",
+                "condition": "<=",
+                "value": "图文笔记：0.1万～0.5万",
+                "required": True,
+                "pgyField": "合作报价",
+                "valueControl": "range",
+                "subField": "图文笔记",
+            },
+            {
+                "field": "合作报价",
+                "condition": "<=",
+                "value": "视频笔记：0.5万～1万",
+                "required": True,
+                "pgyField": "合作报价",
+                "valueControl": "range",
+                "subField": "视频笔记",
+            },
+        ],
+        "pgyCollectionPlan": {"filters": []},
+    }
+
+    collection_plan = build_collection_plan("教育达人", plan)
+    quote_filters = [item for item in collection_plan["filters"] if item["field"] == "合作报价"]
+
+    assert [item["sub_field"] for item in quote_filters] == ["图文笔记", "视频笔记"]
+    assert [item["value"] for item in quote_filters] == ["图文笔记：0.1万～0.5万", "视频笔记：0.5万～1万"]
+    assert [item["max"] for item in quote_filters] == [5000, 10000]
+
+
+def test_project_save_preserves_image_and_video_quote_filters():
+    project_id = "pytest_quote_subfields_save"
+    plan = {
+        "briefType": "complex",
+        "pgyCollectionPlan": {
+            "filters": [
+                {
+                    "field": "合作报价",
+                    "value": "图文笔记：0.1万～0.5万",
+                    "control_type": "subfield_preset_or_number_range",
+                    "sub_field": "图文笔记",
+                    "manual": True,
+                    "source": "frontend",
+                },
+                {
+                    "field": "合作报价",
+                    "value": "视频笔记：0.5万～1万",
+                    "control_type": "subfield_preset_or_number_range",
+                    "sub_field": "视频笔记",
+                    "manual": True,
+                    "source": "frontend",
+                },
+            ]
+        },
+    }
+
+    response = client.post(f"/api/projects/{project_id}", json={"project_name": project_id, "brief": "教育达人", "screening_plan": plan})
+    assert response.status_code == 200
+    saved_plan = json.loads(response.json()["project"]["screening_plan"])
+    quote_filters = [item for item in saved_plan["collectionHardFilters"] if item["pgyField"] == "合作报价"]
+
+    assert [item["subField"] for item in quote_filters] == ["图文笔记", "视频笔记"]
+    assert [item["value"] for item in quote_filters] == ["图文笔记：0.1万～0.5万", "视频笔记：0.5万～1万"]
+    client.delete(f"/api/projects/{project_id}")
 
 
 def test_pgy_quote_range_text_parses_to_yuan_values():

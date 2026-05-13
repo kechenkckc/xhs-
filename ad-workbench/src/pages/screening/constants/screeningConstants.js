@@ -44,8 +44,8 @@ export const HARD_FILTER_CONDITIONS_BY_KIND = {
 };
 export const DEFAULT_HARD_FILTER_CONDITIONS = ['匹配', '包含', '必须存在'];
 
-export const hardFilterKey = (item) => `${item.field || ''}|${item.condition || ''}|${item.value || ''}`;
-export const pgyFilterKey = (item) => `${item.field || ''}|${item.value || ''}`;
+export const hardFilterKey = (item) => `${item.field || ''}|${item.condition || ''}|${item.value || ''}|${item.subField || item.sub_field || ''}`;
+export const pgyFilterKey = (item) => `${item.field || ''}|${item.value || ''}|${item.sub_field || item.subField || ''}`;
 export const metricKey = (item) => String(item?.value || item || '');
 export const hardFilterLabel = (item) => item.label || `${item.field}${item.condition ? ` ${item.condition}` : ''}${item.value ? ` ${item.value}` : ''}`;
 export const pgyFilterLabel = (item) => item.label || `${item.field}：${item.value}`;

@@ -1782,14 +1782,15 @@ def parse_export_file(path: str | Path) -> dict[str, Any]:
 
 def _merge_filters(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for group in groups:
         for item in group or []:
             field = str(item.get("field") or "")
             value = str(item.get("value") or "")
+            sub_field = str(item.get("sub_field") or item.get("subField") or "")
             if not field or not value:
                 continue
-            key = (field, value)
+            key = (field, value, sub_field)
             if key in seen:
                 continue
             seen.add(key)
@@ -1831,8 +1832,12 @@ def _hard_filters_to_pgy_filters(hard_filters: list[dict[str, Any]]) -> list[dic
             continue
         if pgy_field in {"合作报价", "预估阅读单价", "预估互动单价", "阅读中位数", "互动中位数", "曝光中位数"} and value:
             if pgy_field == "合作报价":
-                max_quote = _threshold_from_text(value, "quote", 20000) or 20000
-                add(pgy_field, f"图文笔记：0.1万～{max_quote / 10000:g}万", reason, control_type="subfield_preset_or_number_range", sub_field=sub_field or "图文笔记", min=1000, max=max_quote)
+                parsed_min, parsed_max = _range_numbers_from_text(value)
+                min_quote = item.get("min", parsed_min if parsed_min is not None else 1000)
+                max_quote = item.get("max", parsed_max if parsed_max is not None else (_threshold_from_text(value, "quote", 20000) or 20000))
+                next_sub_field = sub_field or ("视频笔记" if "视频笔记" in value else "图文笔记")
+                display_value = value if next_sub_field in value else f"{next_sub_field}：{value}"
+                add(pgy_field, display_value, reason, control_type="subfield_preset_or_number_range", sub_field=next_sub_field, min=min_quote, max=max_quote)
                 continue
             if pgy_field == "预估阅读单价":
                 cpc_max = _threshold_from_text(value, "cpc", 2) or _threshold_from_text(value, "generic", 2) or 2

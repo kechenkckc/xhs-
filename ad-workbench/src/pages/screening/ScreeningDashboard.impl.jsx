@@ -24,13 +24,27 @@ const tabs = [
   { key: 'screening-review', label: '初筛评分 + 人工筛选', icon: <Users size={14} /> },
   { key: 'creator-audit', label: '审号工作台', icon: <BarChart3 size={14} /> },
   { key: 'score-preview', label: '候选评分预览', icon: <BarChart3 size={14} /> },
-  { key: 'project-setup', label: '立项 + 标准 + 飞书绑定', icon: <FolderPlus size={14} /> },
+  { key: 'project-setup', label: '项目配置', icon: <FolderPlus size={14} /> },
   { key: 'audit-log', label: '操作日志', icon: <ScrollText size={14} /> },
   { key: 'legacy', label: '高级配置', icon: <ExternalLink size={14} /> },
 ];
 
 function getProjectKey(project = {}) {
   return project.id || project.project_id;
+}
+
+function patchProject(project = {}, patch = {}) {
+  return {
+    ...project,
+    ...patch,
+    ...(patch.project_id ? { id: patch.project_id, project_id: patch.project_id } : {}),
+    ...(patch.project_name ? { name: patch.project_name, project_name: patch.project_name } : {}),
+    ...(patch.target_qualified_creator_count ? { creatorCount: patch.target_qualified_creator_count } : {}),
+    ...(patch.period_start ? { periodStart: patch.period_start } : {}),
+    ...(patch.period_end ? { periodEnd: patch.period_end } : {}),
+    ...(patch.brief ? { description: patch.brief, brief: { ...(project.brief || {}), description: patch.brief } } : {}),
+    ...(patch.screening_plan ? { screeningPlan: patch.screening_plan } : {}),
+  };
 }
 
 export default function ScreeningDashboard() {
@@ -86,24 +100,21 @@ export default function ScreeningDashboard() {
 
   const createProject = (newProject) => {
     setProjects((prev) => [...prev, newProject]);
+    setCurrentProject(newProject);
+    setActiveTab('project-setup');
     setShowCreateModal(false);
+    navigate('/workbench/screening/project-setup');
   };
 
   const projectId = currentProject?.id || currentProject?.project_id;
 
   const updateCurrentProject = (patch) => {
     if (!currentProject) return;
-    const normalizedPatch = {
-      ...patch,
-      ...(patch.project_name ? { name: patch.project_name, project_name: patch.project_name } : {}),
-      ...(patch.target_qualified_creator_count ? { creatorCount: patch.target_qualified_creator_count } : {}),
-      ...(patch.period_start ? { periodStart: patch.period_start } : {}),
-      ...(patch.period_end ? { periodEnd: patch.period_end } : {}),
-      ...(patch.brief ? { description: patch.brief, brief: { ...(currentProject.brief || {}), description: patch.brief } } : {}),
-      ...(patch.screening_plan ? { screeningPlan: patch.screening_plan } : {}),
-    };
-    setProjects((prev) => prev.map((item) => (item.id === currentProject.id ? { ...item, ...normalizedPatch } : item)));
-    setCurrentProject((prev) => (prev ? { ...prev, ...normalizedPatch } : prev));
+    const currentId = getProjectKey(currentProject);
+    const normalizedPatch = patchProject(currentProject, patch);
+    setProjects((prev) => prev.map((item) => (getProjectKey(item) === currentId ? patchProject(item, patch) : item)));
+    setProjectList((prev) => prev.map((item) => (getProjectKey(item) === currentId ? { ...item, ...patch } : item)));
+    setCurrentProject((prev) => (prev ? patchProject(prev, patch) : prev));
   };
 
   const safeApi = async (url, options = {}) => {
@@ -123,7 +134,12 @@ export default function ScreeningDashboard() {
       body: JSON.stringify(payload),
     });
     if (result.project) {
+      setProjectList((prev) => {
+        const exists = prev.some((item) => getProjectKey(item) === result.project.project_id);
+        return exists ? prev.map((item) => (getProjectKey(item) === result.project.project_id ? result.project : item)) : [...prev, result.project];
+      });
       updateCurrentProject({
+        project_id: result.project.project_id,
         project_name: result.project.project_name,
         target_qualified_creator_count: result.project.target_qualified_creator_count,
         period_start: result.project.period_start,
@@ -289,7 +305,7 @@ export default function ScreeningDashboard() {
       );
     }
 
-    if (!currentProject) {
+    if (!currentProject && activeTab !== 'project-setup') {
       return (
         <div className="card" style={{ textAlign: 'center', padding: 48 }}>
           <FolderOpen size={48} style={{ color: '#5A6478', marginBottom: 16 }} />
@@ -336,9 +352,12 @@ export default function ScreeningDashboard() {
       case 'score-preview':
         return <ScorePreviewTab project={currentProject} screeningStatus={screeningStatus} onCollectDetails={handleCollectDetails} onPgyInvite={handlePgyInvite} />;
       case 'project-setup':
-        return (
+        return currentProject ? (
           <ProjectSetupTab
             project={currentProject}
+            projects={mergedProjects}
+            onSelectProject={setCurrentProject}
+            onCreateProject={() => setShowCreateModal(true)}
             onSaveProject={handleSaveProject}
             onSaveScreeningPlan={handleSaveScreeningPlan}
             onSaveFeishu={handleSaveFeishu}
@@ -347,6 +366,34 @@ export default function ScreeningDashboard() {
             onLoadFields={handleLoadFields}
             onWriteBack={handleWriteBack}
           />
+        ) : (
+          <div className="card" style={{ textAlign: 'center', padding: 48 }}>
+            <FolderPlus size={44} style={{ color: 'var(--text-muted)', marginBottom: 16 }} />
+            <h4 style={{ margin: '0 0 8px', color: 'var(--text-primary)' }}>项目配置</h4>
+            <p style={{ color: 'var(--text-secondary)', marginBottom: 16 }}>选择已有项目或新建项目后，按立项、飞书绑定、Brief 解析顺序完成配置。</p>
+            <div style={{ display: 'inline-flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
+              {mergedProjects.length > 0 && (
+                <select
+                  className="select-field"
+                  defaultValue=""
+                  style={{ minWidth: 260 }}
+                  onChange={(event) => {
+                    const next = mergedProjects.find(item => getProjectKey(item) === event.target.value);
+                    if (next) setCurrentProject(next);
+                  }}
+                >
+                  <option value="">选择已有项目</option>
+                  {mergedProjects.map(item => {
+                    const id = getProjectKey(item);
+                    return <option key={id} value={id}>{item.name || item.project_name || id}</option>;
+                  })}
+                </select>
+              )}
+              <button className="btn btn-primary" onClick={() => setShowCreateModal(true)}>
+                <FolderPlus size={14} />新建项目
+              </button>
+            </div>
+          </div>
         );
       case 'audit-log':
         return <AuditLogTab project={currentProject} />;

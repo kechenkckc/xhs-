@@ -6,6 +6,62 @@ $port = 8797
 $chromeDebugPort = 9222
 $frontend = Join-Path $PSScriptRoot "ad-workbench"
 
+function Get-PortListeners {
+  param([int]$Port)
+
+  return Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+}
+
+function Stop-PortListeners {
+  param([int]$Port)
+
+  $connections = Get-PortListeners -Port $Port
+  foreach ($pidToStop in ($connections.OwningProcess | Sort-Object -Unique)) {
+    if ($pidToStop -and $pidToStop -ne $PID) {
+      $process = Get-Process -Id $pidToStop -ErrorAction SilentlyContinue
+      $processName = if ($process) { $process.ProcessName } else { "unknown" }
+      Write-Host ("Stopping existing PID {0} ({1}) on port {2}" -f $pidToStop, $processName, $Port)
+      Stop-Process -Id $pidToStop -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+function Wait-PortFree {
+  param(
+    [int]$Port,
+    [int]$TimeoutSeconds = 10
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  do {
+    $connections = Get-PortListeners -Port $Port
+    if (-not $connections) {
+      return $true
+    }
+    Start-Sleep -Milliseconds 250
+  } while ((Get-Date) -lt $deadline)
+
+  return $false
+}
+
+function Ensure-PortFree {
+  param([int]$Port)
+
+  Stop-PortListeners -Port $Port
+  if (Wait-PortFree -Port $Port -TimeoutSeconds 10) {
+    return
+  }
+
+  $connections = Get-PortListeners -Port $Port
+  $owners = foreach ($connection in $connections) {
+    $process = Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue
+    $processName = if ($process) { $process.ProcessName } else { "unknown" }
+    "{0} ({1})" -f $connection.OwningProcess, $processName
+  }
+
+  throw "Port $Port is still occupied by: $($owners -join ', '). Run 一键停止.bat, close the listed process, or restart the computer."
+}
+
 function Get-LanIPv4 {
   $addresses = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object {
@@ -102,13 +158,7 @@ function Start-PgyChrome {
 }
 
 Write-Host "Checking port $port ..."
-$connections = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-foreach ($pidToStop in ($connections.OwningProcess | Sort-Object -Unique)) {
-  if ($pidToStop -and $pidToStop -ne $PID) {
-    Write-Host ("Stopping existing PID {0} on port {1}" -f $pidToStop, $port)
-    Stop-Process -Id $pidToStop -Force -ErrorAction SilentlyContinue
-  }
-}
+Ensure-PortFree -Port $port
 
 if (Test-Path -LiteralPath $frontend) {
   Push-Location -LiteralPath $frontend
@@ -143,6 +193,8 @@ if ($lanIp) {
 Write-Host ""
 Write-Host "Keep this window open while others are using the app."
 Write-Host "Keep the Chrome window open and log in to Pgy if prompted."
+
+Ensure-PortFree -Port $port
 
 Start-Job -ScriptBlock {
   param($url)

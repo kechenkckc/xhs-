@@ -1016,7 +1016,7 @@ def _sync_screening_plan_criteria(plan: dict[str, Any]) -> dict[str, Any]:
 
     def hard_filters_from_pgy_filters(items: Any) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         option_by_field = {
             "博主类目": {"condition": "包含", "feishuField": "账号类型", "valueControl": "multi"},
             "粉丝年龄": {"condition": "匹配", "feishuField": "粉丝年龄34岁以上占比", "valueControl": "multi"},
@@ -1031,7 +1031,8 @@ def _sync_screening_plan_criteria(plan: dict[str, Any]) -> dict[str, Any]:
             if not field or not value:
                 continue
             option = option_by_field.get(field, {})
-            key = _filter_field_sub_key(item) or (field, "")
+            sub_field = str(item.get("sub_field") or item.get("subField") or "").strip()
+            key = (field, sub_field, value)
             if key in seen:
                 continue
             seen.add(key)
@@ -1044,7 +1045,7 @@ def _sync_screening_plan_criteria(plan: dict[str, Any]) -> dict[str, Any]:
                     "feishuField": option.get("feishuField") or "",
                     "pgyField": field,
                     "valueControl": option.get("valueControl") or "",
-                    "subField": str(item.get("sub_field") or item.get("subField") or "").strip(),
+                    "subField": sub_field,
                 }
             )
         return result

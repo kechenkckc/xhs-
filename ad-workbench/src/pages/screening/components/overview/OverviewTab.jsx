@@ -161,15 +161,15 @@ export function OverviewTab({ project, onCollect, onSavePlan, onTabChange }) {
     });
   };
 
-  const applyPlan = async () => {
-    setPlanStatus('正在应用筛选计划...');
+  const savePlan = async () => {
+    setPlanStatus('正在保存筛选计划...');
     try {
       const nextPlan = syncScreeningCriteria(planDraft);
       await onSavePlan?.(nextPlan);
       setPlanDraft(nextPlan);
-      setPlanStatus('采集计划已应用，后续采集将使用当前采集前筛选条件');
+      setPlanStatus('采集筛选计划已保存，并同步到项目配置');
     } catch (error) {
-      setPlanStatus(error.message || '筛选计划应用失败');
+      setPlanStatus(error.message || '筛选计划保存失败');
     }
   };
 
@@ -338,9 +338,9 @@ export function OverviewTab({ project, onCollect, onSavePlan, onTabChange }) {
             </>
           )}
           <div className="collection-plan-actions">
-            <span className={planStatus.includes('失败') ? 'is-error' : ''}>{planStatus || '修改后点击应用，采集会使用当前筛选计划。'}</span>
-            <button className="btn btn-primary" onClick={applyPlan} disabled={!planDirty && planStatus.includes('已应用')}>
-              <Save size={14} style={{ marginRight: 4 }} />应用计划
+            <span className={planStatus.includes('失败') ? 'is-error' : ''}>{planStatus || '修改后点击保存，采集会使用当前筛选计划。'}</span>
+            <button className="btn btn-primary" onClick={savePlan} disabled={!planDirty && planStatus.includes('已保存')}>
+              <Save size={14} style={{ marginRight: 4 }} />保存计划
             </button>
           </div>
         </div>
