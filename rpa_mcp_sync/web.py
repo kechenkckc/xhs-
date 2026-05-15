@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import threading
 from datetime import datetime
 from typing import Any
 
@@ -70,6 +71,7 @@ from .creator_store import (
     update_handoff_status,
     update_task,
     update_creator,
+    update_batch_progress,
     update_scheme_count_memory,
     upsert_creator,
 )
@@ -77,6 +79,19 @@ from .feishu import FeishuClient, FeishuError, choose_table, column_name, parse_
 from .feishu_field_agent import analyze_field_mapping, apply_field_mapping, default_source_rows
 from .llm_config import chat_json, read_ai_config, test_ai_config, write_ai_config
 from .pgy_browser import PGY_FILTER_CATALOG, browser_status, build_collection_plan, collect_details_for_targets, collect_visible_list, parse_export_file, start_browser
+
+
+_COLLECT_LOCKS: dict[str, threading.Lock] = {}
+_COLLECT_LOCKS_GUARD = threading.Lock()
+
+
+def _collect_lock(project_id: str) -> threading.Lock:
+    with _COLLECT_LOCKS_GUARD:
+        lock = _COLLECT_LOCKS.get(project_id)
+        if lock is None:
+            lock = threading.Lock()
+            _COLLECT_LOCKS[project_id] = lock
+        return lock
 
 
 class FeishuConnectionPayload(BaseModel):
@@ -226,7 +241,7 @@ class BatchCollectPayload(BaseModel):
     include_details: bool = False
     collect_profile_urls: bool = True
     export_metrics: bool = True
-    limit: int = 20
+    limit: int = 1000
     scheme_ids: list[str] = Field(default_factory=list)
     multi_scheme: bool = True
     preflight: bool = True
@@ -239,6 +254,13 @@ class DetailCollectPayload(BaseModel):
     segment: str | None = None
     manual: bool = False
     limit: int = 20
+
+
+class XhsNoteParsePayload(BaseModel):
+    url: str
+    note: dict[str, Any] = Field(default_factory=dict)
+    creator: dict[str, Any] = Field(default_factory=dict)
+    project: dict[str, Any] = Field(default_factory=dict)
 
 
 class ScreeningStandardPayload(BaseModel):
@@ -1529,6 +1551,36 @@ def _error_detail(error: FeishuError) -> dict[str, Any]:
     return {"code": error.code, "message": str(error), **error.details}
 
 
+def _feishu_failure_title(failed_step: str | None) -> str:
+    return {
+        "parse_url": "飞书链接无法识别",
+        "auth": "应用鉴权或 Wiki 解析失败",
+        "list_tables": "读取子表失败",
+        "read_fields": "读取字段失败",
+        "write_test": "测试写入失败",
+    }.get(failed_step or "", "飞书连接测试未通过")
+
+
+def _normalize_feishu_test_failure(result: dict[str, Any]) -> dict[str, Any]:
+    error = result.get("error") if isinstance(result.get("error"), dict) else {}
+    permission_urls = list(dict.fromkeys([
+        *(result.get("permission_urls") or []),
+        *(error.get("permission_urls") or []),
+        *([error.get("console_url")] if error.get("console_url") else []),
+    ]))
+    failed_step = result.get("failed_step")
+    return {
+        **result,
+        "ok": False,
+        "title": _feishu_failure_title(failed_step),
+        "failed_reason": result.get("message") or error.get("message") or _feishu_failure_title(failed_step),
+        "permission_urls": permission_urls,
+        "required_scope": result.get("required_scope") or error.get("required_scope"),
+        "permission_violations": result.get("permission_violations") or error.get("permission_violations") or [],
+        "fix_actions": result.get("fix_actions") or error.get("fix_actions") or [],
+    }
+
+
 def _mark_step(steps: list[dict[str, Any]], key: str, status: str, message: str, **extra: Any) -> None:
     for step in steps:
         if step["key"] == key:
@@ -1667,9 +1719,24 @@ def test_feishu_connection(payload: FeishuConnectionPayload) -> dict[str, Any]:
     feishu_url = payload.feishu_url or saved.get("feishu_url") or ""
     app_id = payload.app_id or saved.get("app_id") or ""
     app_secret = payload.app_secret or saved.get("app_secret") or ""
-    target = parse_feishu_url(feishu_url)
+    try:
+        target = parse_feishu_url(feishu_url)
+    except FeishuError as error:
+        return _normalize_feishu_test_failure({
+            "ok": False,
+            "failed_step": "parse_url",
+            "steps": [
+                {"key": "parse_url", "label": "识别飞书链接", "status": "failed", "message": str(error), "error": _error_detail(error)},
+                {"key": "auth", "label": "应用鉴权 / Wiki 解析", "status": "pending"},
+                {"key": "list_tables", "label": "读取子表", "status": "pending"},
+                {"key": "read_fields", "label": "读取字段", "status": "pending"},
+                {"key": "write_test", "label": "测试写入", "status": "pending"},
+            ],
+            "message": str(error),
+            "error": _error_detail(error),
+        })
     if not app_secret:
-        return {
+        return _normalize_feishu_test_failure({
             "ok": False,
             "target": target.as_dict(),
             "failed_step": "auth",
@@ -1681,10 +1748,10 @@ def test_feishu_connection(payload: FeishuConnectionPayload) -> dict[str, Any]:
                 {"key": "write_test", "label": "测试写入", "status": "pending"},
             ],
             "message": "未提供 App Secret，无法完整测试字段读取和写入",
-        }
+        })
     result = _run_feishu_full_test(feishu_url, app_id, app_secret)
     if not result.get("ok"):
-        raise HTTPException(status_code=400, detail=result)
+        raise HTTPException(status_code=400, detail=_normalize_feishu_test_failure(result))
     return result
 
 
@@ -2058,6 +2125,52 @@ def api_pgy_collect_detail(payload: DetailCollectPayload) -> dict[str, Any]:
     }
 
 
+@app.post("/api/xhs/notes/parse")
+def api_xhs_note_parse(payload: XhsNoteParsePayload) -> dict[str, Any]:
+    url = str(payload.url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail={"message": "请提供小红书笔记链接"})
+    if not re.search(r"(xiaohongshu\.com|xhslink\.com|xhsurl\.com)", url, re.I):
+        raise HTTPException(status_code=400, detail={"message": "当前仅接受小红书笔记链接"})
+
+    note = payload.note or {}
+    metrics = note.get("metrics") if isinstance(note.get("metrics"), dict) else {}
+    title = str(note.get("title") or "").strip()
+    comments = note.get("comments") if isinstance(note.get("comments"), list) else []
+    comments = [str(item.get("content") if isinstance(item, dict) else item or "").strip() for item in comments]
+    comments = [item for item in comments if item][:20]
+    extracted_id = ""
+    match = re.search(r"(?:explore|discovery/item|note)/([^/?#]+)", url)
+    if match:
+        extracted_id = match.group(1)
+
+    return {
+        "ok": True,
+        "source": "preset-xhs-parser",
+        "status": "stub",
+        "message": "小红书笔记解析端口已预置，当前返回前端传入的样本信息；接入真实解析服务后在此替换正文、话题、组件和评论字段。",
+        "url": url,
+        "note_id": extracted_id,
+        "note": {
+            "title": title,
+            "cover_url": note.get("cover_url") or "",
+            "cover_text": note.get("cover_text") or "",
+            "published_at": note.get("published_at") or "",
+            "content": note.get("content") or "",
+            "topics": note.get("topics") or [],
+            "comments": comments,
+            "metrics": {
+                "read_count": metrics.get("read_count") or "",
+                "like_count": metrics.get("like_count") or "",
+                "save_count": metrics.get("save_count") or "",
+                "comment_count": metrics.get("comment_count") or "",
+            },
+        },
+        "creator": payload.creator,
+        "project": payload.project,
+    }
+
+
 def _normalize_project_screening_plan(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return copy.deepcopy(value)
@@ -2391,6 +2504,22 @@ def _evaluate_scheme_count(expected: dict[str, Any], actual: Any, lower_bound: b
 @app.post("/api/pgy/collect/batch")
 def api_pgy_collect_batch(payload: BatchCollectPayload) -> dict[str, Any]:
     project_id = payload.project_id or "youdao_001"
+    lock = _collect_lock(project_id)
+    if not lock.acquire(blocking=False):
+        running_batch = next((batch for batch in list_batches(project_id) if batch.get("status") == "running"), None)
+        return {
+            "ok": False,
+            "message": "当前项目已有采集任务在运行，请等待完成后再启动新的采集",
+            "batch": running_batch or {},
+            "error": "collection_already_running",
+        }
+    try:
+        return _api_pgy_collect_batch_locked(payload, project_id)
+    finally:
+        lock.release()
+
+
+def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str) -> dict[str, Any]:
     project = get_project(project_id) or {}
     brief = project.get("brief") or ""
     screening_plan = payload.screening_plan or _normalize_project_screening_plan(project.get("screening_plan")) or {}
@@ -2407,6 +2536,7 @@ def api_pgy_collect_batch(payload: BatchCollectPayload) -> dict[str, Any]:
     ]
     use_multi_scheme = bool(payload.multi_scheme and payload.apply_filters and schemes)
     batch_id = create_batch(project_id, payload.source_url)
+    update_batch_progress(batch_id, stage="preflight", message="正在应用采集条件并预检推荐数量")
     scheme_results: list[dict[str, Any]] = []
     raw_creators_by_key: dict[str, dict[str, Any]] = {}
     memory_ids_by_scheme: dict[str, str] = {}
@@ -2419,11 +2549,17 @@ def api_pgy_collect_batch(payload: BatchCollectPayload) -> dict[str, Any]:
     detail_collection = ""
     last_error = ""
 
-    def run_once(plan: dict[str, Any], scheme: dict[str, Any] | None = None, reset_filters: bool = False, preflight_only: bool = False) -> dict[str, Any]:
+    def run_once(
+        plan: dict[str, Any],
+        scheme: dict[str, Any] | None = None,
+        reset_filters: bool = False,
+        preflight_only: bool = False,
+        apply_filters: bool | None = None,
+    ) -> dict[str, Any]:
         result = collect_visible_list(
             brief=brief,
             screening_plan=plan,
-            apply_filters=payload.apply_filters,
+            apply_filters=payload.apply_filters if apply_filters is None else apply_filters,
             include_details=payload.include_details,
             collect_profile_urls=payload.collect_profile_urls,
             export_metrics=payload.export_metrics,
@@ -2501,7 +2637,13 @@ def api_pgy_collect_batch(payload: BatchCollectPayload) -> dict[str, Any]:
                         break
             should_collect = bool(evaluation.get("should_collect") or payload.collect_out_of_range)
             scheme_result = (
-                run_once(plan_for_scheme, scheme, reset_filters=not payload.preflight, preflight_only=False)
+                run_once(
+                    plan_for_scheme,
+                    scheme,
+                    reset_filters=not payload.preflight,
+                    preflight_only=False,
+                    apply_filters=not payload.preflight,
+                )
                 if should_collect
                 else {
                     "ok": False,
@@ -2517,6 +2659,15 @@ def api_pgy_collect_batch(payload: BatchCollectPayload) -> dict[str, Any]:
                     "export_result": {"status": "skipped", "message": "数量预检未通过，未执行实际列表采集"},
                 }
             )
+            if should_collect and payload.preflight:
+                if not scheme_result.get("applied_filters") and preflight_result.get("applied_filters"):
+                    scheme_result["applied_filters"] = preflight_result.get("applied_filters") or []
+                if not scheme_result.get("skipped_filters") and preflight_result.get("skipped_filters"):
+                    scheme_result["skipped_filters"] = preflight_result.get("skipped_filters") or []
+                if not scheme_result.get("selected_metrics") and preflight_result.get("selected_metrics"):
+                    scheme_result["selected_metrics"] = preflight_result.get("selected_metrics") or []
+                if not scheme_result.get("skipped_metrics") and preflight_result.get("skipped_metrics"):
+                    scheme_result["skipped_metrics"] = preflight_result.get("skipped_metrics") or []
             scheme_result["preflight"] = {
                 "expected": expected_count,
                 "memory": {"sample_size": len(history), "latest": history[0] if history else None},
@@ -2531,6 +2682,12 @@ def api_pgy_collect_batch(payload: BatchCollectPayload) -> dict[str, Any]:
                 "forced_collect": bool(payload.collect_out_of_range and not evaluation.get("should_collect")),
             }
             scheme_creators = scheme_result.get("creators") or []
+            update_batch_progress(
+                batch_id,
+                stage="collected",
+                message=f"已从蒲公英读取 {len(raw_creators_by_key) + len(scheme_creators)} 个候选达人，准备入库",
+                total_count=len(raw_creators_by_key) + len(scheme_creators),
+            )
             memory = record_scheme_count_memory(
                 project_id,
                 scheme,
@@ -2613,6 +2770,12 @@ def api_pgy_collect_batch(payload: BatchCollectPayload) -> dict[str, Any]:
             "skipped_metrics": result.get("skipped_metrics") or [],
         }
     collected_creators = _merge_export_creators(result.get("creators") or [], result.get("export_result"))
+    update_batch_progress(
+        batch_id,
+        stage="collected",
+        message=f"已采集 {len(collected_creators)} 个候选达人，正在执行硬性条件标记",
+        total_count=len(collected_creators),
+    )
     hard_filters = screening_plan.get("collectionHardFilters") or (screening_plan.get("pgyCollectionPlan") or {}).get("hard_filters") or screening_plan.get("hardFilters") or []
     _, rejected_by_hard_filters = _filter_creators_by_hard_filters(project_id, collected_creators, hard_filters)
     hard_filter_issue_by_key = {
@@ -2706,9 +2869,25 @@ def api_pgy_collect_batch(payload: BatchCollectPayload) -> dict[str, Any]:
             "skipped_metrics": result.get("skipped_metrics") or [],
         }
     creator_ids = []
-    for creator in creators:
+    total_creators = len(creators)
+    for index, creator in enumerate(creators, start=1):
         saved = upsert_creator(project_id, creator, score=False)
         creator_ids.append(saved["creator_id"])
+        if index == 1 or index == total_creators or index % 20 == 0:
+            update_batch_progress(
+                batch_id,
+                stage="ingesting",
+                message=f"正在入库 {index}/{total_creators} 个达人",
+                total_count=len(collected_creators),
+                success_count=index,
+            )
+    update_batch_progress(
+        batch_id,
+        stage="scoring",
+        message=f"已入库 {len(creator_ids)} 个达人，正在评分",
+        total_count=len(collected_creators),
+        success_count=len(creator_ids),
+    )
     scoring = score_project(project_id, creator_ids=creator_ids, trigger_source="pgy_collect")
     batch = finish_batch(
         batch_id,

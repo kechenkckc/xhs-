@@ -24,6 +24,7 @@ import { PgyFilterPopover } from './PgyFilterPopover';
 
 export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
   const [openField, setOpenField] = useState(null);
+  const [openAnchor, setOpenAnchor] = useState(null);
 
   const selectedKeys = useMemo(() => new Set((filters || []).map(pgyFilterKey)), [filters]);
   const selectedItems = useMemo(() => filters || [], [filters]);
@@ -40,7 +41,11 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
           type="button"
           className={`pgy-find-filter-token has-chevron ${active ? 'is-active' : ''}`}
           title={active ? selectedItems.map(item => item.value).join('、') : label}
-          onClick={() => setOpenField(openField === field ? null : field)}
+          onClick={(event) => {
+            const nextField = openField === field ? null : field;
+            setOpenField(nextField);
+            setOpenAnchor(nextField ? event.currentTarget : null);
+          }}
         >
           <span>{label}{displayValue ? `：${displayValue}${selectedItems.length > 2 ? '...' : ''}` : ''}</span>
           <ChevronDown size={14} className={openField === field ? 'is-open' : ''} />
@@ -49,9 +54,13 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
           <PgyFilterPopover
             meta={meta}
             filters={filters}
+            anchorEl={openAnchor}
             onApply={(nextItems) => onChange?.(replacePgyFieldFilters(filters, meta, nextItems))}
             onClear={() => onChange?.((filters || []).filter(item => item.field !== meta.field))}
-            onClose={() => setOpenField(null)}
+            onClose={() => {
+              setOpenField(null);
+              setOpenAnchor(null);
+            }}
           />
         )}
       </span>

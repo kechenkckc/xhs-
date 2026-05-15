@@ -408,7 +408,9 @@ CREATE TABLE IF NOT EXISTS collection_batches (
   skipped_filters TEXT DEFAULT '[]',
   selected_metrics TEXT DEFAULT '[]',
   skipped_metrics TEXT DEFAULT '[]',
-  detail_collection TEXT DEFAULT ''
+  detail_collection TEXT DEFAULT '',
+  progress_stage TEXT DEFAULT '',
+  progress_message TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS scheme_count_memory (
@@ -633,6 +635,8 @@ def init_db() -> None:
             "selected_metrics": "TEXT DEFAULT '[]'",
             "skipped_metrics": "TEXT DEFAULT '[]'",
             "detail_collection": "TEXT DEFAULT ''",
+            "progress_stage": "TEXT DEFAULT ''",
+            "progress_message": "TEXT DEFAULT ''",
         }.items():
             _ensure_column(conn, "collection_batches", column, definition)
         for column, definition in {
@@ -3310,6 +3314,43 @@ def create_batch(project_id: str, source_url: str, status: str = "running") -> s
     return batch_id
 
 
+def update_batch_progress(
+    batch_id: str,
+    *,
+    stage: str = "",
+    message: str = "",
+    total_count: int | None = None,
+    success_count: int | None = None,
+    failed_count: int | None = None,
+) -> dict[str, Any]:
+    assignments = []
+    params: list[Any] = []
+    if stage:
+        assignments.append("progress_stage=?")
+        params.append(stage)
+    if message:
+        assignments.append("progress_message=?")
+        params.append(message)
+    if total_count is not None:
+        assignments.append("total_count=?")
+        params.append(total_count)
+    if success_count is not None:
+        assignments.append("success_count=?")
+        params.append(success_count)
+    if failed_count is not None:
+        assignments.append("failed_count=?")
+        params.append(failed_count)
+    if not assignments:
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM collection_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        return _batch_dict(row)
+    params.append(batch_id)
+    with connect() as conn:
+        conn.execute(f"UPDATE collection_batches SET {', '.join(assignments)} WHERE batch_id=?", params)
+        row = conn.execute("SELECT * FROM collection_batches WHERE batch_id=?", (batch_id,)).fetchone()
+    return _batch_dict(row)
+
+
 def _json_text(value: Any, default: Any) -> str:
     payload = default if value is None else value
     return json.dumps(payload, ensure_ascii=False)
@@ -3472,7 +3513,7 @@ def finish_batch(
             """
             UPDATE collection_batches SET status=?, finished_at=?, total_count=?, success_count=?,
             failed_count=?, error_message=?, collection_plan=?, applied_filters=?, skipped_filters=?,
-            selected_metrics=?, skipped_metrics=?, detail_collection=? WHERE batch_id=?
+            selected_metrics=?, skipped_metrics=?, detail_collection=?, progress_stage=?, progress_message=? WHERE batch_id=?
             """,
             (
                 status,
@@ -3487,6 +3528,8 @@ def finish_batch(
                 _json_text(selected_metrics, []),
                 _json_text(skipped_metrics, []),
                 detail_collection,
+                status,
+                "采集完成" if status == "success" else error,
                 batch_id,
             ),
         )

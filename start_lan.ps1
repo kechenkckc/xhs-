@@ -5,6 +5,10 @@ Set-Location -LiteralPath $PSScriptRoot
 $port = 8797
 $chromeDebugPort = 9222
 $frontend = Join-Path $PSScriptRoot "ad-workbench"
+$python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) {
+  $python = "python"
+}
 
 function Get-PortListeners {
   param([int]$Port)
@@ -211,4 +215,4 @@ Start-Job -ScriptBlock {
   }
 } -ArgumentList "http://127.0.0.1:$port/workbench" | Out-Null
 
-python -m uvicorn rpa_mcp_sync.web:app --host 0.0.0.0 --port $port
+& $python -m uvicorn rpa_mcp_sync.web:app --host 0.0.0.0 --port $port

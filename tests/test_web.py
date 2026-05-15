@@ -1295,6 +1295,155 @@ def test_save_project_syncs_editable_hard_filters_to_scoring_criteria():
         conn.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
 
 
+def test_save_project_preserves_brief_generated_pgy_filters():
+    project_id = "pytest_saved_pgy_filters"
+    plan = {
+        "briefType": "complex",
+        "collectionHardFilters": [
+            {"field": "博主类目", "condition": "包含", "value": "教育", "required": True, "pgyField": "博主类目"},
+        ],
+        "scoringHardFilters": [
+            {"field": "平台报价", "condition": "<=", "value": "20000", "required": True, "feishuField": "报价"},
+        ],
+        "pgyCollectionPlan": {
+            "filters": [
+                {"field": "博主类目", "value": "教育", "reason": "Brief 命中教育场景"},
+                {"field": "粉丝年龄", "value": "35～44 占比高", "reason": "Brief 要求家长粉丝"},
+                {"field": "合作报价", "value": "图文笔记：0.1万～2万", "sub_field": "图文笔记", "max": 20000},
+            ],
+            "display_metrics": ["全部非直播指标"],
+        },
+    }
+
+    response = client.post(
+        f"/api/projects/{project_id}",
+        json={"project_name": project_id, "brief": "教育亲子达人，报价不超过2万", "screening_plan": plan},
+    )
+
+    assert response.status_code == 200
+    saved_plan = json.loads(response.json()["project"]["screening_plan"])
+    saved_filters = saved_plan["pgyCollectionPlan"]["filters"]
+    assert [item["field"] for item in saved_filters] == ["博主类目", "粉丝年龄", "合作报价"]
+    assert saved_plan["pgyCollectionPlan"]["hard_filters"][0]["pgyField"] == "博主类目"
+    assert saved_plan["scoringCriteria"]["hard_rules"] == saved_plan["scoringHardFilters"]
+
+    with connect() as conn:
+        conn.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
+
+
+def test_collect_batch_uses_saved_project_screening_plan(monkeypatch):
+    project_id = "pytest_collect_saved_plan"
+    plan = {
+        "pgyCollectionPlan": {
+            "filters": [
+                {"field": "博主类目", "value": "教育", "reason": "保存的采集条件"},
+                {"field": "粉丝年龄", "value": "35～44 占比高", "reason": "保存的采集条件"},
+            ],
+            "display_metrics": ["全部非直播指标"],
+        }
+    }
+    client.post(
+        f"/api/projects/{project_id}",
+        json={"project_name": project_id, "brief": "教育亲子达人", "screening_plan": plan},
+    )
+
+    captured = {}
+
+    def fake_collect_visible_list(**kwargs):
+        captured["screening_plan"] = kwargs["screening_plan"]
+        filters = kwargs["screening_plan"]["pgyCollectionPlan"]["filters"]
+        return {
+            "ok": True,
+            "creators": [
+                {
+                    "creator_id": "saved-plan-creator",
+                    "source": "pgy",
+                    "nickname": "保存计划采集测试达人",
+                    "pgy_url": "https://pgy.xiaohongshu.com/creator/saved-plan",
+                    "quote_price": 12000,
+                }
+            ],
+            "collection_plan": kwargs["screening_plan"]["pgyCollectionPlan"],
+            "applied_filters": [{"field": item["field"], "value": item["value"], "message": "已应用"} for item in filters],
+            "skipped_filters": [],
+            "selected_metrics": [],
+            "skipped_metrics": [],
+            "export_result": {"status": "skipped"},
+        }
+
+    monkeypatch.setattr("rpa_mcp_sync.web.collect_visible_list", fake_collect_visible_list)
+    monkeypatch.setattr("rpa_mcp_sync.web.score_project", lambda project_id, **kwargs: {"scored": 0})
+
+    response = client.post("/api/pgy/collect/batch", json={"project_id": project_id, "preflight": False})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    filters = captured["screening_plan"]["pgyCollectionPlan"]["filters"]
+    assert [item["field"] for item in filters] == ["博主类目", "粉丝年龄"]
+    assert payload["batch"]["applied_filters"][1]["value"] == "35～44 占比高"
+
+    with connect() as conn:
+        conn.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
+
+
+def test_collect_batch_defaults_to_1000_limit(monkeypatch):
+    project_id = "pytest_collect_default_limit"
+    plan = {"pgyCollectionPlan": {"filters": [{"field": "博主类目", "value": "教育"}]}}
+    client.post(f"/api/projects/{project_id}", json={"project_name": project_id, "screening_plan": plan})
+    captured = {}
+
+    def fake_collect_visible_list(**kwargs):
+        captured["limit"] = kwargs["limit"]
+        return {
+            "ok": True,
+            "creators": [
+                {
+                    "creator_id": "default-limit-creator",
+                    "source": "pgy",
+                    "nickname": "默认上限测试达人",
+                    "pgy_url": "https://pgy.xiaohongshu.com/creator/default-limit",
+                }
+            ],
+            "collection_plan": kwargs["screening_plan"]["pgyCollectionPlan"],
+            "applied_filters": [],
+            "skipped_filters": [],
+            "selected_metrics": [],
+            "skipped_metrics": [],
+            "export_result": {"status": "skipped"},
+        }
+
+    monkeypatch.setattr("rpa_mcp_sync.web.collect_visible_list", fake_collect_visible_list)
+    monkeypatch.setattr("rpa_mcp_sync.web.score_project", lambda project_id, **kwargs: {"scored": 0})
+
+    response = client.post("/api/pgy/collect/batch", json={"project_id": project_id, "preflight": False})
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert captured["limit"] == 1000
+
+    with connect() as conn:
+        conn.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
+
+
+def test_collect_batch_rejects_concurrent_project_run():
+    from rpa_mcp_sync.web import _collect_lock
+
+    project_id = "pytest_collect_lock"
+    lock = _collect_lock(project_id)
+    assert lock.acquire(blocking=False)
+    try:
+        response = client.post("/api/pgy/collect/batch", json={"project_id": project_id})
+    finally:
+        lock.release()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error"] == "collection_already_running"
+    assert "已有采集任务" in payload["message"]
+
+
 def test_collection_plan_uses_first_scheme_when_default_filters_missing():
     plan = build_collection_plan(
         "教育达人",
@@ -1420,3 +1569,36 @@ def test_pgy_invite_api_marks_creators_invited():
     assert pool.status_code == 200
     assert pool.json()["groups"]["待建联达人"][0]["review_status"] == "已邀约"
     client.delete(f"/api/projects/{project_id}")
+
+
+def test_xhs_note_parse_stub_accepts_note_link():
+    response = client.post(
+        "/api/xhs/notes/parse",
+        json={
+            "url": "https://www.xiaohongshu.com/explore/abc123",
+            "note": {
+                "title": "每天8小时睡眠，你的枕头挑对了吗",
+                "cover_url": "https://example.com/cover.jpg",
+                "cover_text": "睡眠枕头测评",
+                "published_at": "2026-05-11",
+                "comments": ["这个枕头真的舒服", {"content": "适合租房卧室"}],
+                "metrics": {"read_count": 8402, "like_count": 580},
+            },
+            "creator": {"id": "creator-001", "name": "奥特迪迪"},
+            "project": {"id": "project-001", "name": "家居家装"},
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["status"] == "stub"
+    assert payload["note_id"] == "abc123"
+    assert payload["note"]["title"] == "每天8小时睡眠，你的枕头挑对了吗"
+    assert payload["note"]["cover_text"] == "睡眠枕头测评"
+    assert payload["note"]["comments"] == ["这个枕头真的舒服", "适合租房卧室"]
+
+
+def test_xhs_note_parse_stub_rejects_non_xhs_link():
+    response = client.post("/api/xhs/notes/parse", json={"url": "https://example.com/post/1"})
+    assert response.status_code == 400

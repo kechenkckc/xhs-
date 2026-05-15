@@ -1,4 +1,5 @@
-import React, { useMemo, useState } from 'react';
+import React, { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   LayoutDashboard, Users, BarChart3, FolderPlus, ScrollText, ExternalLink,
   Filter, CheckCircle2, XCircle, AlertTriangle, Clock, ChevronRight,
@@ -18,7 +19,11 @@ import {
 import { PGY_SINGLE_VALUE_CONTROLS } from '../../constants/pgyConstants';
 import { CONTROL_TYPE_LABELS } from '../../constants/screeningConstants';
 
-export function PgyFilterPopover({ meta, filters = [], onApply, onClear, onClose }) {
+const POPOVER_MARGIN = 12;
+
+export function PgyFilterPopover({ meta, filters = [], anchorEl, onApply, onClear, onClose }) {
+  const popoverRef = useRef(null);
+  const [popoverStyle, setPopoverStyle] = useState(null);
   const selectedItems = useMemo(() => getPgySelectedItems(filters, meta.field), [filters, meta.field]);
   const initialSubField = selectedItems[0]?.sub_field || meta.sub_fields?.[0] || '';
   const [subField, setSubField] = useState(initialSubField);
@@ -127,8 +132,44 @@ export function PgyFilterPopover({ meta, filters = [], onApply, onClear, onClose
     applyItems(nextItems);
   };
 
-  return (
-    <div className="pgy-find-filter-popover">
+  useLayoutEffect(() => {
+    if (!anchorEl) return undefined;
+
+    const updatePosition = () => {
+      const anchorRect = anchorEl.getBoundingClientRect();
+      const popoverRect = popoverRef.current?.getBoundingClientRect();
+      const popoverWidth = popoverRect?.width || Math.min(380, window.innerWidth * 0.78);
+      const popoverHeight = popoverRect?.height || Math.min(520, window.innerHeight - 150);
+      const maxLeft = Math.max(POPOVER_MARGIN, window.innerWidth - popoverWidth - POPOVER_MARGIN);
+      const preferredLeft = Math.min(anchorRect.left, maxLeft);
+      const nextLeft = Math.max(POPOVER_MARGIN, preferredLeft);
+      const roomBelow = window.innerHeight - anchorRect.bottom - POPOVER_MARGIN;
+      const roomAbove = anchorRect.top - POPOVER_MARGIN;
+      const openAbove = roomBelow < Math.min(popoverHeight, 260) && roomAbove > roomBelow;
+      const nextTop = openAbove
+        ? Math.max(POPOVER_MARGIN, anchorRect.top - popoverHeight - 8)
+        : Math.min(anchorRect.bottom + 8, window.innerHeight - POPOVER_MARGIN);
+
+      setPopoverStyle({
+        left: `${nextLeft}px`,
+        top: `${nextTop}px`,
+        maxHeight: `${Math.max(220, openAbove ? roomAbove - 8 : roomBelow - 8)}px`,
+      });
+    };
+
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [anchorEl, meta.field, draftItems.length, hasOptionGroups, activeGroup, subField]);
+
+  if (!anchorEl) return null;
+
+  return createPortal(
+    <div ref={popoverRef} className="pgy-find-filter-popover" style={popoverStyle || undefined}>
       <div className="pgy-find-filter-popover-head">
         <strong>{meta.field}</strong>
         <span>{CONTROL_TYPE_LABELS[meta.control_type] || meta.control_type}</span>
@@ -239,6 +280,7 @@ export function PgyFilterPopover({ meta, filters = [], onApply, onClear, onClose
         <button type="button" onClick={onClose}>取消</button>
         <button type="button" className="is-primary" disabled={!canApply} onClick={() => applyItems()}>添加条件</button>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

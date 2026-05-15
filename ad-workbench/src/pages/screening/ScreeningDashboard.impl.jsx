@@ -7,7 +7,8 @@ import TabBar from '../../components/TabBar';
 import PageHeader from '../../components/PageHeader';
 import { api } from './api/screeningApi';
 import { initialProjects, initialScreeningStatus } from './constants/projectConstants';
-import { mapBackendProject } from './utils/projectMappers';
+import { mapBackendProject, parseStoredScreeningPlan } from './utils/projectMappers';
+import { mapBackendCreator } from './utils/creatorMappers';
 import { ProjectsPreview } from './components/project/ProjectsPreview';
 import { CreateProjectModal } from './components/project/CreateProjectModal';
 import { OverviewTab } from './components/overview/OverviewTab';
@@ -43,7 +44,7 @@ function patchProject(project = {}, patch = {}) {
     ...(patch.period_start ? { periodStart: patch.period_start } : {}),
     ...(patch.period_end ? { periodEnd: patch.period_end } : {}),
     ...(patch.brief ? { description: patch.brief, brief: { ...(project.brief || {}), description: patch.brief } } : {}),
-    ...(patch.screening_plan ? { screeningPlan: patch.screening_plan } : {}),
+    ...(patch.screening_plan ? { screeningPlan: parseStoredScreeningPlan(patch.screening_plan, project.screeningPlan || {}) } : {}),
   };
 }
 
@@ -57,6 +58,9 @@ export default function ScreeningDashboard() {
   const [screeningStatus, setScreeningStatus] = useState(initialScreeningStatus);
   const [projectList, setProjectList] = useState([]);
   const [projectListLoadFailed, setProjectListLoadFailed] = useState(false);
+  const [feishuConfig, setFeishuConfig] = useState(null);
+  const [feishuTables, setFeishuTables] = useState([]);
+  const [feishuFields, setFeishuFields] = useState([]);
 
   useEffect(() => {
     setActiveTab(tab || 'projects');
@@ -108,6 +112,41 @@ export default function ScreeningDashboard() {
 
   const projectId = currentProject?.id || currentProject?.project_id;
 
+  useEffect(() => {
+    if (!projectId) {
+      setFeishuConfig(null);
+      setFeishuTables([]);
+      setFeishuFields([]);
+      return;
+    }
+    let cancelled = false;
+    setFeishuTables([]);
+    setFeishuFields([]);
+    api(`/api/projects/feishu/connection?project_id=${encodeURIComponent(projectId)}`)
+      .then((payload) => {
+        if (cancelled) return;
+        const config = payload.config || null;
+        setFeishuConfig(config);
+        if (config?.feishu_url) {
+          updateCurrentProject({
+            feishuBinding: {
+              ...(currentProject?.feishuBinding || {}),
+              linked: true,
+              tableUrl: config.feishu_url,
+              baseToken: config.target?.token || '',
+              tableId: config.target?.table_id || '',
+            },
+          });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setFeishuConfig(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
   const updateCurrentProject = (patch) => {
     if (!currentProject) return;
     const currentId = getProjectKey(currentProject);
@@ -117,12 +156,41 @@ export default function ScreeningDashboard() {
     setCurrentProject((prev) => (prev ? patchProject(prev, patch) : prev));
   };
 
+  const refreshProjectData = async () => {
+    if (!projectId) return { ok: false, error: '未选择项目' };
+    const [projectPayload, creatorsPayload] = await Promise.all([
+      safeApi(`/api/projects/${projectId}`),
+      safeApi(`/api/projects/${projectId}/creators`),
+    ]);
+    const mappedCreators = (creatorsPayload.creators || []).map(mapBackendCreator);
+    if (projectPayload?.project) {
+      const mappedProject = mapBackendProject(projectPayload.project, mappedCreators, feishuConfig);
+      setProjectList((prev) => {
+        const exists = prev.some((item) => item.project_id === projectPayload.project.project_id);
+        return exists ? prev.map((item) => (item.project_id === projectPayload.project.project_id ? projectPayload.project : item)) : [...prev, projectPayload.project];
+      });
+      setCurrentProject(mappedProject);
+      setProjects((prev) => {
+        const exists = prev.some((item) => getProjectKey(item) === getProjectKey(mappedProject));
+        return exists ? prev.map((item) => (getProjectKey(item) === getProjectKey(mappedProject) ? mappedProject : item)) : prev;
+      });
+    } else if (mappedCreators.length) {
+      updateCurrentProject({ creators: mappedCreators });
+    }
+    return { ok: true, project: projectPayload?.project, creators: creatorsPayload.creators || [] };
+  };
+
   const safeApi = async (url, options = {}) => {
     try {
       return await api(url, options);
     } catch (error) {
       console.warn('[ScreeningDashboard]', error.message || error);
-      return { ok: false, error: error.message || '请求失败' };
+      return {
+        ok: false,
+        error: error.message || '请求失败',
+        message: error.message || '请求失败',
+        ...(error.detail && typeof error.detail === 'object' ? error.detail : {}),
+      };
     }
   };
 
@@ -157,9 +225,32 @@ export default function ScreeningDashboard() {
     return handleSaveProject(payload);
   };
 
-  const handleCollect = async (plan) => {
+  const getLatestCollectBatch = async () => {
+    if (!projectId) return {};
+    const payload = await safeApi(`/api/projects/${projectId}/batches`);
+    return (payload.batches || [])[0] || {};
+  };
+
+  const handleCollect = async (plan, options = {}) => {
     if (plan) updateCurrentProject({ screening_plan: plan });
-    return safeApi('/api/pgy/collect/list', { method: 'POST' });
+    if (!projectId) return { ok: false, error: '未选择项目' };
+    const limit = Math.max(1, Math.min(1000, Number(options.limit || 1000)));
+    const result = await safeApi('/api/pgy/collect/batch', {
+      method: 'POST',
+      body: JSON.stringify({
+        project_id: projectId,
+        screening_plan: plan || currentProject?.screeningPlan || {},
+        apply_filters: true,
+        include_details: false,
+        collect_profile_urls: true,
+        export_metrics: true,
+        limit,
+      }),
+    });
+    if (result.ok) {
+      await refreshProjectData();
+    }
+    return result;
   };
 
   const handleCollectDetails = async ({ creatorIds = [], segment = '', segmentLabel = '' } = {}) => {
@@ -217,20 +308,28 @@ export default function ScreeningDashboard() {
   };
 
   const handleRefresh = async () => {
-    const payload = projectId ? await safeApi(`/api/projects/${projectId}`) : null;
-    if (payload?.project) {
-      setProjectList((prev) => {
-        const exists = prev.some((item) => item.project_id === payload.project.project_id);
-        return exists ? prev.map((item) => (item.project_id === payload.project.project_id ? payload.project : item)) : [...prev, payload.project];
-      });
-    }
-    return payload;
+    return refreshProjectData();
   };
 
-  const handleSaveFeishu = async (form = {}) => safeApi('/api/projects/feishu/connection', {
-    method: 'POST',
-    body: JSON.stringify({ ...form, project_id: projectId }),
-  });
+  const handleSaveFeishu = async (form = {}) => {
+    const result = await safeApi('/api/projects/feishu/connection', {
+      method: 'POST',
+      body: JSON.stringify({ ...form, project_id: projectId }),
+    });
+    if (result.config) {
+      setFeishuConfig(result.config);
+      updateCurrentProject({
+        feishuBinding: {
+          ...(currentProject?.feishuBinding || {}),
+          linked: Boolean(result.config.feishu_url),
+          tableUrl: result.config.feishu_url || '',
+          baseToken: result.config.target?.token || '',
+          tableId: result.config.target?.table_id || '',
+        },
+      });
+    }
+    return result;
+  };
 
   const handleTestFeishu = async (form = {}) => safeApi('/api/projects/feishu/test', {
     method: 'POST',
@@ -238,9 +337,17 @@ export default function ScreeningDashboard() {
     allowBusinessError: true,
   });
 
-  const handleLoadTables = async () => safeApi(`/api/projects/feishu/tables?project_id=${projectId || ''}`);
+  const handleLoadTables = async () => {
+    const result = await safeApi(`/api/projects/feishu/tables?project_id=${encodeURIComponent(projectId || '')}`);
+    if (result.tables) setFeishuTables(result.tables);
+    return result;
+  };
 
-  const handleLoadFields = async (tableId = '') => safeApi(`/api/projects/feishu/fields?project_id=${projectId || ''}${tableId ? `&table_id=${encodeURIComponent(tableId)}` : ''}`);
+  const handleLoadFields = async (tableId = '') => {
+    const result = await safeApi(`/api/projects/feishu/fields?project_id=${encodeURIComponent(projectId || '')}${tableId ? `&table_id=${encodeURIComponent(tableId)}` : ''}`);
+    if (result.fields) setFeishuFields(result.fields);
+    return result;
+  };
 
   const handleWriteBack = async (tableId = '') => safeApi('/api/projects/feishu/writeback', {
     method: 'POST',
@@ -318,7 +425,7 @@ export default function ScreeningDashboard() {
 
     switch (activeTab) {
       case 'overview':
-        return <OverviewTab project={currentProject} onCollect={handleCollect} onSavePlan={handleSaveScreeningPlan} onTabChange={handleTabChange} />;
+        return <OverviewTab project={currentProject} onCollect={handleCollect} onLatestBatch={getLatestCollectBatch} onSavePlan={handleSaveScreeningPlan} onTabChange={handleTabChange} />;
       case 'screening-review':
         return (
           <ScreeningReviewTab
@@ -358,6 +465,9 @@ export default function ScreeningDashboard() {
             projects={mergedProjects}
             onSelectProject={setCurrentProject}
             onCreateProject={() => setShowCreateModal(true)}
+            feishuConfig={feishuConfig}
+            feishuFields={feishuFields}
+            feishuTables={feishuTables}
             onSaveProject={handleSaveProject}
             onSaveScreeningPlan={handleSaveScreeningPlan}
             onSaveFeishu={handleSaveFeishu}
@@ -400,7 +510,7 @@ export default function ScreeningDashboard() {
       case 'legacy':
         return <AdvancedConfigTab />;
       default:
-        return <OverviewTab project={currentProject} onCollect={handleCollect} onSavePlan={handleSaveScreeningPlan} onTabChange={handleTabChange} />;
+        return <OverviewTab project={currentProject} onCollect={handleCollect} onLatestBatch={getLatestCollectBatch} onSavePlan={handleSaveScreeningPlan} onTabChange={handleTabChange} />;
     }
   };
 

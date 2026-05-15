@@ -3485,7 +3485,7 @@ def _extract_visible_creators(
     seen: set[str] = set()
     page_number = 1
     idle_rounds = 0
-    max_rounds = max(4, min(30, limit + 3))
+    max_rounds = max(4, min(120, (limit // 20) + 8))
     for _ in range(max_rounds):
         before_count = len(creators)
         _extract_current_creator_page(
@@ -3525,7 +3525,6 @@ def _extract_visible_creators(
         idle_rounds = idle_rounds + 1 if added == 0 else 0
         if idle_rounds >= 2 or added == 0:
             break
-        break
     return creators
 
 
@@ -4486,16 +4485,29 @@ def browser_status() -> dict[str, Any]:
     return {
         "connected": False,
         "message": "未检测到 Chrome 调试端口，请先启动调试浏览器并登录蒲公英",
-        "start_command": 'Start-Process "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" -ArgumentList "--remote-debugging-port=9222","--user-data-dir=D:\\第三事业部\\runtime\\chrome-pgy-profile"',
+        "start_command": 'Start-Process "<chrome.exe>" -ArgumentList "--remote-debugging-port=9222","--user-data-dir=<project>\\runtime\\chrome-pgy-profile"',
     }
+
+
+def _find_chrome_exe() -> Path | None:
+    candidates = [
+        Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+        Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+    ]
+    local_app_data = Path.home() / "AppData/Local/Google/Chrome/Application/chrome.exe"
+    candidates.append(local_app_data)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def start_browser() -> dict[str, Any]:
     status = browser_status()
     if status["connected"]:
         return status
-    chrome = Path("C:/Program Files/Google/Chrome/Application/chrome.exe")
-    if not chrome.exists():
+    chrome = _find_chrome_exe()
+    if not chrome:
         return {"connected": False, "message": "未找到 Chrome，请手动用调试端口启动浏览器"}
     profile = ROOT / "runtime" / "chrome-pgy-profile"
     profile.mkdir(parents=True, exist_ok=True)
@@ -4517,7 +4529,7 @@ def collect_visible_list(
     brief: str = "",
     screening_plan: dict[str, Any] | None = None,
     apply_filters: bool = True,
-    limit: int = 20,
+    limit: int = 1000,
     include_details: bool = True,
     collect_profile_urls: bool = True,
     export_metrics: bool = True,
@@ -4592,7 +4604,7 @@ def collect_visible_list(
                     **plan_result,
                     **recommendation_count,
                 }
-            collect_limit = max(1, min(limit, 100))
+            collect_limit = max(1, min(limit, 1000))
             creators = _extract_visible_creators(
                 page,
                 collect_limit,

@@ -8,6 +8,14 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>）)]+")
+FEISHU_PERMISSION_HOSTS = {"open.feishu.cn", "open.larksuite.com"}
+
+
+def _is_feishu_permission_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and parsed.netloc in FEISHU_PERMISSION_HOSTS
+
 
 class FeishuError(RuntimeError):
     def __init__(self, code: str, message: str, *, details: dict[str, Any] | None = None):
@@ -20,13 +28,29 @@ def _collect_permission_urls(value: Any) -> list[str]:
     urls: list[str] = []
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in {"console_url", "permission_url"} and isinstance(item, str) and item:
+            if key in {"console_url", "permission_url", "auth_url", "open_url"} and isinstance(item, str) and item:
                 urls.append(item)
             urls.extend(_collect_permission_urls(item))
     elif isinstance(value, list):
         for item in value:
             urls.extend(_collect_permission_urls(item))
-    return list(dict.fromkeys(urls))
+    elif isinstance(value, str):
+        urls.extend(URL_PATTERN.findall(value))
+    return [url for url in dict.fromkeys(urls) if _is_feishu_permission_url(url)]
+
+
+def _collect_permission_violations(value: Any) -> list[Any]:
+    violations: list[Any] = []
+    if isinstance(value, dict):
+        nested = value.get("permission_violations")
+        if isinstance(nested, list):
+            violations.extend(nested)
+        for item in value.values():
+            violations.extend(_collect_permission_violations(item))
+    elif isinstance(value, list):
+        for item in value:
+            violations.extend(_collect_permission_violations(item))
+    return violations
 
 
 def permission_details(payload: dict[str, Any], *, required_scope: str | None = None) -> dict[str, Any]:
@@ -35,6 +59,9 @@ def permission_details(payload: dict[str, Any], *, required_scope: str | None = 
     if urls:
         details["permission_urls"] = urls
         details["console_url"] = urls[0]
+    violations = _collect_permission_violations(payload)
+    if violations:
+        details["permission_violations"] = violations
     if required_scope:
         details["required_scope"] = required_scope
     return details
@@ -313,7 +340,7 @@ class FeishuClient:
                     message,
                     details=self._sheet_write_permission_details(payload),
                 )
-            raise FeishuError("feishu_api_error", message, details=payload)
+            raise FeishuError("feishu_api_error", message, details=permission_details(payload))
         return payload.get("data") or {}
 
     def ensure_sheet_field(

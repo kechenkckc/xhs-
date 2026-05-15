@@ -6,6 +6,11 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
+$python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) {
+  $python = "python"
+}
+
 function Get-PortListeners {
   param([int]$Port)
 
@@ -23,7 +28,7 @@ $deadline = (Get-Date).AddSeconds(10)
 do {
   $connections = Get-PortListeners -Port $Port
   if (-not $connections) {
-    python -m uvicorn rpa_mcp_sync.web:app --host $BindHost --port $Port
+    & $python -m uvicorn rpa_mcp_sync.web:app --host $BindHost --port $Port
     exit $LASTEXITCODE
   }
   Start-Sleep -Milliseconds 250

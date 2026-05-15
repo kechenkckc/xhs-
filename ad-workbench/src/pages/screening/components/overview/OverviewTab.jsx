@@ -33,12 +33,16 @@ import { getSchemeAdditionalFilters, getSchemeRequiredFilters, normalizeWorkbenc
 import { SelectedChips } from '../filters/SelectedChips';
 import { PgyFindBloggerFilterPanel } from '../filters/PgyFindBloggerFilterPanel';
 
-export function OverviewTab({ project, onCollect, onSavePlan, onTabChange }) {
+export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onTabChange }) {
   const creators = useMemo(() => getProjectCreators(project), [project]);
   const stats = getProjectStats(project);
   const [planDraft, setPlanDraft] = useState(() => normalizeWorkbenchPlan(project.screeningPlan || {}));
   const [planStatus, setPlanStatus] = useState('');
   const [planExpanded, setPlanExpanded] = useState(false);
+  const [collectLimit, setCollectLimit] = useState(1000);
+  const [collectStatus, setCollectStatus] = useState('');
+  const [collecting, setCollecting] = useState(false);
+  const [collectProgress, setCollectProgress] = useState(null);
 
   useEffect(() => {
     setPlanDraft(normalizeWorkbenchPlan(project.screeningPlan || {}));
@@ -173,6 +177,50 @@ export function OverviewTab({ project, onCollect, onSavePlan, onTabChange }) {
     }
   };
 
+  const runCollect = async () => {
+    if (collecting) return;
+    setCollecting(true);
+    setCollectStatus(`正在采集，目标上限 ${collectLimit} 个...`);
+    setCollectProgress({ status: 'running', total_count: 0, success_count: 0, progress_stage: 'starting', progress_message: '正在启动采集任务' });
+    let stopped = false;
+    const pollProgress = async () => {
+      if (stopped || !onLatestBatch) return;
+      try {
+        const batch = await onLatestBatch();
+        if (batch?.batch_id) {
+          setCollectProgress(batch);
+          const stageText = batch.progress_message || batch.status || '采集中';
+          setCollectStatus(`${stageText} · 已采集 ${batch.total_count || 0} · 已入库 ${batch.success_count || 0}`);
+        }
+      } catch {
+        // Ignore transient polling failures; the final collect response still settles the UI.
+      }
+    };
+    const progressTimer = window.setInterval(pollProgress, 2000);
+    pollProgress();
+    try {
+      const result = await onCollect(syncScreeningCriteria(planDraft), { limit: collectLimit });
+      stopped = true;
+      window.clearInterval(progressTimer);
+      if (result?.ok) {
+        const count = result.batch?.success_count ?? result.creators?.length ?? 0;
+        setCollectProgress(result.batch || null);
+        setCollectStatus(`采集完成，已入库 ${count} 个达人`);
+      } else {
+        setCollectProgress(result?.batch || null);
+        setCollectStatus(result?.message || result?.error || '采集未完成');
+      }
+    } catch (error) {
+      stopped = true;
+      window.clearInterval(progressTimer);
+      setCollectStatus(error.message || '采集失败');
+    } finally {
+      stopped = true;
+      window.clearInterval(progressTimer);
+      setCollecting(false);
+    }
+  };
+
   return (
     <div>
       {/* 项目概览 */}
@@ -210,11 +258,49 @@ export function OverviewTab({ project, onCollect, onSavePlan, onTabChange }) {
           <div className="collector-inline-header">
             <h4><Bot size={16} /> 蒲公英采集执行</h4>
             <div className="collector-action-row">
-              <button className="btn btn-primary collector-action collector-action-primary" onClick={() => onCollect(syncScreeningCriteria(planDraft))}>
-                <Download size={16} />一键采集
+              <label className="collector-limit-control">
+                <span>采集上限</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="1000"
+                  step="50"
+                  value={collectLimit}
+                  onChange={(event) => {
+                    const nextValue = Number(event.target.value || 1);
+                    setCollectLimit(Math.max(1, Math.min(1000, nextValue)));
+                  }}
+                />
+              </label>
+              <button className="btn btn-primary collector-action collector-action-primary" onClick={runCollect} disabled={collecting}>
+                <Download size={16} />{collecting ? '采集中...' : '一键采集'}
               </button>
             </div>
           </div>
+          {collectStatus && (
+            <div className={`collector-status-line ${collectStatus.includes('失败') || collectStatus.includes('未完成') || collectStatus.includes('运行') ? 'is-error' : ''}`}>
+              {collectStatus}
+            </div>
+          )}
+          {collectProgress && (
+            <div className="collector-progress-panel">
+              <div className="collector-progress-row">
+                <span>采集</span>
+                <strong>{collectProgress.total_count || 0}</strong>
+                <small>候选达人</small>
+              </div>
+              <div className="collector-progress-row">
+                <span>入库</span>
+                <strong>{collectProgress.success_count || 0}</strong>
+                <small>已写入达人池</small>
+              </div>
+              <div className="collector-progress-row">
+                <span>阶段</span>
+                <strong>{collectProgress.progress_stage || collectProgress.status || '-'}</strong>
+                <small>{collectProgress.progress_message || collectProgress.error_message || '等待更新'}</small>
+              </div>
+            </div>
+          )}
           <div className="collector-result-strip">
             {collectionTaskResults.map(([label, value, desc]) => (
               <div key={label} className="collector-result-item">

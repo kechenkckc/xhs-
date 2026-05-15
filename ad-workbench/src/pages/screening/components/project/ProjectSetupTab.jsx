@@ -29,6 +29,79 @@ import { hardFilterOptionsFor, normalizeWorkbenchPlan, syncScreeningCriteria } f
 import { PgyFindBloggerFilterPanel } from '../filters/PgyFindBloggerFilterPanel';
 import { HardFilterCheckPanel } from '../filters/HardFilterCheckPanel';
 
+const URL_PATTERN = /https?:\/\/[^\s"'<>）)]+/g;
+const FEISHU_PERMISSION_HOSTS = new Set(['open.feishu.cn', 'open.larksuite.com']);
+
+function uniqueItems(items = []) {
+  return Array.from(new Set(items.filter(Boolean)));
+}
+
+function collectNested(value, predicate) {
+  const result = [];
+  const walk = (item) => {
+    if (!item) return;
+    if (predicate(item)) result.push(item);
+    if (typeof item === 'string') return;
+    if (Array.isArray(item)) {
+      item.forEach(walk);
+      return;
+    }
+    if (typeof item === 'object') Object.values(item).forEach(walk);
+  };
+  walk(value);
+  return result;
+}
+
+function collectUrls(value) {
+  const urls = [];
+  const walk = (item, key = '') => {
+    if (!item) return;
+    if (typeof item === 'string') {
+      if (['console_url', 'permission_url', 'auth_url', 'open_url'].includes(key) || item.includes('open.feishu.cn')) {
+        urls.push(item);
+      }
+      urls.push(...(item.match(URL_PATTERN) || []));
+      return;
+    }
+    if (Array.isArray(item)) {
+      item.forEach(walk);
+      return;
+    }
+    if (typeof item === 'object') Object.entries(item).forEach(([nextKey, nextValue]) => walk(nextValue, nextKey));
+  };
+  walk(value);
+  return uniqueItems(urls).filter((url) => {
+    try {
+      return FEISHU_PERMISSION_HOSTS.has(new URL(url).hostname);
+    } catch {
+      return false;
+    }
+  });
+}
+
+function normalizeFeishuTestResult(result) {
+  if (!result) return null;
+  const detail = result.detail && typeof result.detail === 'object' ? result.detail : result;
+  const error = detail.error && typeof detail.error === 'object' ? detail.error : {};
+  const failedStep = detail.failed_step || error.failed_step || '';
+  const failedStepMessage = (detail.steps || []).find(step => step.key === failedStep)?.message;
+  const permissionViolations = [
+    ...(detail.permission_violations || []),
+    ...(error.permission_violations || []),
+    ...collectNested(detail, item => item && typeof item === 'object' && (item.scope || item.permission)),
+  ];
+  return {
+    ...detail,
+    error,
+    title: detail.title || (detail.ok ? '飞书连接测试通过' : '飞书连接测试未通过'),
+    failedReason: detail.failed_reason || detail.message || failedStepMessage || error.message || error.msg || '飞书返回了失败结果，请按下方步骤定位。',
+    permissionUrls: collectUrls(detail),
+    requiredScope: detail.required_scope || error.required_scope,
+    permissionViolations,
+    fixActions: detail.fix_actions || error.fix_actions || [],
+  };
+}
+
 export function ProjectSetupTab({
   project,
   projects = [],
@@ -128,14 +201,16 @@ export function ProjectSetupTab({
   ];
 
   const labelStyle = { fontSize: 12, color: 'var(--text-secondary)', display: 'block', marginBottom: 4 };
+  const feishuFailure = useMemo(() => normalizeFeishuTestResult(feishuTestResult), [feishuTestResult]);
 
   const runFeishuTest = async () => {
     if (!onTestFeishu) return;
+    setFeishuTestResult(null);
     try {
       const result = await onTestFeishu(feishuForm);
       setFeishuTestResult(result);
     } catch (error) {
-      setFeishuTestResult(error.detail || { ok: false, message: error.message });
+      setFeishuTestResult(error.detail || { ok: false, message: error.message || '飞书连接测试未通过' });
     }
   };
 
@@ -160,10 +235,9 @@ export function ProjectSetupTab({
     setFeishuStatus('正在保存飞书绑定...');
     try {
       const result = await onSaveFeishu?.(feishuForm);
-      setFeishuStatus(result?.ok === false ? (result.message || result.error || '飞书绑定保存失败') : '飞书绑定已保存，请读取字段后解析 Brief');
+      setFeishuStatus(result?.ok === false ? (result.message || result.error || '飞书绑定保存失败') : '飞书绑定已保存');
       if (result?.ok !== false) {
         setFeishuSaved(true);
-        setActiveSection('standard');
       }
       return result;
     } catch (error) {
@@ -560,7 +634,7 @@ export function ProjectSetupTab({
               </div>
 
               <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' }}>
-                <button className="btn btn-primary" onClick={saveFeishuBinding}><Save size={14} style={{ marginRight: 4 }} />保存绑定并进入 Brief 解析</button>
+                <button className="btn btn-primary" onClick={saveFeishuBinding}><Save size={14} style={{ marginRight: 4 }} />保存绑定</button>
                 <button className="btn btn-secondary" onClick={runFeishuTest}><CheckCircle2 size={14} style={{ marginRight: 4 }} />测试连接</button>
                 <button className="btn btn-secondary" onClick={onLoadTables}><Database size={14} style={{ marginRight: 4 }} />读取子表</button>
                 <button className="btn btn-primary" onClick={() => onWriteBack?.(feishuForm.table_id)}><Send size={14} style={{ marginRight: 4 }} />写回飞书</button>
@@ -571,17 +645,37 @@ export function ProjectSetupTab({
                 </div>
               )}
 
-              {feishuTestResult && (
-                <div style={{ marginBottom: 20, padding: 14, border: `1px solid ${feishuTestResult.ok ? '#10B98155' : '#F59E0B55'}`, background: 'var(--bg-elevated)', borderRadius: 8 }}>
+              {feishuFailure && (
+                <div style={{ marginBottom: 20, padding: 14, border: `1px solid ${feishuFailure.ok ? '#10B98155' : '#F59E0B55'}`, background: feishuFailure.ok ? 'rgba(16, 185, 129, 0.08)' : 'rgba(245, 158, 11, 0.08)', borderRadius: 8 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', marginBottom: 12 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-primary)', fontWeight: 600 }}>
-                      {feishuTestResult.ok ? <CheckCircle2 size={16} style={{ color: '#10B981' }} /> : <AlertTriangle size={16} style={{ color: '#F59E0B' }} />}
-                      {feishuTestResult.message || (feishuTestResult.ok ? '飞书连接测试通过' : '飞书连接测试未通过')}
+                      {feishuFailure.ok ? <CheckCircle2 size={16} style={{ color: '#10B981' }} /> : <AlertTriangle size={16} style={{ color: '#F59E0B' }} />}
+                      {feishuFailure.title}
                     </div>
-                    {feishuTestResult.failed_step && <Badge variant="amber">卡在：{feishuTestResult.failed_step}</Badge>}
+                    {feishuFailure.failed_step && <Badge variant="amber">卡在：{feishuFailure.failed_step}</Badge>}
                   </div>
+                  {!feishuFailure.ok && (
+                    <div style={{ marginBottom: 12, padding: 12, border: '1px solid rgba(245, 158, 11, 0.28)', background: 'rgba(255, 255, 255, 0.62)', borderRadius: 8, display: 'grid', gap: 8 }}>
+                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                        <Info size={14} style={{ color: '#D97706', marginTop: 2, flexShrink: 0 }} />
+                        <div>
+                          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 2 }}>未通过原因</div>
+                          <div style={{ fontSize: 13, color: 'var(--text-primary)', fontWeight: 600 }}>{feishuFailure.failedReason}</div>
+                        </div>
+                      </div>
+                      {feishuFailure.permissionUrls.length > 0 && (
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                          {feishuFailure.permissionUrls.map((url, index) => (
+                            <a key={url} className="btn btn-sm btn-primary" href={url} target="_blank" rel="noreferrer">
+                              <ExternalLink size={13} /> 打开飞书权限配置{feishuFailure.permissionUrls.length > 1 ? ` ${index + 1}` : ''}
+                            </a>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <div style={{ display: 'grid', gap: 8 }}>
-                    {(feishuTestResult.steps || []).map(step => (
+                    {(feishuFailure.steps || []).map(step => (
                       <div key={step.key} style={{ display: 'grid', gridTemplateColumns: '20px 160px 1fr', gap: 8, alignItems: 'start', fontSize: 12 }}>
                         <span style={{ color: step.status === 'success' ? '#10B981' : step.status === 'failed' ? '#EF4444' : 'var(--text-muted)' }}>
                           {step.status === 'success' ? '✓' : step.status === 'failed' ? '!' : '·'}
@@ -591,28 +685,11 @@ export function ProjectSetupTab({
                       </div>
                     ))}
                   </div>
-                  {(feishuTestResult.error || feishuTestResult.write_error) && (
+                  {!feishuFailure.ok && (feishuFailure.requiredScope || feishuFailure.permissionViolations.length > 0 || feishuFailure.fixActions.length > 0 || feishuFailure.permissionUrls.length > 0) && (
                     <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border-subtle)', display: 'grid', gap: 8 }}>
-                      {(() => {
-                        const error = feishuTestResult.error || feishuTestResult.write_error || {};
-                        const urls = error.permission_urls || (error.console_url ? [error.console_url] : []);
-                        return (
-                          <>
-                            {error.required_scope && <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>需要权限：<code>{error.required_scope}</code></div>}
-                            {(error.permission_violations || []).length > 0 && <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>飞书返回缺失权限：{error.permission_violations.map(item => item.scope || item.permission || JSON.stringify(item)).join('、')}</div>}
-                            {(error.fix_actions || []).map((item, index) => <div key={index} style={{ fontSize: 12, color: 'var(--text-secondary)' }}>处理方式：{item}</div>)}
-                            {urls.length > 0 && (
-                              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                                {urls.map((url, index) => (
-                                  <a key={url} className="btn btn-sm btn-primary" href={url} target="_blank" rel="noreferrer">
-                                    <ExternalLink size={13} /> 打开飞书权限配置{urls.length > 1 ? ` ${index + 1}` : ''}
-                                  </a>
-                                ))}
-                              </div>
-                            )}
-                          </>
-                        );
-                      })()}
+                      {feishuFailure.requiredScope && <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>需要权限：<code>{feishuFailure.requiredScope}</code></div>}
+                      {feishuFailure.permissionViolations.length > 0 && <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>飞书返回缺失权限：{feishuFailure.permissionViolations.map(item => item.scope || item.permission || JSON.stringify(item)).join('、')}</div>}
+                      {feishuFailure.fixActions.map((item, index) => <div key={index} style={{ fontSize: 12, color: 'var(--text-secondary)' }}>处理方式：{item}</div>)}
                     </div>
                   )}
                 </div>

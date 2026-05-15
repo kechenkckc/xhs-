@@ -243,4 +243,32 @@ def test_permission_details_extracts_console_url():
 
     assert details["console_url"] == "https://open.feishu.cn/app/cli_test/auth"
     assert details["permission_urls"] == ["https://open.feishu.cn/app/cli_test/auth"]
+    assert details["permission_violations"] == [{"scope": "sheets:spreadsheet:write_only"}]
     assert details["required_scope"] == "sheets:spreadsheet:write_only"
+
+
+def test_permission_details_extracts_permission_url_from_message():
+    payload = {
+        "code": 99991672,
+        "msg": "Permission denied. open https://open.feishu.cn/app/cli_test/auth to enable scope.",
+    }
+
+    details = permission_details(payload)
+
+    assert details["console_url"] == "https://open.feishu.cn/app/cli_test/auth"
+
+
+def test_permission_details_ignores_non_feishu_permission_urls():
+    payload = {
+        "code": 99991672,
+        "msg": "Permission denied. open http://127.0.0.1:5173/login",
+        "error": {
+            "console_url": "/login",
+            "permission_url": "https://example.com/auth",
+        },
+    }
+
+    details = permission_details(payload)
+
+    assert "console_url" not in details
+    assert "permission_urls" not in details

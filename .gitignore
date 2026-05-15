@@ -1,9 +1,11 @@
 # Dependencies
 node_modules/
+.venv/
 
 # Build outputs
 dist/
 build/
+migration-packages/
 
 # Python/test caches
 __pycache__/
