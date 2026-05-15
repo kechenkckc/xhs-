@@ -1294,6 +1294,9 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
             "必须把蒲公英筛选方案和采集后评分标准拆开：pgyCollectionPlan 只服务找博主采集，scoringCriteria 只服务入库后评分/推荐/匹配",
             "hardFilters 是评分/入库硬性规则，不要简单等同于蒲公英页面已勾选条件",
             "蒲公英 schemes 至少输出 3 套，分别覆盖不同达人来源或人群角度；每套 required_filters 必须且只包含：博主类目、粉丝量、粉丝年龄、合作报价",
+            "博主类目可多选；例如 Brief 同时命中母婴和教育时，required_filters 中可以同时保留两条博主类目条件，也可以单独只保留其中一个方案类目",
+            "营销目标是低优先级附加条件，只能放入 additional_filters 或用户手动 filters，不能放入 required_filters；字段结构要用父子指标，如 {field:'营销目标', value:'互动表现', goal:'种草', parent_value:'种草', control_type:'marketing_goal_metric'}",
+            "地域/粉丝地域只有 Brief 明确强调地域、IP、城市优先/必须/重点覆盖时才放入筛选条件；仅出现城市案例或品牌叙事时不要自动加入地域",
             "不要在 required_filters 或自动 filters 中加入 家庭身份、职业身份、特色背景、母婴阶段、行业推荐博主、近期合作品牌、按博主粉丝推荐；这些低频项只有用户在前端手动添加时才允许进入 filters",
             "预估阅读单价、预估互动单价、阅读/互动/曝光中位数等提质条件放入 additional_filters，默认非必要；如果必备筛选下博主过多，按 additional_filters 数组顺序逐个叠加，越靠上越先启用，一旦数量达标就不再继续加下面的条件",
             "每套蒲公英方案需要 target_count_range、expand_if_too_few、narrow_if_too_many，用来根据页面推荐数量动态扩缩条件",
@@ -2285,18 +2288,18 @@ def _base_filters_for_scheme(screening_plan: dict[str, Any], scheme: dict[str, A
     if isinstance(explicit_base, list) and explicit_base:
         return _clean_scheme_filters(explicit_base, allowed_fields=PGY_BASE_FILTER_FIELDS)
     filters = [item for item in (scheme.get("filters") or []) if isinstance(item, dict)]
-    by_key = {_filter_field_sub_key(item): item for item in filters if str(item.get("field") or "") in PGY_BASE_FILTER_FIELDS}
+    base_candidates = [item for item in filters if str(item.get("field") or "") in PGY_BASE_FILTER_FIELDS]
     pgy_plan = screening_plan.get("pgyCollectionPlan") if isinstance(screening_plan.get("pgyCollectionPlan"), dict) else {}
     plan_filters = [item for item in (pgy_plan.get("filters") or []) if isinstance(item, dict)]
     for item in plan_filters:
         field = str(item.get("field") or "")
-        key = _filter_field_sub_key(item)
-        if field in PGY_BASE_FILTER_FIELDS and key not in by_key:
-            by_key[key] = item
-    category_filters = [item for key, item in by_key.items() if key[0] == "博主类目"] or [{**PGY_DEFAULT_BASE_FILTERS["category"]}]
-    follower_filters = [item for key, item in by_key.items() if key[0] == "粉丝量"] or [{**PGY_DEFAULT_BASE_FILTERS["followers"]}]
-    age_filters = [item for key, item in by_key.items() if key[0] == "粉丝年龄"] or [{**PGY_DEFAULT_BASE_FILTERS["age"]}]
-    quote_filters = [item for key, item in by_key.items() if key[0] == "合作报价"] or [{**PGY_DEFAULT_BASE_FILTERS["quote"]}]
+        if field in PGY_BASE_FILTER_FIELDS:
+            base_candidates.append(item)
+    base_candidates = _dedupe_filters(base_candidates)
+    category_filters = [item for item in base_candidates if str(item.get("field") or "") == "博主类目"] or [{**PGY_DEFAULT_BASE_FILTERS["category"]}]
+    follower_filters = [item for item in base_candidates if str(item.get("field") or "") == "粉丝量"] or [{**PGY_DEFAULT_BASE_FILTERS["followers"]}]
+    age_filters = [item for item in base_candidates if str(item.get("field") or "") == "粉丝年龄"] or [{**PGY_DEFAULT_BASE_FILTERS["age"]}]
+    quote_filters = [item for item in base_candidates if str(item.get("field") or "") == "合作报价"] or [{**PGY_DEFAULT_BASE_FILTERS["quote"]}]
     return _dedupe_filters([*category_filters, *follower_filters, *age_filters, *quote_filters])
 
 

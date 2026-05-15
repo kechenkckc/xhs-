@@ -795,6 +795,50 @@ def test_collection_only_marketing_goal_does_not_block_creator_gate():
     assert rejected == []
 
 
+def test_build_collection_plan_uses_marketing_goal_metric_shape_and_strict_region():
+    weak = build_collection_plan("上海教育品牌想找母婴和教育达人做种草内容", {})
+    weak_filters = weak["filters"]
+
+    goal = next(item for item in weak_filters if item["field"] == "营销目标")
+    assert goal["value"] == "互动表现"
+    assert goal["goal"] == "种草"
+    assert goal["control_type"] == "marketing_goal_metric"
+    assert [item["value"] for item in weak_filters if item["field"] == "博主类目"] == ["教育", "母婴"]
+    assert "地域" not in [item["field"] for item in weak_filters]
+
+    strict = build_collection_plan("地域要求：北京、上海 IP 优先，教育达人", {})
+    assert any(item["field"] == "地域" for item in strict["filters"])
+    assert next(item for item in strict["filters"] if item["field"] == "地域")["control_type"] == "three_level_cascade_checkbox_popover"
+
+
+def test_region_targets_parse_china_and_foreign_values():
+    from rpa_mcp_sync.pgy_browser import _region_targets_from_item
+
+    assert _region_targets_from_item({"field": "地域", "value": "北京/上海优先"}) == ["北京", "上海"]
+    assert _region_targets_from_item({"field": "地域", "value": "地域要求：中国、美国、日本"}) == ["美国", "日本"]
+    assert _region_targets_from_item({"field": "地域", "value": "北上广深"}) == ["北京", "上海", "广州", "深圳"]
+
+
+def test_scheme_plan_preserves_multiple_category_filters():
+    from rpa_mcp_sync.web import _scheme_plan
+
+    screening_plan = {"pgyCollectionPlan": {"filters": []}}
+    scheme = {
+        "filters": [
+            {"field": "博主类目", "value": "教育"},
+            {"field": "博主类目", "value": "母婴"},
+            {"field": "粉丝量", "value": "1万～10万"},
+            {"field": "粉丝年龄", "value": "35～44 占比高"},
+            {"field": "合作报价", "value": "图文笔记：0.1万～2万"},
+        ],
+    }
+
+    plan = _scheme_plan(screening_plan, scheme)
+    required = plan["pgyCollectionPlan"]["required_filters"]
+
+    assert [item["value"] for item in required if item["field"] == "博主类目"] == ["教育", "母婴"]
+
+
 def test_hard_filters_parse_multi_choice_text_rules(monkeypatch):
     project_id = "pytest_collect_multi_text_rules"
     plan = {
@@ -1467,12 +1511,23 @@ def test_collection_plan_uses_first_scheme_when_default_filters_missing():
     assert plan["schemes"][0]["scheme_id"] == "education_core"
 
 
+def test_collection_plan_normalizes_saved_marketing_goal_parent_value():
+    plan = build_collection_plan(
+        "种草达人",
+        {"pgyCollectionPlan": {"filters": [{"field": "营销目标", "value": "种草"}]}},
+    )
+
+    assert plan["filters"][0]["value"] == "互动表现"
+    assert plan["filters"][0]["goal"] == "种草"
+    assert plan["filters"][0]["control_type"] == "marketing_goal_metric"
+
+
 def test_relaxed_collection_plan_keeps_broad_filters_when_empty():
     from rpa_mcp_sync.pgy_browser import _relaxed_collection_plan
 
     plan = {
         "filters": [
-            {"field": "营销目标", "value": "种草"},
+            {"field": "营销目标", "value": "互动表现", "goal": "种草", "control_type": "marketing_goal_metric"},
             {"field": "博主类目", "value": "教育"},
             {"field": "粉丝年龄", "value": "35～44 占比高"},
             {"field": "预估互动单价", "value": "图文笔记互动单价≤20"},

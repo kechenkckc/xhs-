@@ -15,6 +15,43 @@ export const PGY_BLOGGER_CATEGORY_OPTIONS = [
 ];
 export const PGY_REGION_OPTIONS = ['北京', '上海', '广东', '浙江', '江苏', '四川', '湖北', '湖南', '山东', '河南'];
 export const PGY_MARKETING_GOAL_OPTIONS = ['曝光', '种草', '转化'];
+export const PGY_MARKETING_GOAL_GROUPS = [
+  { label: '曝光', options: ['曝光表现', '阅读表现'] },
+  { label: '种草', options: ['互动表现'] },
+  { label: '转化', options: ['外溢进店表现'] },
+];
+export const PGY_MARKETING_GOAL_DEFAULT_METRIC = {
+  曝光: '曝光表现',
+  种草: '互动表现',
+  转化: '外溢进店表现',
+};
+export const PGY_REGION_CASCADE_GROUPS = [
+  {
+    label: '中国',
+    options: [
+      { label: '北京', options: ['东城区', '西城区', '朝阳区', '海淀区', '丰台区', '石景山区', '通州区', '昌平区', '大兴区', '顺义区'] },
+      { label: '上海', options: ['黄浦区', '徐汇区', '长宁区', '静安区', '普陀区', '虹口区', '杨浦区', '浦东新区', '闵行区', '宝山区'] },
+      { label: '广东', options: ['广州', '深圳', '佛山', '东莞', '珠海', '中山', '惠州', '汕头'] },
+      { label: '浙江', options: ['杭州', '宁波', '温州', '嘉兴', '绍兴', '金华'] },
+      { label: '江苏', options: ['南京', '苏州', '无锡', '常州', '南通', '扬州'] },
+      { label: '四川', options: ['成都', '绵阳', '德阳', '宜宾'] },
+      { label: '湖北', options: ['武汉', '宜昌', '襄阳'] },
+      { label: '湖南', options: ['长沙', '株洲', '湘潭'] },
+      { label: '山东', options: ['济南', '青岛', '烟台'] },
+      { label: '河南', options: ['郑州', '洛阳'] },
+    ],
+  },
+  { label: '美国', options: [] },
+  { label: '日本', options: [] },
+  { label: '澳大利亚', options: [] },
+  { label: '英国', options: [] },
+  { label: '加拿大', options: [] },
+  { label: '韩国', options: [] },
+  { label: '法国', options: [] },
+  { label: '德国', options: [] },
+  { label: '新加坡', options: [] },
+  { label: '其他', options: [] },
+];
 export const PGY_FAMILY_IDENTITY_GROUPS = [
   { label: '家庭角色', options: ['妈妈', '萌娃', '爸爸', '奶奶'] },
   { label: '出镜人关系', options: ['情侣', '夫妻', '家庭', '闺蜜', '兄弟'] },
@@ -95,15 +132,16 @@ export const PGY_LIVE_VIEWER_OPTIONS = ['0~5k', '5k~1w', '1w~10w', '10w~50w', '5
 export const PGY_LIVE_SALES_OPTIONS = ['5千以下', '5千～1万', '1万～10万', '10万～50万', '50万～100万', '100万～200万', '200万～500万', '500万以上'];
 
 export const PGY_FILTER_OPTIONS = [
-  { field: '营销目标', value: '曝光', reason: 'Brief 提到曝光/声量目标', label: '营销目标：曝光', control_type: 'tag' },
-  { field: '营销目标', value: '转化', reason: 'Brief 提到转化目标', label: '营销目标：转化', control_type: 'tag' },
+  { field: '营销目标', value: '曝光表现', goal: '曝光', parent_value: '曝光', reason: 'Brief 提到曝光/声量目标', label: '营销目标：曝光-曝光表现', control_type: 'marketing_goal_metric', priority: 'low' },
+  { field: '营销目标', value: '互动表现', goal: '种草', parent_value: '种草', reason: 'Brief 提到种草目标', label: '营销目标：种草-互动表现', control_type: 'marketing_goal_metric', priority: 'low' },
+  { field: '营销目标', value: '外溢进店表现', goal: '转化', parent_value: '转化', reason: 'Brief 提到转化目标', label: '营销目标：转化-外溢进店表现', control_type: 'marketing_goal_metric', priority: 'low' },
   { field: '按博主粉丝推荐', value: '待选择合作品牌/竞品', reason: '根据品牌或竞品粉丝画像找博主', label: '人群目标：按博主粉丝推荐', control_type: 'brand_search_recommendation', input_values: [], pending_detail: '右上角搜索合作品牌或竞品品牌' },
   { field: '博主类目', value: '教育', reason: 'Brief 命中教育场景', label: '博主类目：教育', control_type: 'tag' },
   { field: '博主类目', value: '母婴', reason: 'Brief 命中母婴/亲子场景', label: '博主类目：母婴', control_type: 'tag' },
   { field: '家庭身份', value: '妈妈', reason: 'Brief 命中家庭身份画像', label: '家庭身份：妈妈', control_type: 'checkbox_popover' },
   { field: '职业身份', value: '教育科研', reason: 'Brief 命中教师/专家画像', label: '职业身份：教育科研', control_type: 'checkbox_popover' },
   { field: '特色背景', value: '备考经验', reason: 'Brief 命中高知/升学画像', label: '特色背景：备考经验', control_type: 'checkbox_popover' },
-  { field: '地域', value: '北京/上海优先', reason: 'Brief 提到北京、上海或一线城市', label: '地域：北京/上海优先', control_type: 'cascade_checkbox_popover', pending_detail: '需要展开国内城市二级选项' },
+  { field: '地域', value: '北京/上海优先', reason: 'Brief 明确强调地域/IP/城市要求', label: '地域：北京/上海优先', control_type: 'three_level_cascade_checkbox_popover' },
   { field: '粉丝年龄', value: '35～44 占比高', reason: 'Brief 要求家长/35岁以上粉丝', label: '粉丝年龄：35～44 占比高', control_type: 'dropdown' },
   { field: '合作报价', value: '图文笔记：0.1万～2万', reason: '单达人预算上限', label: '合作报价：图文 ≤ 2万', control_type: 'subfield_preset_or_number_range', sub_field: '图文笔记' },
   { field: '预估阅读单价', value: '图文笔记阅读单价≤2', reason: 'Brief 要求控制 CPC', label: '预估阅读单价：图文 ≤ 2', control_type: 'subfield_preset_or_number_range', sub_field: '图文笔记阅读单价' },
@@ -130,7 +168,7 @@ export const PGY_FIND_BLOGGER_FILTER_GROUPS = [
   {
     section: '合作目标',
     rows: [
-      { label: '营销目标', kind: 'tags', field: '营销目标' },
+      { label: '营销目标', kind: 'marketingGoal', field: '营销目标' },
       { label: '人群目标', kind: 'fields', fields: ['按博主粉丝推荐'] },
     ],
   },
@@ -168,14 +206,14 @@ export const PGY_FIND_BLOGGER_FILTER_GROUPS = [
 ];
 
 export const PGY_FILTER_CATALOG_UI = [
-  { field: '营销目标', control_type: 'tag', options: PGY_MARKETING_GOAL_OPTIONS },
+  { field: '营销目标', control_type: 'marketing_goal_metric', parent_options: PGY_MARKETING_GOAL_OPTIONS, option_groups: PGY_MARKETING_GOAL_GROUPS, options: PGY_MARKETING_GOAL_GROUPS.flatMap(group => group.options) },
   { field: '按博主粉丝推荐', control_type: 'brand_search_recommendation', options: ['待选择合作品牌/竞品'] },
   { field: '博主类目', control_type: 'tag', options: PGY_BLOGGER_CATEGORY_OPTIONS },
   { field: '家庭身份', control_type: 'checkbox_popover', option_groups: PGY_FAMILY_IDENTITY_GROUPS, options: PGY_FAMILY_IDENTITY_GROUPS.flatMap(group => group.options) },
   { field: '职业身份', control_type: 'checkbox_popover', option_groups: PGY_CAREER_IDENTITY_GROUPS, options: PGY_CAREER_IDENTITY_GROUPS.flatMap(group => group.options) },
   { field: '特色背景', control_type: 'checkbox_popover', option_groups: PGY_SPECIAL_BACKGROUND_GROUPS, options: PGY_SPECIAL_BACKGROUND_GROUPS.flatMap(group => group.options) },
   { field: '性别', control_type: 'dropdown_single', options: ['不限', '男', '女'] },
-  { field: '地域', control_type: 'cascade_checkbox_popover', options: ['中国', '美国', '日本', '澳大利亚', '英国', '加拿大', '韩国', '法国', '德国', '新加坡', '其他'] },
+  { field: '地域', control_type: 'three_level_cascade_checkbox_popover', option_groups: PGY_REGION_CASCADE_GROUPS, options: ['中国', '美国', '日本', '澳大利亚', '英国', '加拿大', '韩国', '法国', '德国', '新加坡', '其他'] },
   { field: '二十大人群', control_type: 'checkbox_popover', option_groups: PGY_AUDIENCE_20_GROUPS, options: PGY_AUDIENCE_20_GROUPS.flatMap(group => group.options) },
   { field: '行业特色画像', control_type: 'checkbox_popover', options: PGY_INDUSTRY_PORTRAIT_OPTIONS },
   { field: '预估消费行为', control_type: 'checkbox_popover', option_groups: PGY_CONSUMPTION_BEHAVIOR_GROUPS, options: PGY_CONSUMPTION_BEHAVIOR_GROUPS.flatMap(group => group.options) },
@@ -185,7 +223,7 @@ export const PGY_FILTER_CATALOG_UI = [
   { field: '粉丝量', control_type: 'preset_or_number_range', options: PGY_FOLLOWER_RANGE_OPTIONS },
   { field: '粉丝年龄', control_type: 'dropdown', options: PGY_FAN_AGE_OPTIONS },
   { field: '粉丝性别', control_type: 'dropdown', options: ['男性占比高', '女性占比高'] },
-  { field: '粉丝地域', control_type: 'three_level_cascade_checkbox_popover', options: ['中国', '美国', '日本', '澳大利亚', '英国', '加拿大', '韩国', '法国', '德国', '新加坡', '其他'] },
+  { field: '粉丝地域', control_type: 'three_level_cascade_checkbox_popover', option_groups: PGY_REGION_CASCADE_GROUPS, options: ['中国', '美国', '日本', '澳大利亚', '英国', '加拿大', '韩国', '法国', '德国', '新加坡', '其他'] },
   { field: '婚恋状态', control_type: 'dropdown_single', options: ['不限', '未婚', '已婚'] },
   { field: '消费水平', control_type: 'dropdown_single', options: ['不限', '低消费', '中消费', '高消费'] },
   { field: '母婴阶段', control_type: 'checkbox_popover', options: PGY_MATERNAL_STAGE_OPTIONS },

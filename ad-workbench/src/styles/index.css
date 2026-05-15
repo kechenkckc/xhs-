@@ -2128,6 +2128,85 @@ table {
   background: #ffffff;
 }
 
+.pgy-find-region-cascade {
+  display: grid;
+  grid-template-columns: 140px 180px 190px;
+  min-height: 280px;
+  max-height: 360px;
+  overflow: hidden;
+  border-bottom: 1px solid #f0f1f5;
+}
+
+.pgy-find-region-column {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-2);
+  background: #ffffff;
+  border-right: 1px solid #f0f1f5;
+}
+
+.pgy-find-region-column:first-child {
+  background: #fafbfc;
+}
+
+.pgy-find-region-column:last-child {
+  border-right: 0;
+}
+
+.pgy-find-region-column-head {
+  padding: 4px var(--space-2) 8px;
+  color: #9aa0aa;
+  font-size: var(--text-xs);
+}
+
+.pgy-find-region-column > button,
+.pgy-find-region-column .pgy-find-filter-choice button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  width: 100%;
+  min-width: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.pgy-find-region-column > button {
+  min-height: 34px;
+  padding: 5px var(--space-2);
+  color: #3f4652;
+  border-radius: var(--radius-md);
+}
+
+.pgy-find-region-column > button:hover,
+.pgy-find-region-column > button.is-active,
+.pgy-find-region-column > button.has-selected {
+  color: #1f2430;
+  background: #f8f9fb;
+}
+
+.pgy-find-region-column > button.has-selected span::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+  background: #ff2442;
+  border-radius: var(--radius-full);
+}
+
+.pgy-find-region-empty {
+  padding: var(--space-3) var(--space-2);
+  color: #a0a6b1;
+  font-size: var(--text-xs);
+}
+
 .pgy-find-filter-choice,
 .pgy-find-filter-check {
   display: inline-flex;

@@ -17,7 +17,7 @@ import {
 export const WEIGHT_LABELS = { budget: '预算匹配', fans: '粉丝量级', cpe: 'CPE效率', engagement: '互动质量', persona: '人设匹配', content: '内容风格' };
 
 export const HARD_FILTER_OPTIONS = [
-  { field: '营销目标', condition: '包含', value: '种草', required: true, feishuField: '营销目标', label: '蒲公英：营销目标', valueControl: 'multi', options: PGY_MARKETING_GOAL_OPTIONS, pgyField: '营销目标' },
+  { field: '营销目标', condition: '包含', value: '种草', required: false, feishuField: '营销目标', label: '蒲公英：营销目标', valueControl: 'multi', options: PGY_MARKETING_GOAL_OPTIONS, pgyField: '营销目标' },
   { field: '博主类目', condition: '包含', value: '教育', required: true, feishuField: '账号类型', label: '蒲公英：博主类目', valueControl: 'multi', options: PGY_BLOGGER_CATEGORY_OPTIONS, pgyField: '博主类目' },
   { field: '粉丝年龄', condition: '匹配', value: '35～44 占比高', required: true, feishuField: '粉丝年龄34岁以上占比', label: '蒲公英：粉丝年龄区间', valueControl: 'multi', options: PGY_FAN_AGE_OPTIONS, pgyField: '粉丝年龄' },
   { field: '合作报价', condition: '<=', value: '图文笔记：0.1万～2万', required: true, feishuField: '平台报价', label: '蒲公英：合作报价', valueControl: 'range', presets: PGY_PRICE_RANGE_OPTIONS, subField: '图文笔记', pgyField: '合作报价' },
@@ -81,4 +81,5 @@ export const CONTROL_TYPE_LABELS = {
   text_multi_with_exclude: '填空',
   searchable_multi_select_with_exclude: '搜索多选',
   nested_select_popover: '需继续下拉',
+  marketing_goal_metric: '目标指标',
 };

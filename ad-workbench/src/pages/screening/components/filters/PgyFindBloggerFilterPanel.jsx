@@ -29,32 +29,35 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
   const selectedKeys = useMemo(() => new Set((filters || []).map(pgyFilterKey)), [filters]);
   const selectedItems = useMemo(() => filters || [], [filters]);
 
-  const renderFieldButton = (field, label = field) => {
+  const renderFieldButton = (field, label = field, options = {}) => {
     const meta = getPgyFilterMeta(field);
     if (!meta) return renderMutedToken(label, field);
-    const selectedItems = getPgySelectedItems(filters, field);
+    const selectedItems = getPgySelectedItems(filters, field)
+      .filter(item => !options.subField || [item.goal, item.parent_value, item.parentValue, item.sub_field, item.subField].includes(options.subField));
     const active = selectedItems.length > 0;
     const displayValue = active ? selectedItems.slice(0, 2).map(item => item.value).join('、') : '';
+    const fieldKey = `${field}|${options.subField || ''}`;
     return (
-      <span key={field} className="pgy-find-filter-popover-wrap">
+      <span key={fieldKey} className="pgy-find-filter-popover-wrap">
         <button
           type="button"
           className={`pgy-find-filter-token has-chevron ${active ? 'is-active' : ''}`}
           title={active ? selectedItems.map(item => item.value).join('、') : label}
           onClick={(event) => {
-            const nextField = openField === field ? null : field;
+            const nextField = openField === fieldKey ? null : fieldKey;
             setOpenField(nextField);
             setOpenAnchor(nextField ? event.currentTarget : null);
           }}
         >
           <span>{label}{displayValue ? `：${displayValue}${selectedItems.length > 2 ? '...' : ''}` : ''}</span>
-          <ChevronDown size={14} className={openField === field ? 'is-open' : ''} />
+          <ChevronDown size={14} className={openField === fieldKey ? 'is-open' : ''} />
         </button>
-        {openField === field && (
+        {openField === fieldKey && (
           <PgyFilterPopover
             meta={meta}
             filters={filters}
             anchorEl={openAnchor}
+            initialSubField={options.subField || ''}
             onApply={(nextItems) => onChange?.(replacePgyFieldFilters(filters, meta, nextItems))}
             onClear={() => onChange?.((filters || []).filter(item => item.field !== meta.field))}
             onClose={() => {
@@ -76,6 +79,15 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
   );
 
   const renderRowContent = (row) => {
+    if (row.kind === 'marketingGoal') {
+      const meta = getPgyFilterMeta(row.field);
+      const groups = meta?.option_groups || meta?.optionGroups || [];
+      return (
+        <>
+          {groups.map(group => renderFieldButton(row.field, group.label, { subField: group.label }))}
+        </>
+      );
+    }
     if (row.kind === 'tags') {
       const meta = getPgyFilterMeta(row.field);
       const values = row.values || meta?.options || [];

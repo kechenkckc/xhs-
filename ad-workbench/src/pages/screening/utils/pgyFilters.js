@@ -8,6 +8,7 @@ import {
 } from '../constants/screeningConstants';
 import {
   PGY_FILTER_CATALOG_BY_FIELD,
+  PGY_MARKETING_GOAL_DEFAULT_METRIC,
   PGY_SINGLE_VALUE_CONTROLS,
 } from '../constants/pgyConstants';
 
@@ -105,6 +106,21 @@ export function normalizePgyFilterItem(item = {}) {
   const field = item.field || '';
   const value = item.value || '';
   const base = { ...item, field, value, reason: item.reason || '' };
+  if (field === '营销目标') {
+    const metric = PGY_MARKETING_GOAL_DEFAULT_METRIC[value] || value;
+    const parent = item.goal || item.parent_value || item.parentValue || (
+      PGY_MARKETING_GOAL_DEFAULT_METRIC[value] ? value : ''
+    );
+    const fallbackParent = !parent && metric === '曝光表现' ? '曝光' : !parent && metric === '互动表现' ? '种草' : !parent && metric === '外溢进店表现' ? '转化' : parent;
+    return {
+      ...base,
+      value: metric,
+      goal: fallbackParent,
+      parent_value: fallbackParent,
+      control_type: 'marketing_goal_metric',
+      priority: item.priority || 'low',
+    };
+  }
   if (field === '博主人设') {
     const map = {
       家庭身份: { field: '家庭身份', value: '妈妈', control_type: 'checkbox_popover' },
@@ -130,7 +146,7 @@ export function normalizePgyFilterItem(item = {}) {
     return { ...base, value: '35～44 占比高', control_type: 'dropdown' };
   }
   if (field === '地域' && value.includes('优先')) {
-    return { ...base, control_type: 'cascade_checkbox_popover', pending_detail: '需要展开国内城市二级选项' };
+    return { ...base, control_type: 'three_level_cascade_checkbox_popover' };
   }
   return base;
 }
@@ -223,6 +239,7 @@ export function getPgySelectedItems(filters = [], field) {
 }
 
 export function formatPgyFilterValue(field, value, subField) {
+  if (field === '地域' || field === '粉丝地域') return value;
   if (!subField) return value;
   if (String(value).startsWith(`${subField}：`)) return value;
   return `${subField}：${value}`;
@@ -230,6 +247,18 @@ export function formatPgyFilterValue(field, value, subField) {
 
 export function makePgyFilterItem(meta, value, subField) {
   const nextSubField = subField || meta.sub_fields?.[0] || '';
+  if (meta.field === '营销目标') {
+    const metric = PGY_MARKETING_GOAL_DEFAULT_METRIC[value] || value;
+    const parent = subField || (PGY_MARKETING_GOAL_DEFAULT_METRIC[value] ? value : '');
+    const fallbackParent = !parent && metric === '曝光表现' ? '曝光' : !parent && metric === '互动表现' ? '种草' : !parent && metric === '外溢进店表现' ? '转化' : parent;
+    return {
+      field: meta.field,
+      value: metric,
+      control_type: meta.control_type,
+      ...(fallbackParent ? { goal: fallbackParent, parent_value: fallbackParent } : {}),
+      priority: 'low',
+    };
+  }
   return {
     field: meta.field,
     value: formatPgyFilterValue(meta.field, value, nextSubField),
@@ -246,6 +275,13 @@ export function makePgyFilterItemsFromValues(meta, values = [], subField = '') {
 }
 
 export function replacePgyFieldFilters(filters = [], meta, nextItems = []) {
+  if (meta.field === '营销目标') {
+    const parents = new Set((nextItems || []).map(item => item.goal || item.parent_value || item.parentValue || '').filter(Boolean));
+    return [
+      ...(filters || []).filter(item => item.field !== meta.field || !parents.has(item.goal || item.parent_value || item.parentValue || '')),
+      ...(nextItems || []),
+    ];
+  }
   const subFields = new Set((nextItems || []).map(item => item.sub_field || '').filter(Boolean));
   if (subFields.size) {
     return [

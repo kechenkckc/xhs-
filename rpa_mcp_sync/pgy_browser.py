@@ -295,12 +295,30 @@ def _extract_brands_after_labels(brief: str, labels: list[str]) -> list[str]:
                 brands.append(brand)
     return list(dict.fromkeys(brands))
 
+PGY_MARKETING_GOAL_GROUPS = [
+    {"label": "曝光", "options": ["曝光表现", "阅读表现"]},
+    {"label": "种草", "options": ["互动表现"]},
+    {"label": "转化", "options": ["外溢进店表现"]},
+]
+PGY_MARKETING_GOAL_DEFAULT_METRIC = {
+    "曝光": "曝光表现",
+    "种草": "互动表现",
+    "转化": "外溢进店表现",
+}
+PGY_MARKETING_GOAL_METRIC_PARENT = {
+    metric: group["label"]
+    for group in PGY_MARKETING_GOAL_GROUPS
+    for metric in group["options"]
+}
+
 PGY_FILTER_CATALOG = [
     {
         "field": "营销目标",
-        "control_type": "tag",
-        "options": ["曝光", "种草", "转化"],
-        "notes": "一层标签，可直接点击。",
+        "control_type": "marketing_goal_metric",
+        "parent_options": [group["label"] for group in PGY_MARKETING_GOAL_GROUPS],
+        "option_groups": PGY_MARKETING_GOAL_GROUPS,
+        "options": [value for group in PGY_MARKETING_GOAL_GROUPS for value in group["options"]],
+        "notes": "先点击曝光/种草/转化父级，再在弹层内选择对应指标；低优先级筛选，不作为必备条件。",
     },
     {
         "field": "按博主粉丝推荐",
@@ -372,10 +390,10 @@ PGY_FILTER_CATALOG = [
     },
     {
         "field": "地域",
-        "control_type": "cascade_checkbox_popover",
-        "levels": ["国家/地区", "省/直辖市"],
+        "control_type": "three_level_cascade_checkbox_popover",
+        "levels": ["国家/地区", "省/直辖市", "城市/区"],
         "options": ["中国", "美国", "日本", "澳大利亚", "英国", "加拿大", "韩国", "法国", "德国", "新加坡", "其他"],
-        "notes": "打开后先选国家，国内城市需要继续展开二级选项。",
+        "notes": "中国地域需先选国家，再选省/市，再按需选城市/区；外国国家/地区可在第一列直接勾选。支持多选。",
     },
     {
         "field": "二十大人群",
@@ -1798,11 +1816,61 @@ def _merge_filters(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
+def _brief_emphasizes_region(text: str) -> bool:
+    normalized = _clean_text(text).lower()
+    if not any(keyword in normalized for keyword in ["地域", "地区", "城市", "ip", "北京", "上海", "一线", "省份"]):
+        return False
+    emphasis_keywords = [
+        "地域要求",
+        "地区要求",
+        "城市要求",
+        "ip要求",
+        "地域优先",
+        "地区优先",
+        "城市优先",
+        "ip优先",
+        "优先北京",
+        "优先上海",
+        "北京优先",
+        "上海优先",
+        "重点城市",
+        "核心城市",
+        "指定城市",
+        "必须",
+        "限定",
+        "限制",
+        "只要",
+        "仅限",
+        "重点覆盖",
+        "地域强调",
+        "地区强调",
+        "本地",
+        "同城",
+    ]
+    return any(keyword in normalized for keyword in emphasis_keywords)
+
+
 def _hard_filters_to_pgy_filters(hard_filters: list[dict[str, Any]]) -> list[dict[str, str]]:
     filters: list[dict[str, str]] = []
 
     def add(field: str, value: str, reason: str, **extra: Any) -> None:
         filters.append({"field": field, "value": value, "reason": reason, **{key: val for key, val in extra.items() if val not in (None, "", [])}})
+
+    def add_marketing_goal(value: str, reason: str) -> None:
+        parent = str(value or "").strip()
+        metric = PGY_MARKETING_GOAL_DEFAULT_METRIC.get(parent) or parent
+        parent = PGY_MARKETING_GOAL_METRIC_PARENT.get(metric) or parent
+        if not parent or not metric:
+            return
+        add(
+            "营销目标",
+            metric,
+            reason,
+            control_type="marketing_goal_metric",
+            goal=parent,
+            parent_value=parent,
+            priority="low",
+        )
 
     for item in hard_filters or []:
         if item.get("required") is False:
@@ -1814,7 +1882,11 @@ def _hard_filters_to_pgy_filters(hard_filters: list[dict[str, Any]]) -> list[dic
         reason = f"硬性条件：{field}{item.get('condition') or ''}{value}"
         value_control = str(item.get("valueControl") or "")
         sub_field = str(item.get("subField") or "")
-        if pgy_field in {"营销目标", "博主类目", "粉丝量", "粉丝年龄", "家庭身份", "职业身份", "特色背景", "母婴阶段", "地域", "粉丝地域"} and value:
+        if pgy_field == "营销目标" and value:
+            for part in [part.strip() for part in re.split(r"[、,，/]+", value) if part.strip()]:
+                add_marketing_goal(part, reason)
+            continue
+        if pgy_field in {"博主类目", "粉丝量", "粉丝年龄", "家庭身份", "职业身份", "特色背景", "母婴阶段", "地域", "粉丝地域"} and value:
             if pgy_field == "粉丝年龄":
                 age_values = []
                 if any(keyword in value for keyword in ["35", "34", "40", "家长", "父母", ">44", "44岁以上"]):
@@ -1861,8 +1933,8 @@ def _hard_filters_to_pgy_filters(hard_filters: list[dict[str, Any]]) -> list[dic
             add("预估互动单价", f"图文笔记互动单价≤{cpe_max:g}", reason, control_type="subfield_preset_or_number_range", sub_field="图文笔记互动单价", max=cpe_max)
         if any(keyword in text for keyword in ["孩子年级", "小升初", "初中", "高中", "大孩"]):
             add("内容场景", "小升初/初中/高中", reason)
-        if any(keyword in text for keyword in ["地域", "城市", "ip", "北京", "上海", "一线"]):
-            add("地域", value or "北京/上海优先", reason, control_type="cascade_checkbox_popover", pending_detail="需要展开国内城市二级选项")
+        if _brief_emphasizes_region(f"{field} {value}"):
+            add("地域", value or "北京/上海优先", reason, control_type="three_level_cascade_checkbox_popover")
         if any(keyword in text for keyword in ["限流", "违规", "流量稳定", "异常"]):
             add("常规剔除", "剔除低活博主", reason, control_type="checkbox")
             add("常规剔除", "剔除掉粉博主", reason, control_type="checkbox")
@@ -1873,6 +1945,22 @@ def _normalize_pgy_filter_item(item: dict[str, Any]) -> dict[str, Any]:
     field = str(item.get("field") or "")
     value = str(item.get("value") or "")
     normalized = {**item, "field": field, "value": value, "reason": str(item.get("reason") or "")}
+    if field == "营销目标":
+        parent = str(item.get("goal") or item.get("parent_value") or item.get("parentValue") or "").strip()
+        metric = value.strip()
+        if metric in PGY_MARKETING_GOAL_DEFAULT_METRIC:
+            parent = metric
+            metric = PGY_MARKETING_GOAL_DEFAULT_METRIC.get(parent) or metric
+        if not parent:
+            parent = PGY_MARKETING_GOAL_METRIC_PARENT.get(metric) or ""
+        return {
+            **normalized,
+            "value": metric,
+            "control_type": "marketing_goal_metric",
+            "goal": parent,
+            "parent_value": parent,
+            "priority": normalized.get("priority") or "low",
+        }
     if field == "博主人设":
         mapping = {
             "家庭身份": {"field": "家庭身份", "value": "妈妈", "control_type": "checkbox_popover"},
@@ -1921,7 +2009,7 @@ def _normalize_pgy_filter_item(item: dict[str, Any]) -> dict[str, Any]:
     if field == "粉丝年龄":
         return {**normalized, "control_type": normalized.get("control_type") or "dropdown"}
     if field == "地域" and "优先" in value:
-        return {**normalized, "control_type": "cascade_checkbox_popover", "pending_detail": "需要展开国内城市二级选项"}
+        return {**normalized, "control_type": "three_level_cascade_checkbox_popover"}
     if field == "常规剔除" and value in {"低风险/流量稳定", "规避限流异常", "流量稳定"}:
         return {**normalized, "value": "剔除低活博主", "control_type": "checkbox"}
     return normalized
@@ -1989,11 +2077,11 @@ def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None
             filters.append({"field": field, "value": value, "reason": reason, **{key: val for key, val in extra.items() if val not in (None, "", [])}})
 
     if any(keyword in text for keyword in ["曝光", "声量", "阅读", "播放"]):
-        add("营销目标", "曝光", "Brief 提到曝光/声量目标")
+        add("营销目标", "曝光表现", "Brief 提到曝光/声量目标", control_type="marketing_goal_metric", goal="曝光", parent_value="曝光", priority="low")
     if any(keyword in text for keyword in ["种草", "口碑", "测评", "内容"]):
-        add("营销目标", "种草", "Brief 提到种草或内容测评")
+        add("营销目标", "互动表现", "Brief 提到种草或内容测评", control_type="marketing_goal_metric", goal="种草", parent_value="种草", priority="low")
     if any(keyword in text for keyword in ["转化", "销售", "进店", "下单"]):
-        add("营销目标", "转化", "Brief 提到转化目标")
+        add("营销目标", "外溢进店表现", "Brief 提到转化目标", control_type="marketing_goal_metric", goal="转化", parent_value="转化", priority="low")
 
     category_map = [
         ("教育", ["教育", "学习", "升学", "初中", "高中", "答疑", "教辅", "老师"]),
@@ -2020,8 +2108,8 @@ def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None
     if any(keyword in text for keyword in ["高知", "升学", "备考", "留学", "考研"]):
         add("特色背景", "备考经验", "Brief 命中特色背景", control_type="checkbox_popover")
 
-    if any(keyword in text for keyword in ["北京", "上海", "一线"]):
-        add("地域", "北京/上海优先", "Brief 提到北京、上海或一线城市", control_type="cascade_checkbox_popover", pending_detail="国内城市二级选项")
+    if _brief_emphasizes_region(brief):
+        add("地域", "北京/上海优先", "Brief 明确强调地域/IP/城市要求", control_type="three_level_cascade_checkbox_popover")
     if any(keyword in text for keyword in ["35岁", "35 岁", "34岁", "家长", "父母"]):
         add("粉丝年龄", "35～44 占比高", "Brief 要求家长/35岁以上粉丝", control_type="dropdown")
     if any(keyword in text for keyword in ["cpe", "cpc", "阅读单价", "互动单价"]):
@@ -2234,6 +2322,12 @@ def _filter_value_candidates(item: dict[str, Any]) -> list[str]:
     raw_value = str(item.get("value") or "").strip()
     selection_value = _item_selection_value(item)
     candidates = [selection_value, raw_value]
+    if str(item.get("field") or "") == "营销目标":
+        parent = str(item.get("goal") or item.get("parent_value") or item.get("parentValue") or "").strip()
+        if selection_value in PGY_MARKETING_GOAL_DEFAULT_METRIC:
+            candidates.append(PGY_MARKETING_GOAL_DEFAULT_METRIC[selection_value])
+        if parent:
+            candidates.append(parent)
     for value in [selection_value, raw_value]:
         candidates.extend(PGY_FILTER_ALIASES.get(value) or [])
     return list(dict.fromkeys([candidate for candidate in candidates if candidate]))
@@ -3673,6 +3767,85 @@ def _click_popover_confirm(page: Any, popover: Any) -> bool:
     return False
 
 
+def _marketing_goal_parent(item: dict[str, Any]) -> str:
+    value = _item_selection_value(item)
+    parent = str(item.get("goal") or item.get("parent_value") or item.get("parentValue") or "").strip()
+    if not parent and value in PGY_MARKETING_GOAL_DEFAULT_METRIC:
+        parent = value
+    if not parent:
+        parent = PGY_MARKETING_GOAL_METRIC_PARENT.get(value) or ""
+    return parent
+
+
+def _marketing_goal_metric(item: dict[str, Any]) -> str:
+    value = _item_selection_value(item)
+    return PGY_MARKETING_GOAL_DEFAULT_METRIC.get(value) or value
+
+
+def _click_marketing_goal_parent(page: Any, parent: str) -> tuple[Any, str]:
+    if not parent:
+        return None, "营销目标缺少父级目标"
+    for selector in [
+        ".blogger-list_filter .tag",
+        ".blogger-list_filter .selector-body-options *",
+        ".blogger-list_filter button",
+        ".blogger-list_filter *",
+    ]:
+        candidates = page.locator(selector).filter(has_text=re.compile(f"^\\s*{re.escape(parent)}\\s*$"))
+        try:
+            count = min(candidates.count(), 30)
+        except Exception:
+            continue
+        for index in range(count):
+            candidate = candidates.nth(index)
+            try:
+                if not _is_visible(candidate):
+                    continue
+                if not _click_locator(page, candidate, timeout=1800):
+                    continue
+                page.wait_for_timeout(650)
+                popover = _popover_for_trigger(page, candidate) or _last_visible_popover(page)
+                if popover is not None:
+                    return popover, "已打开营销目标弹层"
+            except Exception:
+                continue
+    return None, f"页面未找到营销目标父级：{parent}"
+
+
+def _apply_marketing_goal_group(page: Any, parent: str, items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    pending = [item for item in items if not _filter_already_selected(page, item)]
+    for item in items:
+        if item not in pending:
+            applied.append({**item, "message": "页面已存在该筛选条件"})
+    if not pending:
+        return applied, skipped
+
+    popover, message = _click_marketing_goal_parent(page, parent)
+    if popover is None:
+        for item in pending:
+            skipped.append({**item, "message": message})
+        return applied, skipped
+
+    successes: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for item in pending:
+        metric = _marketing_goal_metric(item)
+        selected = False
+        for candidate in _filter_value_candidates({**item, "value": metric}):
+            if _select_popover_checkbox(page, popover, candidate):
+                selected = True
+                break
+        if selected:
+            successes.append({**item, "value": metric, "message": f"已选择{parent}下的{metric}"})
+        else:
+            failures.append({**item, "value": metric, "message": f"营销目标弹层内未找到指标：{metric}"})
+
+    _click_popover_confirm(page, popover)
+    return [*applied, *successes], [*skipped, *failures]
+
+
 def _select_popover_checkbox(page: Any, popover: Any, text: str) -> bool:
     for selector in [".d-checkbox", ".d-dropdown-option", ".d-options *", ".tag", "label", "button", "*"]:
         option = popover.locator(selector).filter(has_text=re.compile(f"^\\s*{re.escape(text)}\\s*$")).first
@@ -3744,6 +3917,146 @@ def _select_grouped_popover_value(page: Any, popover: Any, item: dict[str, Any])
         if _click_popover_group(page, popover, inferred_group) and _select_popover_checkbox(page, popover, value):
             return True
     return False
+
+
+PGY_FOREIGN_REGION_OPTIONS = {"美国", "日本", "澳大利亚", "英国", "加拿大", "韩国", "法国", "德国", "新加坡", "其他"}
+PGY_CHINA_REGION_OPTIONS = {
+    "北京", "上海", "天津", "重庆", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江",
+    "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南", "湖北", "湖南", "广东",
+    "广西", "海南", "四川", "贵州", "云南", "西藏", "陕西", "甘肃", "青海", "宁夏",
+    "新疆", "香港", "澳门", "台湾",
+}
+PGY_REGION_ALIASES = {
+    "北京/上海优先": ["北京", "上海"],
+    "北京上海优先": ["北京", "上海"],
+    "北上广深": ["北京", "上海", "广州", "深圳"],
+    "一线": ["北京", "上海", "广州", "深圳"],
+    "一线城市": ["北京", "上海", "广州", "深圳"],
+}
+
+
+def _region_targets_from_item(item: dict[str, Any]) -> list[str]:
+    raw_values: list[str] = []
+    for key in ("regions", "region_values", "input_values"):
+        values = item.get(key)
+        if isinstance(values, list):
+            raw_values.extend(str(value) for value in values)
+    for key in ("city", "province", "country"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            raw_values.append(value)
+    raw_value = str(item.get("value") or "")
+    raw_values.extend(PGY_REGION_ALIASES.get(raw_value) or [])
+    raw_values.extend(re.split(r"[、,，/|｜\s]+", raw_value))
+    targets: list[str] = []
+    for value in raw_values:
+        clean = value.strip(" ：:;；。优先重点必须地域要求地区城市IPip")
+        if not clean or clean in {"中国", "国内", "全国", "不限"}:
+            continue
+        if clean in PGY_REGION_ALIASES:
+            targets.extend(PGY_REGION_ALIASES[clean])
+            continue
+        if clean.endswith("市") and len(clean) <= 4:
+            clean = clean[:-1]
+        if clean.endswith("省") and len(clean) <= 4:
+            clean = clean[:-1]
+        if clean:
+            targets.append(clean)
+    return list(dict.fromkeys(targets))
+
+
+def _click_cascade_option(page: Any, popover: Any, text: str, column_index: int | None = None, checkbox: bool | None = None) -> bool:
+    if not text:
+        return False
+    column_selectors = [
+        ".d-new-cascader__option-list__item",
+        ".d-cascader-menu",
+        ".range-select-content__column",
+        ".range-select-content__left, .range-select-content__middle, .range-select-content__right",
+    ]
+    scopes: list[Any] = []
+    if column_index is not None:
+        for selector in column_selectors:
+            columns = popover.locator(selector)
+            try:
+                if columns.count() > column_index:
+                    scopes.append(columns.nth(column_index))
+            except Exception:
+                continue
+    scopes.append(popover)
+    selectors = [".d-checkbox", "label", ".d-new-cascader__option-wrapper", ".d-cascader-menu-item", ".range-select-item", "button", "*"]
+    pattern = re.compile(f"^\\s*{re.escape(text)}\\s*$")
+    for scope in scopes:
+        for selector in selectors:
+            candidates = scope.locator(selector).filter(has_text=pattern)
+            try:
+                count = min(candidates.count(), 30)
+            except Exception:
+                continue
+            for index in range(count):
+                candidate = candidates.nth(index)
+                try:
+                    if not _is_visible(candidate):
+                        continue
+                    if checkbox is True and _checkbox_checked(candidate):
+                        return True
+                    if _click_locator(page, candidate, timeout=1500):
+                        page.wait_for_timeout(450)
+                        return True
+                except Exception:
+                    continue
+    return False
+
+
+def _apply_region_cascade(page: Any, item: dict[str, Any]) -> tuple[bool, str]:
+    field = str(item.get("field") or "地域")
+    popover, message = _open_filter_popover(page, field)
+    if popover is None:
+        return False, message
+    targets = _region_targets_from_item(item)
+    if not targets:
+        _click_popover_confirm(page, popover)
+        return False, "地域条件未解析到可勾选国家/省市，已保留在采集计划中"
+
+    selected: list[str] = []
+    failed: list[str] = []
+    china_targets = [target for target in targets if target not in PGY_FOREIGN_REGION_OPTIONS]
+    foreign_targets = [target for target in targets if target in PGY_FOREIGN_REGION_OPTIONS]
+
+    if china_targets:
+        _click_cascade_option(page, popover, "全部", column_index=0, checkbox=True)
+        _click_cascade_option(page, popover, "全部", column_index=0)
+        if _click_cascade_option(page, popover, "中国", column_index=0, checkbox=True):
+            for target in china_targets:
+                clicked = False
+                candidates = [target]
+                if target in {"广州", "深圳"}:
+                    candidates = ["广东", target]
+                for candidate in candidates:
+                    if _click_cascade_option(page, popover, candidate, column_index=1, checkbox=True):
+                        clicked = True
+                        break
+                    if _click_cascade_option(page, popover, candidate, column_index=2, checkbox=True):
+                        clicked = True
+                        break
+                if clicked:
+                    selected.append(target)
+                else:
+                    failed.append(target)
+        else:
+            failed.extend(china_targets)
+
+    for target in foreign_targets:
+        if _click_cascade_option(page, popover, target, column_index=0, checkbox=True):
+            selected.append(target)
+        else:
+            failed.append(target)
+
+    _click_popover_confirm(page, popover)
+    if selected:
+        suffix = f"；未找到：{'、'.join(failed)}" if failed else ""
+        return True, f"已选择地域：{'、'.join(selected)}{suffix}"
+    return False, f"地域弹层内未找到匹配选项：{'、'.join(failed or targets)}"
 
 
 def _visible_popovers(page: Any, selector: str = ".d-popover, .filter-select-popover") -> list[Any]:
@@ -3981,6 +4294,12 @@ def _apply_popover_filter_item(page: Any, item: dict[str, Any]) -> tuple[bool, s
     field = item.get("field") or ""
     value = str(item.get("value") or "")
     control_type = item.get("control_type") or ""
+    if control_type in {"marketing_goal_metric"}:
+        parent = _marketing_goal_parent(item)
+        applied, skipped = _apply_marketing_goal_group(page, parent, [item])
+        if applied:
+            return True, applied[-1].get("message") or "已选择营销目标指标"
+        return False, (skipped[-1].get("message") if skipped else "营销目标筛选失败，已保留在采集计划中")
     if control_type in {"text_multi_with_exclude", "searchable_multi_select_with_exclude"}:
         popover, message = _open_filter_popover(page, field)
         if popover is None:
@@ -4015,6 +4334,8 @@ def _apply_popover_filter_item(page: Any, item: dict[str, Any]) -> tuple[bool, s
     if control_type in {"range_select_pair", "number_range", "preset_or_number_range", "preset_or_percent_range"}:
         return _apply_preset_or_number_range(page, item)
     if control_type in {"cascade_checkbox_popover", "three_level_cascade_checkbox_popover"}:
+        if field in {"地域", "粉丝地域"}:
+            return _apply_region_cascade(page, item)
         return False, "该条件需要区间/子筛选/级联细分，已保留在采集计划中"
     return False, ""
 
@@ -4345,7 +4666,21 @@ def _ensure_display_metrics(page: Any, metrics: list[str]) -> dict[str, list[dic
 def apply_collection_plan(page: Any, plan: dict[str, Any]) -> dict[str, Any]:
     applied: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
+    grouped_marketing_goals: dict[str, list[dict[str, Any]]] = {}
+    regular_filters: list[dict[str, Any]] = []
     for item in plan.get("filters") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("field") or "") == "营销目标" or str(item.get("control_type") or "") == "marketing_goal_metric":
+            parent = _marketing_goal_parent(item)
+            grouped_marketing_goals.setdefault(parent, []).append(item)
+        else:
+            regular_filters.append(item)
+    for parent, items in grouped_marketing_goals.items():
+        group_applied, group_skipped = _apply_marketing_goal_group(page, parent, items)
+        applied.extend(group_applied)
+        skipped.extend(group_skipped)
+    for item in regular_filters:
         success, message = _apply_filter_item(page, item)
         if success:
             applied.append({**item, "message": message})
