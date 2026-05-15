@@ -387,7 +387,7 @@ export function PgyFilterPopover({ meta, filters = [], anchorEl, initialSubField
         <div className="pgy-find-draft-values">
           {draftItems.map(item => (
             <button key={draftKey(item)} type="button" onClick={() => setDraftItems(old => old.filter(next => draftKey(next) !== draftKey(item)))}>
-              {isRegionCascade && item.country && item.country !== item.value ? `${item.country}：` : item.subField ? `${item.subField}：` : ''}{item.value}
+              {isRegionCascade && item.country && item.country !== item.value ? `${item.country}-` : item.subField ? `${item.subField}：` : ''}{item.value}
               <X size={12} />
             </button>
           ))}

@@ -45,10 +45,19 @@ export const HARD_FILTER_CONDITIONS_BY_KIND = {
 export const DEFAULT_HARD_FILTER_CONDITIONS = ['匹配', '包含', '必须存在'];
 
 export const hardFilterKey = (item) => `${item.field || ''}|${item.condition || ''}|${item.value || ''}|${item.subField || item.sub_field || ''}`;
-export const pgyFilterKey = (item) => `${item.field || ''}|${item.value || ''}|${item.sub_field || item.subField || ''}`;
+export const pgyFilterKey = (item) => `${item.field || ''}|${item.value || ''}|${item.sub_field || item.subField || ''}|${item.country || ''}|${item.province || ''}|${item.city || ''}`;
 export const metricKey = (item) => String(item?.value || item || '');
 export const hardFilterLabel = (item) => item.label || `${item.field}${item.condition ? ` ${item.condition}` : ''}${item.value ? ` ${item.value}` : ''}`;
-export const pgyFilterLabel = (item) => item.label || `${item.field}：${item.value}`;
+export const pgyFilterLabel = (item) => {
+  if (['地域', '粉丝地域'].includes(item.field) && item.country) {
+    const detail = item.city || item.province || item.value;
+    return detail && detail !== item.country ? `${item.field}：${item.country}-${detail}` : `${item.field}：${item.country}`;
+  }
+  if (item.field === '营销目标' && (item.goal || item.parent_value || item.parentValue)) {
+    return `${item.field}：${item.goal || item.parent_value || item.parentValue}-${item.value}`;
+  }
+  return item.label || `${item.field}：${item.value}`;
+};
 export const PGY_REQUIRED_FILTER_FIELDS = new Set(['博主类目', '粉丝量', '粉丝年龄', '合作报价']);
 export const PGY_ADDITIONAL_FILTER_FIELDS = new Set(['预估阅读单价', '预估互动单价', '阅读中位数', '互动中位数', '曝光中位数', '常规剔除', '粉丝地域']);
 export const DEFAULT_COLLECTION_HARD_FILTER_FIELDS = new Set(['博主类目', '粉丝量', '粉丝年龄', '合作报价']);

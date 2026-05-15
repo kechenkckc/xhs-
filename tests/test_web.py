@@ -807,16 +807,20 @@ def test_build_collection_plan_uses_marketing_goal_metric_shape_and_strict_regio
     assert "地域" not in [item["field"] for item in weak_filters]
 
     strict = build_collection_plan("地域要求：北京、上海 IP 优先，教育达人", {})
-    assert any(item["field"] == "地域" for item in strict["filters"])
-    assert next(item for item in strict["filters"] if item["field"] == "地域")["control_type"] == "three_level_cascade_checkbox_popover"
+    region_filters = [item for item in strict["filters"] if item["field"] == "地域"]
+    assert [item["value"] for item in region_filters] == ["北京", "上海"]
+    assert [item["country"] for item in region_filters] == ["中国", "中国"]
+    assert region_filters[0]["control_type"] == "three_level_cascade_checkbox_popover"
 
 
 def test_region_targets_parse_china_and_foreign_values():
-    from rpa_mcp_sync.pgy_browser import _region_targets_from_item
+    from rpa_mcp_sync.pgy_browser import _normalize_pgy_filters, _region_targets_from_item
 
     assert _region_targets_from_item({"field": "地域", "value": "北京/上海优先"}) == ["北京", "上海"]
     assert _region_targets_from_item({"field": "地域", "value": "地域要求：中国、美国、日本"}) == ["美国", "日本"]
     assert _region_targets_from_item({"field": "地域", "value": "北上广深"}) == ["北京", "上海", "广州", "深圳"]
+    normalized = _normalize_pgy_filters([{"field": "地域", "value": "北京/上海优先"}])
+    assert [(item["country"], item["value"]) for item in normalized] == [("中国", "北京"), ("中国", "上海")]
 
 
 def test_scheme_plan_preserves_multiple_category_filters():

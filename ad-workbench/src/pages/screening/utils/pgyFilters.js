@@ -151,10 +151,57 @@ export function normalizePgyFilterItem(item = {}) {
   return base;
 }
 
+const PGY_REGION_ALIAS_VALUES = {
+  '北京/上海优先': ['北京', '上海'],
+  '北京上海优先': ['北京', '上海'],
+  北上广深: ['北京', '上海', '广州', '深圳'],
+  一线: ['北京', '上海', '广州', '深圳'],
+  一线城市: ['北京', '上海', '广州', '深圳'],
+};
+
+const REGION_PROVINCE_BY_CITY = {
+  北京: '北京',
+  上海: '上海',
+  广州: '广东',
+  深圳: '广东',
+};
+
+function standardRegionItem(item = {}, value) {
+  const clean = String(value || item.city || item.province || item.value || '')
+    .replace(/^中国[：:-]/, '')
+    .trim();
+  const province = item.province || REGION_PROVINCE_BY_CITY[clean] || clean;
+  return {
+    ...item,
+    field: item.field,
+    value: clean,
+    country: item.country || '中国',
+    province,
+    ...(item.city ? { city: item.city } : {}),
+    level: item.level || 'province',
+    control_type: 'three_level_cascade_checkbox_popover',
+    label: '',
+  };
+}
+
+function expandPgyRegionFilterItem(item = {}) {
+  if (!['地域', '粉丝地域'].includes(item.field)) return [normalizePgyFilterItem(item)];
+  const value = String(item.value || '');
+  if (item.country && value) return [standardRegionItem(normalizePgyFilterItem(item), value)];
+  const aliasValues = PGY_REGION_ALIAS_VALUES[value] || PGY_REGION_ALIAS_VALUES[value.replace(/\s+/g, '')];
+  if (aliasValues?.length) {
+    return aliasValues.map(region => standardRegionItem(normalizePgyFilterItem(item), region));
+  }
+  if (/^中国[：:-]/.test(value)) {
+    return [standardRegionItem(normalizePgyFilterItem(item), value)];
+  }
+  return [normalizePgyFilterItem(item)];
+}
+
 export function normalizePgyFilters(filters = []) {
   const expanded = [];
   filters.forEach(item => {
-    expanded.push(normalizePgyFilterItem(item));
+    expanded.push(...expandPgyRegionFilterItem(item));
     if (item.field === '数据表现' && ['预估阅读/互动单价', 'CPC<2/CPE<20'].includes(item.value)) {
       expanded.push({
         field: '预估互动单价',

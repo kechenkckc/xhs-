@@ -15,10 +15,12 @@ import {
   getPgyFilterMeta,
   getPgySelectedItems,
   makePgyFilterItem,
+  normalizePgyFilters,
   pgyFilterKey,
   replacePgyFieldFilters,
   togglePgyCollectionFilter,
 } from '../../utils/pgyFilters';
+import { pgyFilterLabel } from '../../constants/screeningConstants';
 import { PGY_FIND_BLOGGER_FILTER_GROUPS } from '../../constants/pgyConstants';
 import { PgyFilterPopover } from './PgyFilterPopover';
 
@@ -26,23 +28,24 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
   const [openField, setOpenField] = useState(null);
   const [openAnchor, setOpenAnchor] = useState(null);
 
-  const selectedKeys = useMemo(() => new Set((filters || []).map(pgyFilterKey)), [filters]);
-  const selectedItems = useMemo(() => filters || [], [filters]);
+  const panelFilters = useMemo(() => normalizePgyFilters(filters || []), [filters]);
+  const selectedKeys = useMemo(() => new Set(panelFilters.map(pgyFilterKey)), [panelFilters]);
+  const selectedItems = useMemo(() => panelFilters, [panelFilters]);
 
   const renderFieldButton = (field, label = field, options = {}) => {
     const meta = getPgyFilterMeta(field);
     if (!meta) return renderMutedToken(label, field);
-    const selectedItems = getPgySelectedItems(filters, field)
+    const selectedItems = getPgySelectedItems(panelFilters, field)
       .filter(item => !options.subField || [item.goal, item.parent_value, item.parentValue, item.sub_field, item.subField].includes(options.subField));
     const active = selectedItems.length > 0;
-    const displayValue = active ? selectedItems.slice(0, 2).map(item => item.value).join('、') : '';
+    const displayValue = active ? selectedItems.slice(0, 2).map(item => pgyFilterLabel(item).replace(`${item.field}：`, '')).join('、') : '';
     const fieldKey = `${field}|${options.subField || ''}`;
     return (
       <span key={fieldKey} className="pgy-find-filter-popover-wrap">
         <button
           type="button"
           className={`pgy-find-filter-token has-chevron ${active ? 'is-active' : ''}`}
-          title={active ? selectedItems.map(item => item.value).join('、') : label}
+          title={active ? selectedItems.map(item => pgyFilterLabel(item)).join('、') : label}
           onClick={(event) => {
             const nextField = openField === fieldKey ? null : fieldKey;
             setOpenField(nextField);
@@ -55,11 +58,11 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
         {openField === fieldKey && (
           <PgyFilterPopover
             meta={meta}
-            filters={filters}
+            filters={panelFilters}
             anchorEl={openAnchor}
             initialSubField={options.subField || ''}
-            onApply={(nextItems) => onChange?.(replacePgyFieldFilters(filters, meta, nextItems))}
-            onClear={() => onChange?.((filters || []).filter(item => item.field !== meta.field))}
+            onApply={(nextItems) => onChange?.(replacePgyFieldFilters(panelFilters, meta, nextItems))}
+            onClear={() => onChange?.(panelFilters.filter(item => item.field !== meta.field))}
             onClose={() => {
               setOpenField(null);
               setOpenAnchor(null);
@@ -91,14 +94,14 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
     if (row.kind === 'tags') {
       const meta = getPgyFilterMeta(row.field);
       const values = row.values || meta?.options || [];
-      const selectedFieldItems = getPgySelectedItems(filters, row.field);
+      const selectedFieldItems = getPgySelectedItems(panelFilters, row.field);
       return (
         <>
           {row.showAll && (
             <button
               type="button"
               className={`pgy-find-filter-token is-all ${selectedFieldItems.length ? '' : 'is-active'}`}
-              onClick={() => meta && onChange?.((filters || []).filter(item => item.field !== row.field))}
+              onClick={() => meta && onChange?.(panelFilters.filter(item => item.field !== row.field))}
             >
               全部
             </button>
@@ -110,7 +113,7 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
                 key={`${row.field}-${value}`}
                 type="button"
                 className={`pgy-find-filter-token ${selected ? 'is-active' : ''}`}
-                onClick={() => meta && onChange?.(togglePgyCollectionFilter(filters, meta, value))}
+                onClick={() => meta && onChange?.(togglePgyCollectionFilter(panelFilters, meta, value))}
               >
                 {row.newValues?.includes(value) && <span className="pgy-find-new-badge">新</span>}
                 <span>{value}</span>
@@ -140,7 +143,7 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
                 <input
                   type="checkbox"
                   checked={checked}
-                  onChange={() => meta && onChange?.(togglePgyCollectionFilter(filters, meta, value))}
+                  onChange={() => meta && onChange?.(togglePgyCollectionFilter(panelFilters, meta, value))}
                 />
                 <span>{value}</span>
               </label>
@@ -163,9 +166,9 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
               <button
                 key={pgyFilterKey(item)}
                 type="button"
-                onClick={() => onChange?.((filters || []).filter(next => pgyFilterKey(next) !== pgyFilterKey(item)))}
+                onClick={() => onChange?.(panelFilters.filter(next => pgyFilterKey(next) !== pgyFilterKey(item)))}
               >
-                {item.field}：{item.value}
+                {pgyFilterLabel(item)}
                 <X size={12} />
               </button>
             ))}

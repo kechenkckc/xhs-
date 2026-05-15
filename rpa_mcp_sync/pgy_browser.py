@@ -1900,6 +1900,13 @@ def _hard_filters_to_pgy_filters(hard_filters: list[dict[str, Any]]) -> list[dic
                 for part in [part.strip() for part in re.split(r"[、,，/]+", value) if part.strip()]:
                     add(pgy_field, part, reason, control_type="preset_or_number_range")
                 continue
+            if pgy_field in {"地域", "粉丝地域"}:
+                region_items = _standard_region_filter_items({"field": pgy_field, "value": value, "reason": reason, "control_type": "three_level_cascade_checkbox_popover"})
+                if region_items:
+                    filters.extend(region_items)
+                else:
+                    add(pgy_field, value, reason, control_type="three_level_cascade_checkbox_popover")
+                continue
             add(pgy_field, value, reason, control_type=value_control or "checkbox_popover")
             continue
         if pgy_field in {"合作报价", "预估阅读单价", "预估互动单价", "阅读中位数", "互动中位数", "曝光中位数"} and value:
@@ -1934,7 +1941,11 @@ def _hard_filters_to_pgy_filters(hard_filters: list[dict[str, Any]]) -> list[dic
         if any(keyword in text for keyword in ["孩子年级", "小升初", "初中", "高中", "大孩"]):
             add("内容场景", "小升初/初中/高中", reason)
         if _brief_emphasizes_region(f"{field} {value}"):
-            add("地域", value or "北京/上海优先", reason, control_type="three_level_cascade_checkbox_popover")
+            region_items = _standard_region_filter_items({"field": "地域", "value": value or "北京/上海优先", "reason": reason, "control_type": "three_level_cascade_checkbox_popover"})
+            if region_items:
+                filters.extend(region_items)
+            else:
+                add("地域", value or "北京/上海优先", reason, control_type="three_level_cascade_checkbox_popover")
         if any(keyword in text for keyword in ["限流", "违规", "流量稳定", "异常"]):
             add("常规剔除", "剔除低活博主", reason, control_type="checkbox")
             add("常规剔除", "剔除掉粉博主", reason, control_type="checkbox")
@@ -2008,16 +2019,71 @@ def _normalize_pgy_filter_item(item: dict[str, Any]) -> dict[str, Any]:
         return {**normalized, "control_type": normalized.get("control_type") or "preset_or_number_range"}
     if field == "粉丝年龄":
         return {**normalized, "control_type": normalized.get("control_type") or "dropdown"}
-    if field == "地域" and "优先" in value:
+    if field in {"地域", "粉丝地域"}:
         return {**normalized, "control_type": "three_level_cascade_checkbox_popover"}
     if field == "常规剔除" and value in {"低风险/流量稳定", "规避限流异常", "流量稳定"}:
         return {**normalized, "value": "剔除低活博主", "control_type": "checkbox"}
     return normalized
 
 
+def _standard_region_filter_items(item: dict[str, Any]) -> list[dict[str, Any]]:
+    field = str(item.get("field") or "")
+    if field not in {"地域", "粉丝地域"}:
+        return []
+    raw_value = str(item.get("value") or "").strip()
+    targets: list[str] = []
+    if raw_value in PGY_REGION_ALIASES:
+        targets.extend(PGY_REGION_ALIASES[raw_value])
+    elif raw_value.replace(" ", "") in PGY_REGION_ALIASES:
+        targets.extend(PGY_REGION_ALIASES[raw_value.replace(" ", "")])
+    elif raw_value.startswith(("中国：", "中国:", "中国-")):
+        targets.append(re.sub(r"^中国[：:-]", "", raw_value).strip())
+    elif any(sep in raw_value for sep in ["、", ",", "，", "/", "|", "｜"]):
+        for part in re.split(r"[、,，/|｜\s]+", raw_value):
+            clean = part.strip(" ：:;；。优先重点必须地域要求地区城市IPip")
+            if clean in PGY_REGION_ALIASES:
+                targets.extend(PGY_REGION_ALIASES[clean])
+            elif clean in PGY_FOREIGN_REGION_OPTIONS or clean in PGY_CHINA_REGION_OPTIONS or clean in {"广州", "深圳"}:
+                targets.append(clean)
+    elif raw_value and raw_value not in {"中国", "国内", "全国", "不限"}:
+        targets.append(raw_value)
+    for key in ("city", "province", "country"):
+        value = str(item.get(key) or "").strip()
+        if value and value not in {"中国", "国内", "全国", "不限"}:
+            targets.append(value)
+    result: list[dict[str, Any]] = []
+    for target in dict.fromkeys([value for value in targets if value]):
+        country = "中国"
+        province = str(item.get("province") or "")
+        city = str(item.get("city") or "")
+        level = str(item.get("level") or "province")
+        if target in PGY_FOREIGN_REGION_OPTIONS:
+            country, province, city, level = target, "", "", "country"
+        else:
+            province = province or {"广州": "广东", "深圳": "广东"}.get(target, target)
+        result.append(
+            {
+                **item,
+                "field": field,
+                "value": target,
+                "country": country,
+                "province": province,
+                **({"city": city} if city else {}),
+                "level": level,
+                "control_type": "three_level_cascade_checkbox_popover",
+                "label": "",
+            }
+        )
+    return result
+
+
 def _normalize_pgy_filters(filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for item in filters or []:
+        region_items = _standard_region_filter_items(item)
+        if region_items:
+            normalized.extend(region_items)
+            continue
         current = _normalize_pgy_filter_item(item)
         normalized.append(current)
         original_field = str(item.get("field") or "")
@@ -2109,7 +2175,8 @@ def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None
         add("特色背景", "备考经验", "Brief 命中特色背景", control_type="checkbox_popover")
 
     if _brief_emphasizes_region(brief):
-        add("地域", "北京/上海优先", "Brief 明确强调地域/IP/城市要求", control_type="three_level_cascade_checkbox_popover")
+        add("地域", "北京", "Brief 明确强调地域/IP/城市要求", control_type="three_level_cascade_checkbox_popover", country="中国", province="北京", level="province")
+        add("地域", "上海", "Brief 明确强调地域/IP/城市要求", control_type="three_level_cascade_checkbox_popover", country="中国", province="上海", level="province")
     if any(keyword in text for keyword in ["35岁", "35 岁", "34岁", "家长", "父母"]):
         add("粉丝年龄", "35～44 占比高", "Brief 要求家长/35岁以上粉丝", control_type="dropdown")
     if any(keyword in text for keyword in ["cpe", "cpc", "阅读单价", "互动单价"]):
