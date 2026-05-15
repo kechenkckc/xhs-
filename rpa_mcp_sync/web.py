@@ -1295,6 +1295,8 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
             "hardFilters 是评分/入库硬性规则，不要简单等同于蒲公英页面已勾选条件",
             "蒲公英 schemes 至少输出 3 套，分别覆盖不同达人来源或人群角度；每套 required_filters 必须且只包含：博主类目、粉丝量、粉丝年龄、合作报价",
             "博主类目可多选；例如 Brief 同时命中母婴和教育时，required_filters 中可以同时保留两条博主类目条件，也可以单独只保留其中一个方案类目",
+            "一般不要选择笔记类目，只选择博主类目即可；笔记类目不是博主类目，不能用汽车/游戏/母婴/美妆等笔记类目去替代或追加到博主类目",
+            "笔记类目在蒲公英真实页面是父级类目下继续展开的二级/三级弹层；除非用户明确要求按笔记内容类目筛选，否则 pgyCollectionPlan 不要输出 笔记类目/内容题材",
             "营销目标是低优先级附加条件，只能放入 additional_filters 或用户手动 filters，不能放入 required_filters；字段结构要用父子指标，如 {field:'营销目标', value:'互动表现', goal:'种草', parent_value:'种草', control_type:'marketing_goal_metric'}",
             "地域/粉丝地域只有 Brief 明确强调地域、IP、城市优先/必须/重点覆盖时才放入筛选条件；仅出现城市案例或品牌叙事时不要自动加入地域",
             "不要在 required_filters 或自动 filters 中加入 家庭身份、职业身份、特色背景、母婴阶段、行业推荐博主、近期合作品牌、按博主粉丝推荐；这些低频项只有用户在前端手动添加时才允许进入 filters",
@@ -2195,7 +2197,7 @@ PGY_DEFAULT_BASE_FILTERS = {
 
 PGY_BASE_FILTER_FIELDS = {"博主类目", "粉丝量", "粉丝年龄", "合作报价"}
 PGY_EXTRA_FILTER_FIELDS = {"预估阅读单价", "预估互动单价", "阅读中位数", "互动中位数", "曝光中位数", "常规剔除", "粉丝地域"}
-PGY_MANUAL_ONLY_FILTER_FIELDS = {"职业身份", "特色背景", "家庭身份", "母婴阶段", "行业推荐博主", "平台推荐", "近期合作品牌", "按博主粉丝推荐"}
+PGY_MANUAL_ONLY_FILTER_FIELDS = {"职业身份", "特色背景", "家庭身份", "母婴阶段", "行业推荐博主", "平台推荐", "近期合作品牌", "按博主粉丝推荐", "笔记类目", "内容题材"}
 PGY_MANUAL_FLAGS = {"manual", "manual_added", "user_added", "frontend_added"}
 
 

@@ -839,6 +839,29 @@ def test_scheme_plan_preserves_multiple_category_filters():
     assert [item["value"] for item in required if item["field"] == "博主类目"] == ["教育", "母婴"]
 
 
+def test_scheme_plan_does_not_treat_note_category_as_blogger_category():
+    from rpa_mcp_sync.web import _scheme_plan
+
+    screening_plan = {"pgyCollectionPlan": {"filters": []}}
+    scheme = {
+        "filters": [
+            {"field": "博主类目", "value": "教育"},
+            {"field": "笔记类目", "value": "母婴"},
+            {"field": "内容题材", "value": "婴童洗护"},
+            {"field": "粉丝量", "value": "1万～10万"},
+            {"field": "粉丝年龄", "value": "35～44 占比高"},
+            {"field": "合作报价", "value": "图文笔记：0.1万～2万"},
+        ],
+    }
+
+    plan = _scheme_plan(screening_plan, scheme)
+    filters = plan["pgyCollectionPlan"]["filters"]
+
+    assert [item["value"] for item in filters if item["field"] == "博主类目"] == ["教育"]
+    assert "笔记类目" not in [item["field"] for item in filters]
+    assert "内容题材" not in [item["field"] for item in filters]
+
+
 def test_hard_filters_parse_multi_choice_text_rules(monkeypatch):
     project_id = "pytest_collect_multi_text_rules"
     plan = {

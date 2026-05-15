@@ -179,7 +179,6 @@ export const PGY_FIND_BLOGGER_FILTER_GROUPS = [
       { label: '博主人设', kind: 'fields', fields: ['家庭身份', '职业身份', '特色背景'] },
       { label: '博主信息', kind: 'fields', fields: ['二十大人群', '性别', '地域', '行业特色画像', '预估消费行为', '签约情况', '擅长内容', '内容题材'] },
       { label: '粉丝画像', kind: 'fields', fields: ['粉丝量', '粉丝年龄', '粉丝性别', '粉丝地域', '婚恋状态', '消费水平', '母婴阶段', '手机价格', '手机品牌'] },
-      { label: '笔记类目', kind: 'tags', field: '博主类目', values: ['汽车', '游戏', '母婴', '美妆'], newValues: ['汽车', '游戏', '母婴'] },
     ],
   },
   {
