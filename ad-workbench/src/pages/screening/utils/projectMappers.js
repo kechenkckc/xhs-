@@ -49,7 +49,8 @@ export function mapBackendProject(item, creators = [], feishuConfig = null) {
       fieldMapping: base.feishuBinding.fieldMapping,
     },
     stats: {
-      total: item.creator_pool_count || creators.length,
+      total: item.screening_candidate_count ?? item.creator_pool_count ?? creators.length,
+      pool: item.creator_pool_count || 0,
       passed: item.qualified_creator_count || 0,
       ratio: item.qualified_ratio || 0,
     },

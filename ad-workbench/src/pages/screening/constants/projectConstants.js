@@ -20,7 +20,7 @@ export const initialProjects = [
         { field: '平台报价', condition: '<=', value: '¥20,000', required: true },
         { field: '蒲公英链接', condition: '必须存在', value: '', required: true },
       ],
-      scoringWeights: { budget: 20, fans: 20, cpe: 15, engagement: 15, persona: 20, content: 10 },
+      scoringWeights: { budget: 15, fans: 5, cpe: 20, engagement: 30, persona: 20, content: 10 },
     },
     feishuBinding: {
       linked: true, tableUrl: 'https://example.feishu.cn/base/abc123', tableName: '有道答疑笔达人池',
@@ -46,7 +46,7 @@ export const initialProjects = [
       projectId: 'ai_course_q2', projectName: 'AI课程推广Q2', template: 'AI课程',
       description: '推广AI编程课程，面向6-12岁学生家长。需要科技教育类达人，有编程或STEM教育背景优先。'
     },
-    screeningPlan: { briefType: 'simple', hardFilters: [], scoringWeights: { budget: 25, fans: 15, cpe: 20, engagement: 15, persona: 15, content: 10 } },
+    screeningPlan: { briefType: 'simple', hardFilters: [], scoringWeights: { budget: 15, fans: 5, cpe: 20, engagement: 30, persona: 20, content: 10 } },
     feishuBinding: { linked: true, tableUrl: 'https://example.feishu.cn/base/def456', tableName: 'AI课程Q2达人', baseToken: 'def456', tableId: 'tbl002', viewId: 'vew002', fieldMapping: [] },
   },
   {

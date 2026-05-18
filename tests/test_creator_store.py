@@ -425,6 +425,34 @@ def test_creator_pool_stage_history_and_csv_export():
     assert "池化测试达人" in csv_path.read_text(encoding="utf-8-sig")
 
 
+def test_scored_collected_creators_stay_in_screening_until_reviewed():
+    project_id = f"pytest_screening_gate_{uuid.uuid4().hex[:8]}"
+    creator = upsert_creator(
+        project_id,
+        {
+            "creator_id": f"{project_id}-001",
+            "nickname": "待筛选候选达人",
+            "pgy_url": "https://pgy.xiaohongshu.com/creator/screening-gate-001",
+            "quote_price": 6800,
+            "fans_35_plus_ratio": 0.48,
+            "followers_count": 86000,
+            "source": "pgy",
+        },
+        score=False,
+    )
+
+    scored = score_project(project_id, creator_ids=[creator["creator_id"]], use_llm=False, trigger_source="pgy_collect")
+    assert scored["scored"] == 1
+    pool = creator_pool(project_id)
+    assert any(item["creator_id"] == creator["creator_id"] for item in pool["groups"]["筛选工作台"])
+    assert not any(item["creator_id"] == creator["creator_id"] for item in pool["groups"]["待建联达人"])
+    assert not any(item["creator_id"] == creator["creator_id"] for item in pool["groups"]["合格达人待合作"])
+
+    review_creator(project_id, creator["creator_id"], "已通过", "人工确认入池", "pytest")
+    reviewed_pool = creator_pool(project_id)
+    assert any(item["creator_id"] == creator["creator_id"] for item in reviewed_pool["groups"]["合格达人待合作"])
+
+
 def test_test_stage_scores_sample_creator_pool():
     project_id = "pytest_sample_pool"
     imported = 0

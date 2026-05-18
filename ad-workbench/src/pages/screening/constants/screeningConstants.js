@@ -32,8 +32,8 @@ export const HARD_FILTER_OPTIONS = [
   { field: '阅读中位数', condition: '>=', value: '0.5万～1万', required: false, feishuField: '阅读中位数（日常）', label: '蒲公英：阅读中位数', valueControl: 'range', presets: PGY_NOTE_COUNT_RANGE_OPTIONS, pgyField: '阅读中位数' },
   { field: '互动中位数', condition: '>=', value: '500～1000', required: false, feishuField: '互动中位数（日常）', label: '蒲公英：互动中位数', valueControl: 'range', presets: PGY_INTERACTION_RANGE_OPTIONS, pgyField: '互动中位数' },
   { field: '曝光中位数', condition: '>=', value: '1万～5万', required: false, feishuField: '曝光中位数（日常）', label: '蒲公英：曝光中位数', valueControl: 'range', presets: PGY_NOTE_COUNT_RANGE_OPTIONS, pgyField: '曝光中位数' },
-  { field: '蒲公英链接', condition: '必须存在', value: '', required: true, feishuField: '蒲公英链接', label: '入库：必须有蒲公英链接', valueControl: 'none' },
-  { field: '限流风险', condition: '规避', value: '疑似限流、异常流量', required: false, feishuField: '品牌备注', label: '入库：规避限流/异常流量', valueControl: 'multi', options: ['疑似限流', '异常流量', '违规', '低活博主', '掉粉博主'] },
+  { field: '详情页证据', condition: '完善', value: '用于人设/内容分析，不作为硬性淘汰', required: false, feishuField: '蒲公英链接', label: '评分：详情页证据完善', valueControl: 'none' },
+  { field: '限流风险', condition: '规避', value: '疑似限流、异常流量', required: false, feishuField: '品牌备注', label: '评分：规避限流/异常流量', valueControl: 'multi', options: ['疑似限流', '异常流量', '违规', '低活博主', '掉粉博主'] },
 ];
 
 export const HARD_FILTER_CONDITIONS_BY_KIND = {
@@ -45,7 +45,7 @@ export const HARD_FILTER_CONDITIONS_BY_KIND = {
 export const DEFAULT_HARD_FILTER_CONDITIONS = ['匹配', '包含', '必须存在'];
 
 export const hardFilterKey = (item) => `${item.field || ''}|${item.condition || ''}|${item.value || ''}|${item.subField || item.sub_field || ''}`;
-export const pgyFilterKey = (item) => `${item.field || ''}|${item.value || ''}|${item.sub_field || item.subField || ''}|${item.country || ''}|${item.province || ''}|${item.city || ''}`;
+export const pgyFilterKey = (item) => `${item.field || ''}|${item.value || ''}|${item.sub_value || item.subValue || ''}|${item.sub_field || item.subField || ''}|${item.country || ''}|${item.province || ''}|${item.city || ''}`;
 export const metricKey = (item) => String(item?.value || item || '');
 export const hardFilterLabel = (item) => item.label || `${item.field}${item.condition ? ` ${item.condition}` : ''}${item.value ? ` ${item.value}` : ''}`;
 export const pgyFilterLabel = (item) => {
@@ -56,21 +56,25 @@ export const pgyFilterLabel = (item) => {
   if (item.field === '营销目标' && (item.goal || item.parent_value || item.parentValue)) {
     return `${item.field}：${item.goal || item.parent_value || item.parentValue}-${item.value}`;
   }
+  if (item.field === '博主类目' && (item.sub_value || item.subValue)) {
+    return `${item.field}：${item.value}-${item.sub_value || item.subValue}`;
+  }
   return item.label || `${item.field}：${item.value}`;
 };
 export const PGY_REQUIRED_FILTER_FIELDS = new Set(['博主类目', '粉丝量', '粉丝年龄', '合作报价']);
-export const PGY_ADDITIONAL_FILTER_FIELDS = new Set(['预估阅读单价', '预估互动单价', '阅读中位数', '互动中位数', '曝光中位数', '常规剔除', '粉丝地域']);
+export const PGY_ADDITIONAL_FILTER_FIELDS = new Set(['预估阅读单价', '预估互动单价', '阅读中位数', '互动中位数', '曝光中位数', '常规剔除', '地域', '粉丝地域']);
 export const DEFAULT_COLLECTION_HARD_FILTER_FIELDS = new Set(['博主类目', '粉丝量', '粉丝年龄', '合作报价']);
 export const DEFAULT_SCORING_HARD_FILTER_FIELDS = new Set([
   '合作报价',
   '粉丝年龄',
   '预估阅读单价',
   '预估互动单价',
-  '蒲公英链接',
+  '详情页证据',
   '限流风险',
 ]);
 export const CONTROL_TYPE_LABELS = {
   tag: '标签',
+  tag_select_with_hover_subcategory: '类目/二级类目',
   checkbox: '复选',
   checkbox_popover: '弹层多选',
   brand_search_recommendation: '品牌/竞品推荐',

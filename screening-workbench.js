@@ -23,7 +23,7 @@ async function loadOverview() {
   const project = payload.projects?.find((item) => item.project_id === projectId) || payload.projects?.[0];
   if (!project) return;
   $("#qualified").textContent = project.qualified_creator_count ?? 0;
-  $("#pool").textContent = project.creator_pool_count ?? 0;
+  $("#pool").textContent = project.screening_candidate_count ?? project.creator_pool_count ?? 0;
 }
 
 async function loadFeishuConfig() {

@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS creators_global (
 CREATE TABLE IF NOT EXISTS project_creators (
   project_id TEXT NOT NULL,
   creator_id TEXT NOT NULL,
-  pool_stage TEXT DEFAULT '待建联达人',
+  pool_stage TEXT DEFAULT '筛选工作台',
   review_status TEXT DEFAULT '待补数据',
   review_reason TEXT DEFAULT '',
   reviewer TEXT DEFAULT '',
@@ -434,6 +434,22 @@ CREATE TABLE IF NOT EXISTS scheme_count_memory (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS pgy_filter_whitelist (
+  whitelist_id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  field TEXT NOT NULL,
+  value TEXT NOT NULL,
+  parent_value TEXT DEFAULT '',
+  level INTEGER DEFAULT 1,
+  control_type TEXT DEFAULT '',
+  is_active INTEGER DEFAULT 1,
+  captured_at TEXT DEFAULT '',
+  raw_payload TEXT DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(source, field, value, parent_value)
+);
+
 CREATE TABLE IF NOT EXISTS operation_logs (
   log_id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
@@ -562,7 +578,8 @@ METRIC_FIELDS = [
 ]
 
 PROJECT_STATUSES = {"待补数据", "待审核", "已通过", "备选", "已驳回", "已写回飞书", "待建联", "已邀约", "合作中"}
-POOL_STAGES = ["已合作跟进中", "合格达人待合作", "待建联达人", "观察暂缓"]
+SCREENING_STAGE = "筛选工作台"
+POOL_STAGES = [SCREENING_STAGE, "已合作跟进中", "合格达人待合作", "待建联达人", "观察暂缓"]
 
 MARKET_BENCHMARKS = [
     {"key": "0-3k", "min": 0, "max": 3000, "good_read": 800, "excellent_read": 1200, "quote_good_max": 300, "quote_high_max": 500, "cpm_good_max": 80, "cpc_good_max": 2.0, "cpe_good_max": 20},
@@ -718,7 +735,7 @@ def save_project_writeback_settings(project_id: str, auto_writeback_enabled: boo
             "更新写回设置",
             PROJECT_NAME,
             "系统",
-            "已开启合格达人详情补采后自动写回" if auto_writeback_enabled else "已关闭自动写回，改为手动批量写回",
+            "已开启合格达人详情完善后自动写回" if auto_writeback_enabled else "已关闭自动写回，改为手动批量写回",
             "success",
         )
     return get_project_writeback_settings(project_id)
@@ -961,6 +978,37 @@ def _first_metric(payload: dict[str, Any], *names: str) -> Any:
     return None
 
 
+INVALID_CREATOR_TYPE_PATTERNS = [
+    "获赞",
+    "收藏",
+    "邀约",
+    "合作报价",
+    "一口价",
+    "相似的博主",
+    "查看更多",
+    "粉丝数",
+    "阅读中位数",
+    "互动中位数",
+    "曝光中位数",
+]
+
+
+def sanitize_creator_type(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) > 36:
+        return ""
+    if any(pattern in compact for pattern in INVALID_CREATOR_TYPE_PATTERNS):
+        return ""
+    if re.search(r"[¥￥]", compact):
+        return ""
+    if re.search(r"(?:^|/)\d+(?:\.\d+)?(?:w|W|万|%)?(?:/|$)", compact):
+        return ""
+    return compact
+
+
 def _json_metric(value: Any, default: Any) -> str:
     if isinstance(value, str):
         stripped = value.strip()
@@ -1062,6 +1110,7 @@ def _audience_distribution_payload(payload: dict[str, Any]) -> tuple[dict[str, A
 
 def normalize_creator(payload: dict[str, Any], project_id: str) -> dict[str, Any]:
     age_distribution, gender_distribution = _audience_distribution_payload(payload)
+    creator_type = sanitize_creator_type(payload.get("creator_type") or payload.get("达人类型"))
     return {
         "creator_id": str(payload.get("creator_id") or payload.get("达人ID") or uuid.uuid4()),
         "project_id": project_id,
@@ -1070,7 +1119,7 @@ def normalize_creator(payload: dict[str, Any], project_id: str) -> dict[str, Any
         "pgy_blogger_id": payload.get("pgy_blogger_id") or "",
         "pgy_url": payload.get("pgy_url") or payload.get("蒲公英链接") or "",
         "nickname": payload.get("nickname") or payload.get("达人昵称") or "",
-        "creator_type": payload.get("creator_type") or payload.get("达人类型") or "",
+        "creator_type": creator_type,
         "persona_tags": payload.get("persona_tags") or payload.get("人设标签") or "",
         "ip_city": payload.get("ip_city") or payload.get("IP城市") or "",
         "profile_url": payload.get("profile_url") or "",
@@ -1158,6 +1207,8 @@ def tier_from_score(score: Any) -> str:
 
 
 def stage_from_status(status: str | None, score: Any = None) -> str:
+    if status in {"待补数据", "待审核", "人工复核", None, ""}:
+        return SCREENING_STAGE
     if status in {"已驳回", "默认淘汰"}:
         return "观察暂缓"
     if status in {"已写回飞书", "合作中"}:
@@ -1166,14 +1217,12 @@ def stage_from_status(status: str | None, score: Any = None) -> str:
         return "合格达人待合作"
     if status in {"待建联", "已邀约"}:
         return "待建联达人"
-    number = parse_number(score) or 0
-    if number >= 70:
-        return "待建联达人"
-    return "观察暂缓" if number and number < 70 else "待建联达人"
+    return SCREENING_STAGE
 
 
 def status_from_stage(stage: str) -> str:
     return {
+        SCREENING_STAGE: "待审核",
         "已合作跟进中": "合作中",
         "合格达人待合作": "已通过",
         "待建联达人": "待审核",
@@ -1408,7 +1457,7 @@ def upsert_creator(project_id: str, payload: dict[str, Any], score: bool = True)
                 ts,
             ],
         )
-        log(conn, project_id, "creator", action, creator.get("nickname") or creator_id, "系统", "达人池已去重入库", "success")
+        log(conn, project_id, "creator", action, creator.get("nickname") or creator_id, "系统", "候选达人已进入筛选工作台", "success")
     if score:
         score_creator(project_id, creator_id)
     return get_creator(project_id, creator_id) or {}
@@ -1634,14 +1683,19 @@ def delete_project(project_id: str) -> dict[str, Any]:
 
 def with_project_stats(project: dict[str, Any]) -> dict[str, Any]:
     with connect() as conn:
-        pool = conn.execute("SELECT COUNT(*) AS count FROM project_creators WHERE project_id=?", (project["project_id"],)).fetchone()["count"]
-        if not pool:
-            pool = conn.execute("SELECT COUNT(*) AS count FROM creators WHERE project_id=?", (project["project_id"],)).fetchone()["count"]
+        candidates = conn.execute("SELECT COUNT(*) AS count FROM project_creators WHERE project_id=?", (project["project_id"],)).fetchone()["count"]
+        if not candidates:
+            candidates = conn.execute("SELECT COUNT(*) AS count FROM creators WHERE project_id=?", (project["project_id"],)).fetchone()["count"]
+        pool = conn.execute(
+            "SELECT COUNT(*) AS count FROM project_creators WHERE project_id=? AND pool_stage<>?",
+            (project["project_id"], SCREENING_STAGE),
+        ).fetchone()["count"]
         qualified = conn.execute(
             "SELECT COUNT(*) AS count FROM project_creators WHERE project_id=? AND review_status IN ('已通过','已写回飞书','合作中')",
             (project["project_id"],),
         ).fetchone()["count"]
     target = project.get("target_qualified_creator_count") or 10
+    project["screening_candidate_count"] = candidates
     project["creator_pool_count"] = pool
     project["qualified_creator_count"] = qualified
     project["qualified_ratio"] = qualified / target if target else 0
@@ -1680,6 +1734,8 @@ def list_creators(project_id: str, status: str | None = None, q: str | None = No
     with connect() as conn:
         rows = rows_dict(conn.execute(sql, params).fetchall())
         if rows:
+            for row in rows:
+                row["creator_type"] = sanitize_creator_type(row.get("creator_type"))
             return rows
         legacy_where = ["c.project_id=?"]
         legacy_params: list[Any] = [project_id]
@@ -1702,7 +1758,10 @@ def list_creators(project_id: str, status: str | None = None, q: str | None = No
         WHERE {' AND '.join(legacy_where)}
         ORDER BY COALESCE(s.total_score, 0) DESC, c.updated_at DESC
         """
-        return rows_dict(conn.execute(legacy_sql, legacy_params).fetchall())
+        legacy_rows = rows_dict(conn.execute(legacy_sql, legacy_params).fetchall())
+        for row in legacy_rows:
+            row["creator_type"] = sanitize_creator_type(row.get("creator_type"))
+        return legacy_rows
 
 
 def get_creator(project_id: str, creator_id: str) -> dict[str, Any] | None:
@@ -1873,13 +1932,15 @@ def creator_pool(project_id: str) -> dict[str, Any]:
     for creator in creators:
         stage = creator.get("pool_stage") or stage_from_status(creator.get("status"), creator.get("total_score"))
         if stage not in groups:
-            stage = "待建联达人"
+            stage = SCREENING_STAGE
         groups[stage].append(creator)
     for items in groups.values():
         items.sort(key=lambda item: float(item.get("total_score") or 0), reverse=True)
+    pool_creators = [item for stage, items in groups.items() if stage != SCREENING_STAGE for item in items]
     stats = {
-        "total": len(creators),
-        "avg_score": round(sum(float(item.get("total_score") or 0) for item in creators) / len(creators), 2) if creators else 0,
+        "total": len(pool_creators),
+        "screening": len(groups[SCREENING_STAGE]),
+        "avg_score": round(sum(float(item.get("total_score") or 0) for item in pool_creators) / len(pool_creators), 2) if pool_creators else 0,
         "by_stage": {stage: len(items) for stage, items in groups.items()},
         "qualified": len(groups["已合作跟进中"]) + len(groups["合格达人待合作"]),
     }
@@ -2085,17 +2146,17 @@ def _initial_tier(total_score: Any, hard_pass: bool = True) -> str:
 
 def _detail_collection_priority(total_score: Any, bonus_score: Any, hard_pass: bool = True) -> str:
     if not hard_pass:
-        return "筛选暂缓"
+        return "数据暂缓"
     score = parse_number(total_score) or 0
     bonus = parse_number(bonus_score) or 0
     if score >= 100:
         return "必须补采"
     if score >= 90:
         return "优先补采"
-    if score >= 80 and bonus >= 8:
+    if score >= 80:
         return "高潜补采"
     if score >= 70:
-        return "暂缓补采"
+        return "暂缓观察"
     return "不补采"
 
 
@@ -2110,6 +2171,9 @@ def _recommend_level(total_score: Any, hard_pass: bool = True) -> str:
     if score >= 80:
         return "备选"
     return "不推荐"
+
+
+DETAIL_PRIORITY_HIGH_VALUES = {"必须完善", "优先完善", "高潜完善", "必须补采", "优先补采", "高潜补采"}
 
 
 def _score_bonus(creator: dict[str, Any]) -> tuple[float, list[str]]:
@@ -2332,13 +2396,16 @@ def _efficiency_profile(creator: dict[str, Any], benchmark: dict[str, Any], read
     cpm_good_max = float(benchmark.get("cpm_good_max") or 100)
     cpc_good_max = float(benchmark.get("cpc_good_max") or 2)
     cpe_good_max = float(benchmark.get("cpe_good_max") or 20)
+    followers_missing = parse_number(creator.get("followers_count")) is None
 
     score = 10.0
     reasons: list[str] = []
     good_efficiency = False
     poor_efficiency = False
 
-    if quote is not None:
+    if quote is not None and followers_missing:
+        reasons.append(f"报价{quote:.0f}待结合粉丝T级与效果容量判断")
+    elif quote is not None:
         if quote <= quote_good_max:
             reasons.append(f"报价{quote:.0f}低于量级合理线{quote_good_max:.0f}")
         elif cpm is not None or cpc is not None or cpe is not None:
@@ -2400,6 +2467,47 @@ def _efficiency_profile(creator: dict[str, Any], benchmark: dict[str, Any], read
         "good_efficiency": good_efficiency,
         "poor_efficiency": poor_efficiency,
         "reasons": reasons,
+    }
+
+
+def _budget_effect_profile(creator: dict[str, Any], benchmark: dict[str, Any] | None = None) -> dict[str, Any]:
+    benchmark = benchmark or _scoring_benchmark_for_creator(creator)
+    metrics = _efficiency_metrics(creator)
+    quote = metrics["quote"]
+    cpm = metrics["cpm"] if metrics["cpm"] is not None else metrics["estimated_cpm"]
+    cpc = metrics["cpc"] if metrics["cpc"] is not None else metrics["estimated_cpc"]
+    cpe = metrics["cpe"]
+    estimated_exposure = quote / cpm * 1000 if quote is not None and cpm else None
+    estimated_read = quote / cpc if quote is not None and cpc else None
+    estimated_interaction = quote / cpe if quote is not None and cpe else None
+    return {
+        "quote": quote,
+        "effective_cpm": cpm,
+        "effective_cpc": cpc,
+        "effective_cpe": cpe,
+        "estimated_exposure": round(estimated_exposure, 2) if estimated_exposure is not None else None,
+        "estimated_read": round(estimated_read, 2) if estimated_read is not None else None,
+        "estimated_interaction": round(estimated_interaction, 2) if estimated_interaction is not None else None,
+        "observed_30d_exposure_median": _exposure_reference_from_creator(creator),
+        "observed_30d_read_median": _read_reference_from_creator(creator),
+        "observed_30d_interaction_median": _first_number(
+            creator.get("cooperation_interaction_median"),
+            creator.get("daily_interaction_median"),
+            creator.get("image_daily_interaction_median"),
+            creator.get("video_daily_interaction_median"),
+        ),
+        "tier_benchmark": {
+            "tier_key": benchmark.get("key"),
+            "expected_read": benchmark.get("good_read"),
+            "excellent_read": benchmark.get("excellent_read"),
+            "quote_good_max": benchmark.get("quote_good_max"),
+            "quote_high_max": benchmark.get("quote_high_max"),
+            "cpm_good_max": benchmark.get("cpm_good_max"),
+            "cpc_good_max": benchmark.get("cpc_good_max"),
+            "cpe_good_max": benchmark.get("cpe_good_max"),
+            "source": benchmark.get("source"),
+            "sample_count": benchmark.get("sample_count"),
+        },
     }
 
 
@@ -2550,7 +2658,6 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
     risk = str(creator.get("rate_limit_risk") or "")
     stability = str(creator.get("traffic_stability") or "")
     text = _text_blob(creator)
-    has_pgy = bool(creator.get("pgy_url") and creator.get("pgy_url") != "待填")
     data_profile = _recent_note_data_profile(creator)
     efficiency_profile = _efficiency_profile(creator, data_profile["benchmark"], data_profile.get("median_read") or data_profile.get("avg_read"))
     data_profile["efficiency"] = efficiency_profile
@@ -2564,38 +2671,39 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
         hard_issues.append("存在明确高风险信号")
     hard_pass = not hard_issues
 
-    persona, family, vertical_fit = _verticality_fit(creator)
+    persona_raw, content_raw, vertical_fit = _verticality_fit(creator)
     precision_fans, precise_fans = _precision_fans_fit(creator)
     scale_fit = _follower_scale_fit(creator.get("followers_count"))
-    fans = round((precision_fans * 0.7) + (scale_fit * 0.3), 2)
+    fans = round(((precision_fans * 0.7) + (scale_fit * 0.3)) / 15 * 5, 2)
 
-    traffic = 9 if search is None else 15 if search >= 0.55 else 13 if search >= 0.45 else 11 if search >= 0.4 else 6
-    traffic = max(traffic, round(data_profile["data_score"] / 2, 2))
+    traffic = 18 if search is None else 30 if search >= 0.55 else 26 if search >= 0.45 else 22 if search >= 0.4 else 12
+    traffic = max(traffic, round(data_profile["data_score"], 2))
     if _contains_any(stability, ["稳定", "良好"]):
-        traffic += 1
+        traffic += 2
     if _contains_any(stability, ["波动", "下滑", "异常"]) or _contains_any(risk, ["中风险", "限流"]):
-        traffic -= 4
-    traffic = max(0, min(15, traffic))
+        traffic -= 8
+    traffic = max(0, min(30, traffic))
 
-    efficiency = efficiency_profile["score"]
+    efficiency = round(float(efficiency_profile["score"] or 0) / 12 * 20, 2)
     if cpc is not None:
-        efficiency -= 2 if cpc >= 2 else 0
-        efficiency += 1 if cpc < 1.5 else 0
+        efficiency -= 4 if cpc >= 2 else 0
+        efficiency += 2 if cpc < 1.5 else 0
     if cpe is not None:
-        efficiency -= 3 if cpe >= 20 else 1 if cpe >= 10 else 0
-        efficiency += 1 if cpe < 10 else 0
-    efficiency = max(0, min(10, efficiency))
+        efficiency -= 6 if cpe >= 20 else 2 if cpe >= 10 else 0
+        efficiency += 2 if cpe < 10 else 0
+    cpe_efficiency = max(0, min(20, efficiency))
 
-    execution = 6
-    if has_pgy:
-        execution += 2
+    budget = round(float(efficiency_profile["score"] or 0) / 12 * 15, 2)
     if quote is None or quote <= 20000:
-        execution += 1
+        budget = min(15, budget + 2)
     if _contains_any(text, ["种草", "测评", "好物", "工具", "合作", "开箱", "体验"]):
-        execution += 1
-    execution = max(0, min(10, execution))
+        budget = min(15, budget + 1)
+    budget = max(0, min(15, budget))
 
-    base = round(persona + family + fans + traffic + efficiency + execution, 2)
+    persona = round(persona_raw / 30 * 20, 2)
+    content = round(content_raw / 20 * 10, 2)
+
+    base = round(budget + fans + cpe_efficiency + traffic + persona + content, 2)
     bonus, bonus_reasons = _score_bonus(creator)
     total = round(min(120, base + bonus), 2)
     completeness = _score_information_completeness(creator)
@@ -2605,14 +2713,12 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
     reasons: list[str] = []
     if hard_issues:
         reasons.extend(hard_issues)
-    if not has_pgy:
-        reasons.append("缺少蒲公英链接，暂按已采集信息初评")
     if fans35 is None:
-        reasons.append("粉丝年龄画像待补")
+        reasons.append("粉丝年龄画像未进入本轮数据判断")
     if cpc is None and cpe is None:
-        reasons.append("CPC/CPE待补")
+        reasons.append("CPC/CPE未进入本轮数据判断")
     if search is None:
-        reasons.append("搜索+推荐占比待补")
+        reasons.append("搜索+推荐占比未进入本轮数据判断")
     if efficiency_profile["reasons"]:
         reasons.append(f"效率判断：{'、'.join(efficiency_profile['reasons'][:4])}")
     if data_profile["source"]:
@@ -2625,7 +2731,7 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
             reads.append(f"最高阅读{data_profile['max_read']:.0f}")
         reasons.append(f"近期/合作数据：{'、'.join(reads)}，达标线{data_profile['expected_read']:.0f}")
     else:
-        reasons.append("近期笔记阅读数据待补")
+        reasons.append("近30天阅读数据未进入本轮数据判断")
 
     combination_match = any(
         [
@@ -2637,6 +2743,9 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
     if combination_match:
         reasons.append("高分依据：最近笔记数据+粉丝量/内容垂直度/粉丝精准至少一组匹配")
     total = round(_apply_quality_gate(total, data_profile, reasons), 2)
+    if hard_pass and total < 70 and not data_profile["weak_recent_data"] and not efficiency_profile["poor_efficiency"]:
+        total = 70.0
+        reasons.append("未发现已确认硬伤，数据证据不足时按B档观察，不因缺字段直接低分")
     tier = _initial_tier(total, hard_pass)
     priority = _detail_collection_priority(total, bonus, hard_pass)
     if bonus_reasons:
@@ -2652,12 +2761,12 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
         "information_completeness": completeness,
         "initial_tier": tier,
         "detail_collection_priority": priority,
-        "budget_score": efficiency,
+        "budget_score": budget,
         "fans_score": fans,
-        "cpe_score": efficiency,
+        "cpe_score": cpe_efficiency,
         "traffic_score": traffic,
         "persona_score": persona,
-        "content_score": family,
+        "content_score": content,
         "hard_filter_passed": 1 if hard_pass else 0,
         "recommend_level": level,
         "score_reason": "；".join(reasons),
@@ -2702,7 +2811,7 @@ def _project_hard_filter_issues(project_id: str, creator: dict[str, Any]) -> lis
         rule_text = f"{field} {condition} {value}".lower()
         label = " ".join(part for part in [field, condition, value] if part)
         if "蒲公英" in rule_text and not creator.get("pgy_url"):
-            issues.append(f"{label}：缺少蒲公英链接")
+            continue
         if any(keyword in rule_text for keyword in ["报价", "预算", "合作价格", "平台价格"]):
             threshold = _threshold_from_text(value, "quote")
             quote = parse_number(creator.get("quote_price"))
@@ -2781,16 +2890,14 @@ def _default_cooperation_direction(creator: dict[str, Any], recommend_level: str
     tags = f"{creator.get('persona_tags') or ''} {creator.get('topic_point') or ''}"
     level = recommend_level or ""
     if "不推荐" in level:
-        return "暂不合作，补充关键数据后复核"
+        return "暂不进入高优先级，保留明确风险和数据短板"
+    if any(word in tags for word in ["升学", "政策", "规划", "教师", "老师", "高知", "陪读"]):
+        return "高优先级详情完善，重点核验主页简介、笔记标题、文案与长期教育场景"
     if "卖货" in creator_type or any(word in tags for word in ["测评", "教辅", "工具", "答疑"]):
-        return "产品种草/测评转化，突出答疑笔功能场景"
-    if any(word in tags for word in ["升学", "政策", "规划", "教师", "老师"]):
-        return "教育场景深度内容，围绕学习规划和答疑效率"
-    if any(word in tags for word in ["亲子", "家庭", "陪读", "中产", "高知"]):
-        return "亲子家庭场景种草，突出家长陪伴和孩子自主学习"
-    if "曝光" in creator_type:
-        return "品牌曝光合作，优先图文笔记验证自然流量"
-    return "合作笔记试投，验证内容适配度与自然流量效率"
+        return "高优先级详情完善，重点核验内容质量与数据效果是否支撑报价"
+    if any(word in tags for word in ["亲子", "家庭", "妈妈", "家长"]):
+        return "详情完善后判断真实家庭教育场景与内容调性"
+    return "按数据层级进入后续详情完善与内容质量判断"
 
 
 def _extract_cooperation_direction(result: dict[str, Any], creator: dict[str, Any], recommend_level: str) -> str:
@@ -2809,7 +2916,7 @@ def _extract_cooperation_direction(result: dict[str, Any], creator: dict[str, An
 
 def _normalize_llm_score(result: dict[str, Any], fallback: dict[str, Any], creator: dict[str, Any] | None = None) -> dict[str, Any]:
     dimensions = result.get("dimensionScores") or result.get("scores") or {}
-    weights = {"budget": 10, "fans": 15, "cpe": 10, "engagement": 15, "persona": 30, "content": 20}
+    weights = {"budget": 15, "fans": 5, "cpe": 20, "engagement": 30, "persona": 20, "content": 10}
     if dimensions:
         component_scores = {
             "budget_score": _weighted_component(dimensions.get("budget"), weights["budget"]),
@@ -2904,16 +3011,22 @@ def _creator_score_payload(creator: dict[str, Any]) -> dict[str, Any]:
         "natural_cpc": creator.get("natural_cpc"),
         "natural_cpe": creator.get("natural_cpe"),
         "daily_read_median": creator.get("daily_read_median"),
+        "daily_exposure_median": creator.get("daily_exposure_median"),
         "daily_interaction_median": creator.get("daily_interaction_median"),
+        "image_daily_exposure_median": creator.get("image_daily_exposure_median"),
         "image_daily_read_median": creator.get("image_daily_read_median"),
         "image_daily_interaction_median": creator.get("image_daily_interaction_median"),
+        "video_daily_exposure_median": creator.get("video_daily_exposure_median"),
         "video_daily_read_median": creator.get("video_daily_read_median"),
         "video_daily_interaction_median": creator.get("video_daily_interaction_median"),
         "video_completion_rate": creator.get("video_completion_rate"),
+        "cooperation_exposure_median": creator.get("cooperation_exposure_median"),
         "cooperation_read_median": creator.get("cooperation_read_median"),
         "cooperation_interaction_median": creator.get("cooperation_interaction_median"),
+        "image_cpm": creator.get("image_cpm"),
         "image_read_unit_price": creator.get("image_read_unit_price"),
         "image_interaction_unit_price": creator.get("image_interaction_unit_price"),
+        "video_cpm": creator.get("video_cpm"),
         "video_read_unit_price": creator.get("video_read_unit_price"),
         "video_interaction_unit_price": creator.get("video_interaction_unit_price"),
         "liked_collected_count": creator.get("liked_collected_count"),
@@ -2926,6 +3039,7 @@ def _creator_score_payload(creator: dict[str, Any]) -> dict[str, Any]:
         "rate_limit_risk": creator.get("rate_limit_risk"),
         "pgy_url": creator.get("pgy_url"),
         "raw_payload": creator.get("raw_payload"),
+        "machine_data_profile": _budget_effect_profile(creator),
     }
 
 
@@ -2939,16 +3053,30 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
             screening_plan = {}
     if not isinstance(screening_plan, dict):
         screening_plan = {}
+    scoring_criteria = screening_plan.get("scoringCriteria") if isinstance(screening_plan.get("scoringCriteria"), dict) else {}
+    budget_policy = screening_plan.get("budgetPolicy") or scoring_criteria.get("budget_policy") or {}
+    data_layer = screening_plan.get("dataLayerScoring") or scoring_criteria.get("data_layer_scoring") or {}
+    tier_policy = screening_plan.get("tierPolicy") or scoring_criteria.get("tier_policy") or {}
     return {
         "project": {
             "project_id": project_id,
             "project_name": project.get("project_name") or PROJECT_NAME,
             "brief": project.get("brief") or "教育/亲子大孩/高知家庭达人，聚焦有道答疑笔5-6月合作。",
             "target_qualified_creator_count": project.get("target_qualified_creator_count"),
-            "scoringCriteria": screening_plan.get("scoringCriteria") or {},
+            "budgetPolicy": budget_policy,
+            "scoringCriteria": scoring_criteria,
+            "dataLayerScoring": data_layer,
+            "tierPolicy": tier_policy,
             "scoringHardFilters": screening_plan.get("scoringHardFilters") or (screening_plan.get("scoringCriteria") or {}).get("hard_rules") or screening_plan.get("hardFilters") or [],
             "hardFilters": screening_plan.get("scoringHardFilters") or (screening_plan.get("scoringCriteria") or {}).get("hard_rules") or screening_plan.get("hardFilters") or [],
             "scoringWeights": screening_plan.get("scoringWeights") or {},
+            "scoringProtocol": [
+                "先读取 machine_data_profile 与近30天曝光/阅读/互动、CPM/CPC/CPE，判断数据层级；粉丝量只作为T级比较坐标，不作为高权重加分项。",
+                "报价不是越低越好，必须结合报价能换来的曝光/阅读/互动总量、CPM/CPC/CPE效率、单达人参考预算和硬上限判断。",
+                "缺蒲公英链接、缺字段、缺近期笔记正文是采集/证据状态，不是达人质量问题，不得作为硬性淘汰原因。",
+                "只有已确认的报价超硬上限、同T级近30天数据明显低于基准、已确认异常/违规/限流，才能作为明确风险。",
+                "人设、内容调性、主页简介、笔记标题/文案只在原始详情中有证据时分析；不要用关键词一句话认定真实命中。",
+            ],
             "collectionSchemeSummary": [
                 {
                     "scheme_id": scheme.get("scheme_id"),
@@ -2964,24 +3092,25 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
             "results": [
                 {
                     "creator_id": "必须原样返回",
-                    "baseScore": "0-100 基础分，只评估该达人是否适配当前项目，不因信息缺失直接打很低",
-                    "bonusScore": "0-20 加成分，只奖励稀缺人设、强话题、城市/受众/性价比/组合价值等亮点",
+                    "dataLayer": "S|A|B|C；基于报价、近30天曝光/阅读/互动、CPM/CPC/CPE、T级基准和预算效果核算得到的数据层级",
+                    "baseScore": "0-100 基础分；先按数据层级和预算效果判断，再结合有证据的人设/内容质量，不因采集缺字段直接低分",
+                    "bonusScore": "0-20 加成分；只奖励同T级明显超预期、预算效果强、内容证据扎实或稀缺人设，低价本身不能单独加高分",
                     "totalScore": "0-120 初筛总分，等于 baseScore + bonusScore",
-                    "informationCompleteness": "0-1，关键初筛字段的信息完整度；未知字段不直接淘汰，但要说明待补",
+                    "informationCompleteness": "0-1，当前可用证据完整度；低完整度只影响置信度和后续详情完善优先级，不等于达人质量差",
                     "initialTier": "S|A|B+|B|C；S≥100，A=90-99，B+=80-89，B=70-79，C<70；硬性不符也必须保留分数档位，不要输出Pass",
-                    "detailCollectionPriority": "必须补采|优先补采|高潜补采|暂缓补采|不补采|筛选暂缓；只让高分或高潜达人进入详情页补采，硬性不符用筛选暂缓",
+                    "detailCollectionPriority": "必须补采|优先补采|高潜补采|暂缓观察|不补采|数据暂缓；只让数据层级高或高潜达人进入详情页补采内容/人设信息，硬性不符用数据暂缓",
                     "dimensionScores": {
-                        "budget": "0-100 预算/报价匹配，对应基础分中的成本效率部分",
-                        "fans": "0-100 粉丝画像/目标受众匹配",
-                        "cpe": "0-100 成本效率/CPC/CPE/转化成本",
-                        "engagement": "0-100 流量质量、互动质量与稳定性",
-                        "persona": "0-100 人设与当前项目 Brief 匹配",
-                        "content": "0-100 内容风格、内容场景与可植入度",
+                        "budget": "0-100 预算效果核算：报价、单达人参考预算、硬上限、报价能换来的曝光/阅读/互动容量",
+                        "fans": "0-100 粉丝T级坐标与画像辅助判断，低权重；不要因为粉丝多直接高分",
+                        "cpe": "0-100 CPM/CPC/CPE效率综合判断",
+                        "engagement": "0-100 近30天曝光、阅读、互动及稳定性，需与同T级基准比较",
+                        "persona": "0-100 基于主页简介、详情页、笔记标题/文案证据的人设匹配；无证据不要臆测",
+                        "content": "0-100 基于长期内容调性、笔记标题/文案、合作笔记案例的内容质量与Brief匹配",
                     },
-                    "hardFilterPassed": "boolean，是否没有命中当前项目明确硬性淘汰项；未知项不要当成硬性不符",
-                    "recommendLevel": "强推荐|推荐|备选|不推荐",
-                    "reason": "220字以内，按【数据表现】【人设匹配】【内容贴合】【风险/动作】四段输出。必须结合该达人的粉丝/报价/CPC/CPE/互动/视频或笔记表现、人设标签、个人简介、笔记案例或原始详情；不得只写泛泛的初筛结论。缺失字段要明确说明待补。",
-                    "cooperationDirection": "80字以内，给出适合该达人的合作方向/内容角度/投放角色",
+                    "hardFilterPassed": "boolean，只基于已确认事实判断；未知项、缺蒲公英链接、缺字段不得当成硬性不符",
+                    "recommendLevel": "强推荐|推荐|备选|不推荐|继续观察",
+                    "reason": "260字以内，按【数据层级】【预算效果】【人设内容证据】【风险/置信度】四段输出。必须写明报价、近30天曝光/阅读/互动、CPM/CPC/CPE、T级比较结论；人设内容必须引用主页简介/详情/笔记标题/文案等证据，不能只写真实命中。",
+                    "cooperationDirection": "80字以内，非评分依据；只说明后续详情完善或审核重点，不要用曝光/测评/转化角色影响分数",
                 }
             ]
         },
@@ -3006,13 +3135,15 @@ def _chunk_creators_for_llm(project_id: str, creators: list[dict[str, Any]]) -> 
 
 def score_values_batch_with_llm(project_id: str, creators: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     system_prompt = (
-        "你是广告投放达人筛选策略专家。请基于每个项目自己的 Brief、采集后评分标准 scoringCriteria 和达人资料做综合判断。"
-        "所有项目都使用同一套初筛评分协议：基础分 baseScore 满分100，加成分 bonusScore 满分20，总分 totalScore 满分120。"
-        "基础分评估项目适配度，未知字段只标记待补采并影响 informationCompleteness，不要因为信息不全把大部分候选人打成不及格；"
-        "加成分只奖励稀缺人设、强话题、城市/人群优势、讨论度、低成本潜力和组合补位价值。"
-        "推荐理由必须像资深媒介审号结论：逐个达人结合数据表现、人设匹配、视频/图文笔记内容贴合度、内容证据和风险动作判断；"
-        "不要输出'适合教育场景'这类通用话术，不要把蒲公英筛选条件复述成结论。"
-        "请输出 initialTier 和 detailCollectionPriority，用于决定哪些高分/高潜达人进入详情页补采。"
+        "你是广告投放达人质量评估专家。请严格按两阶段机制评分：第一阶段是数据层级，第二阶段才是详情内容与人设分析。"
+        "数据层级必须基于报价、近30天曝光/阅读/互动、CPM/CPC/CPE、预算效果核算和T级基准；粉丝量只作为T级坐标，不是高权重得分项。"
+        "报价不是越低越好：必须判断这笔预算能换来的曝光/阅读/互动总量，以及该价格层级是否符合项目对单个达人质量的预期。"
+        "所有项目使用基础分 baseScore 100、加成分 bonusScore 20、总分 totalScore 120；加成只给同T级明显超预期、预算效果强、内容证据扎实或稀缺人设。"
+        "缺蒲公英链接、缺字段、缺近期笔记正文属于证据/采集状态，不是达人质量问题，不得作为硬性淘汰或低分原因。"
+        "只有已确认的报价超硬上限、同T级近30天数据明显低于基准、已确认异常/违规/限流，才能作为明确风险。"
+        "人设和内容匹配必须来自主页简介、详情页、笔记标题、笔记正文/文案、整体内容调性等证据；不要用关键词一句话判断'真实命中'。"
+        "不要把达人是否适合曝光、测评、转化种草作为评分依据；达人质量好才值得推进，怎么推是后续执行策略。"
+        "请输出 initialTier 和 detailCollectionPriority，用于决定哪些数据层级高或高潜达人进入详情页完善信息。"
         "不要把当前项目 Brief 写死成有道答疑笔；不同项目必须按传入 Brief 和 scoringCriteria 适配。"
         "蒲公英 collectionSchemeSummary 只用于理解达人来源，不得把页面筛选条件直接当作最终评分结论。"
     )
@@ -3123,7 +3254,7 @@ def _persist_creator_score(
             (
                 score["total_score"],
                 tier_from_score(score["total_score"]),
-                stage_from_status(creator.get("status"), score["total_score"]),
+                stage_from_status(creator.get("status")),
                 cooperation_direction,
                 ts,
                 project_id,
@@ -3134,7 +3265,7 @@ def _persist_creator_score(
             conn.execute("UPDATE creators SET status='待审核', updated_at=? WHERE creator_id=?", (ts, creator_id))
             conn.execute(
                 "UPDATE project_creators SET review_status='待审核', pool_stage=?, updated_at=? WHERE project_id=? AND creator_id=?",
-                (stage_from_status("待审核", score["total_score"]), ts, project_id, creator_id),
+                (stage_from_status("待审核"), ts, project_id, creator_id),
             )
     scored = get_creator(project_id, creator_id) or {}
     scored["score_source"] = source
@@ -3171,6 +3302,7 @@ def score_project(
     creators = [creator for creator in all_creators if wanted is None or str(creator.get("creator_id")) in wanted]
     batch_id = str(uuid.uuid4())
     sources = {"llm": 0, "generated": 0, "rule": 0}
+    llm_errors: list[str] = []
     if use_llm and creators:
         for chunk in _chunk_creators_for_llm(project_id, creators):
             try:
@@ -3179,7 +3311,8 @@ def score_project(
                     score = batch_scores[str(creator["creator_id"])]
                     scored = _persist_creator_score(project_id, creator, score, "llm", batch_id, trigger_source)
                     sources[scored.get("score_source") or "fallback"] = sources.get(scored.get("score_source") or "fallback", 0) + 1
-            except Exception:
+            except Exception as error:
+                llm_errors.append(str(error)[:300])
                 for creator in chunk:
                     score, source = generate_test_stage_score(project_id, creator)
                     scored = _persist_creator_score(project_id, creator, score, source, batch_id, trigger_source)
@@ -3206,6 +3339,8 @@ def score_project(
         "source": "llm" if sources.get("llm") else ("generated" if sources.get("generated") else "rule"),
         "sources": sources,
         "trigger_source": trigger_source,
+        "llm_errors": llm_errors,
+        "message": detail,
     }
 
 
@@ -3844,6 +3979,7 @@ def project_metrics(project_id: str) -> dict[str, Any]:
     assets = list_assets(project_id)
     logs = list_logs(project_id)
     creator_pool_count = int(project.get("creator_pool_count") or 0)
+    screening_candidate_count = int(project.get("screening_candidate_count") or 0)
     qualified_count = int(project.get("qualified_creator_count") or 0)
     task_total = len(tasks)
     task_done = len([task for task in tasks if task.get("status") == "done"])
@@ -3873,12 +4009,13 @@ def project_metrics(project_id: str) -> dict[str, Any]:
             "asset_count": len(assets),
             "timeline_count": len(logs),
             "creator_pool_count": creator_pool_count,
+            "screening_candidate_count": screening_candidate_count,
             "qualified_creator_count": qualified_count,
         },
         "role_efficiency": {
             "planner": {"brief_assets": brief_assets, "strategy_assets": strategy_assets, "handoffs": len([item for item in handoffs if item.get("from_role") == "planner"])},
             "executor": {"task_completion_rate": execution_score, "blocked_tasks": blocked, "tasks": task_total},
-            "screening": {"candidate_count": creator_pool_count, "qualified_count": qualified_count, "qualified_rate": creator_score},
+            "screening": {"candidate_count": screening_candidate_count, "qualified_count": qualified_count, "qualified_rate": creator_score},
         },
         "risks": [
             *[
@@ -4200,8 +4337,8 @@ def standard_feishu_rows(
                 "初筛总分": c.get("total_score") or "",
                 "信息完整度": c.get("information_completeness") or "",
                 "初筛等级": c.get("initial_tier") or c.get("tier") or "",
-                "是否进入详情页补采": "是" if c.get("detail_collection_priority") in {"必须补采", "优先补采", "高潜补采"} else "否",
-                "补采优先级": c.get("detail_collection_priority") or "",
+                "是否进入详情页完善": "是" if c.get("detail_collection_priority") in DETAIL_PRIORITY_HIGH_VALUES else "否",
+                "详情完善优先级": c.get("detail_collection_priority") or "",
                 "合作方向": c.get("cooperation_direction") or c.get("portfolio_role") or "",
                 "当前状态": c.get("status") or "",
                 "备注": c.get("score_reason") or "",
@@ -4234,7 +4371,7 @@ def quality_feishu_rows(
         and (c.get("hard_filter_passed") == 1 or c.get("hard_filter_passed") is True)
         and float(c.get("total_score") or 0) >= min_score
         and c.get("recommend_level") in {"强推荐", "推荐", "备选"}
-        and c.get("detail_collection_priority") in {"必须补采", "优先补采", "高潜补采", None, ""}
+        and c.get("detail_collection_priority") in {*DETAIL_PRIORITY_HIGH_VALUES, None, ""}
     ]
     rows = []
     for c in creators[:max_rows]:
@@ -4261,7 +4398,7 @@ def quality_feishu_rows(
                 "初筛总分": c.get("total_score") or "",
                 "信息完整度": c.get("information_completeness") or "",
                 "初筛等级": c.get("initial_tier") or c.get("tier") or "",
-                "补采优先级": c.get("detail_collection_priority") or "",
+                "详情完善优先级": c.get("detail_collection_priority") or "",
                 "合作方向": c.get("cooperation_direction") or c.get("portfolio_role") or "",
                 "平台报价": c.get("quote_price") or "",
                 "合作价格（含服务费）": c.get("quote_price") or "",

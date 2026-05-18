@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   LayoutDashboard, Users, BarChart3, FolderPlus, ScrollText, ExternalLink,
   Filter, CheckCircle2, XCircle, AlertTriangle, Clock, ChevronRight,
@@ -9,7 +9,7 @@ import {
   UserCheck, UserX, Ban, Bookmark, RotateCcw, Send, Settings, Database,
   Shield, Zap, Activity, FileSpreadsheet, ClipboardCheck, ArrowUpRight,
   ArrowDownRight, Minus, Info, X, ChevronUp, ChevronLeft, KeyRound, Globe,
-  ToggleLeft, ToggleRight
+  ToggleLeft, ToggleRight, Square
 } from 'lucide-react';
 import StatCard from '../../../../components/StatCard';
 import DataTable from '../../../../components/DataTable';
@@ -19,6 +19,7 @@ import {
   DEFAULT_SCORING_HARD_FILTER_FIELDS,
   hardFilterKey,
   hardFilterLabel,
+  pgyFilterLabel,
 } from '../../constants/screeningConstants';
 import { getProjectCreators, getProjectStats } from '../../utils/projectMappers';
 import { getScoreColor, getScoreTier } from '../../utils/creatorScoring';
@@ -33,25 +34,82 @@ import { getSchemeAdditionalFilters, getSchemeRequiredFilters, normalizeWorkbenc
 import { SelectedChips } from '../filters/SelectedChips';
 import { PgyFindBloggerFilterPanel } from '../filters/PgyFindBloggerFilterPanel';
 
-export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onTabChange }) {
+const REQUIRED_SCHEME_FIELDS = new Set(['博主类目', '粉丝量', '粉丝年龄', '合作报价']);
+const SCHEME_LABELS = ['方案一', '方案二', '方案三', '方案四', '方案五', '方案六'];
+
+const schemeKey = (scheme = {}, index = 0) => String(scheme.scheme_id || scheme.id || scheme.name || `scheme_${index + 1}`);
+const schemeDisplayName = (scheme = {}, index = 0) => SCHEME_LABELS[index] || `方案${index + 1}`;
+
+const resultCountText = (result = {}) => {
+  const text = result.estimated_count_text || result.preflight?.actual_count_text;
+  const count = result.estimated_count ?? result.preflight?.actual_recommend_count;
+  if (text) return text;
+  if (count !== undefined && count !== null) return `推荐 ${count} 位博主`;
+  return '待预估';
+};
+
+const enabledSchemeIdsFor = (pgyPlan = {}) => {
+  const schemes = Array.isArray(pgyPlan.schemes) ? pgyPlan.schemes : [];
+  const allIds = schemes.map((scheme, index) => schemeKey(scheme, index));
+  const savedIds = Array.isArray(pgyPlan.enabled_scheme_ids) ? pgyPlan.enabled_scheme_ids.map(String).filter(Boolean) : [];
+  return savedIds.length ? savedIds.filter(id => allIds.includes(id)) : allIds;
+};
+
+const batchSchemes = (batch = {}) => {
+  if (Array.isArray(batch.scheme_results) && batch.scheme_results.length) return batch.scheme_results;
+  if (Array.isArray(batch.collection_plan?.schemes) && batch.collection_plan.schemes.length) return batch.collection_plan.schemes;
+  return [];
+};
+
+export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, onSavePlan, onTabChange }) {
   const creators = useMemo(() => getProjectCreators(project), [project]);
   const stats = getProjectStats(project);
+  const projectKey = project.id || project.project_id;
   const [planDraft, setPlanDraft] = useState(() => normalizeWorkbenchPlan(project.screeningPlan || {}));
   const [planStatus, setPlanStatus] = useState('');
   const [planExpanded, setPlanExpanded] = useState(false);
+  const [selectedSchemeIds, setSelectedSchemeIds] = useState([]);
+  const [expandedSchemeId, setExpandedSchemeId] = useState('');
+  const [collectSchemeResults, setCollectSchemeResults] = useState([]);
+  const [schemeSaveStatus, setSchemeSaveStatus] = useState({});
   const [collectLimit, setCollectLimit] = useState(1000);
   const [collectStatus, setCollectStatus] = useState('');
   const [collecting, setCollecting] = useState(false);
+  const [stoppingCollect, setStoppingCollect] = useState(false);
   const [collectProgress, setCollectProgress] = useState(null);
+  const editingPlanRef = useRef(false);
+  const lastProjectKeyRef = useRef(projectKey);
+  const activeBatchIdRef = useRef('');
+  const lastLoadedBatchIdRef = useRef('');
 
   useEffect(() => {
-    setPlanDraft(normalizeWorkbenchPlan(project.screeningPlan || {}));
+    const sameProject = lastProjectKeyRef.current === projectKey;
+    if (sameProject && editingPlanRef.current) {
+      return;
+    }
+    const nextPlan = normalizeWorkbenchPlan(project.screeningPlan || {});
+    const nextSchemes = nextPlan.pgyCollectionPlan?.schemes || [];
+    const nextIds = enabledSchemeIdsFor(nextPlan.pgyCollectionPlan || {});
+    lastProjectKeyRef.current = projectKey;
+    editingPlanRef.current = false;
+    setPlanDraft(nextPlan);
+    setSelectedSchemeIds(nextIds);
+    setExpandedSchemeId(nextIds[0] || (nextSchemes[0] ? schemeKey(nextSchemes[0], 0) : ''));
+    setCollectSchemeResults([]);
+    setSchemeSaveStatus({});
     setPlanStatus('');
-  }, [project.id, project.screeningPlan]);
+    lastLoadedBatchIdRef.current = '';
+  }, [projectKey, project.screeningPlan]);
 
   const savedPlan = useMemo(() => normalizeWorkbenchPlan(project.screeningPlan || {}), [project.screeningPlan]);
   const planDirty = JSON.stringify(planDraft) !== JSON.stringify(savedPlan);
   const pgyPlan = planDraft.pgyCollectionPlan || {};
+  const schemes = Array.isArray(pgyPlan.schemes) ? pgyPlan.schemes : [];
+  const schemeResultById = useMemo(() => {
+    const map = new Map();
+    collectSchemeResults.forEach(item => map.set(String(item.scheme_id || item.id || item.name || ''), item));
+    return map;
+  }, [collectSchemeResults]);
   const collectionResult = {
     collected: creators.length,
     scored: creators.filter(item => Number(item.baseScore || 0) > 0).length,
@@ -67,7 +125,7 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
     {
       title: '累计采集',
       value: collectionResult.collected,
-      subtitle: '达人已入本项目',
+      subtitle: '待评分匹配',
       icon: Database,
       color: 'blue',
     },
@@ -86,7 +144,7 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
       color: 'purple',
     },
     {
-      title: '需补采',
+      title: '需完善',
       value: expectedShortage,
       subtitle: '按通过率推算',
       icon: AlertTriangle,
@@ -94,13 +152,14 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
     },
   ];
   const collectionTaskResults = [
-    ['已采集入库', collectionResult.collected, '去重达人'],
+    ['已采集候选', collectionResult.collected, '待评分匹配'],
     ['已完成初评', collectionResult.scored, 'ABC 分档'],
     ['初筛可用', collectionResult.passedFilters, '>=90 或高潜'],
     ['需人工判断', collectionResult.needsManual, '风险或低分'],
   ];
 
-  const planSummary = `${planDraft.collectionHardFilters?.length || 0} 个采集前条件 · ${pgyPlan.filters?.length || 0} 个蒲公英条件 · ${pgyPlan.display_metrics?.length || 0} 个展示指标`;
+  const planSummary = `${selectedSchemeIds.length || schemes.length} 套采集方案 · ${planDraft.collectionHardFilters?.length || 0} 个采集前条件 · ${pgyPlan.display_metrics?.length || 0} 个展示指标`;
+  const selectedSchemes = schemes.filter((scheme, index) => selectedSchemeIds.includes(schemeKey(scheme, index)));
   const activePgyFilters = useMemo(
     () => mergeOptionItems(
       collectionHardFiltersToPgyFilters(planDraft.collectionHardFilters || []),
@@ -110,9 +169,58 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
     [planDraft.collectionHardFilters, pgyPlan.filters]
   );
 
+  const updatePlanDraft = (updater) => {
+    editingPlanRef.current = true;
+    setPlanStatus('正在自动保存筛选条件...');
+    setPlanDraft(updater);
+  };
+
+  useEffect(() => {
+    if (!editingPlanRef.current || !planDirty) return;
+    const timer = window.setTimeout(async () => {
+      try {
+        const nextPlan = syncScreeningCriteria({
+          ...planDraft,
+          pgyCollectionPlan: {
+            ...(planDraft.pgyCollectionPlan || {}),
+            enabled_scheme_ids: selectedSchemeIds,
+          },
+        });
+        await onSavePlan?.(nextPlan);
+        editingPlanRef.current = false;
+        setPlanDraft(normalizeWorkbenchPlan(nextPlan));
+        setPlanStatus('筛选条件已自动保存，刷新后会保留');
+      } catch (error) {
+        setPlanStatus(error.message || '自动保存筛选条件失败，请点击保存计划重试');
+      }
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [onSavePlan, planDirty, planDraft, selectedSchemeIds]);
+
+  useEffect(() => {
+    let alive = true;
+    const loadLatestBatch = async () => {
+      if (!onLatestBatch) return;
+      try {
+        const batch = await onLatestBatch();
+        if (!alive || !batch?.batch_id || batch.batch_id === lastLoadedBatchIdRef.current) return;
+        lastLoadedBatchIdRef.current = batch.batch_id;
+        const schemes = batchSchemes(batch);
+        if (schemes.length) setCollectSchemeResults(schemes);
+        if (batch.status) setCollectProgress(batch);
+      } catch {
+        // 历史批次读取失败不影响页面编辑。
+      }
+    };
+    loadLatestBatch();
+    return () => {
+      alive = false;
+    };
+  }, [onLatestBatch, projectKey]);
+
   const updatePgyFilters = (filters = []) => {
     const normalizedFilters = markManualPgyFilters(filters);
-    setPlanDraft(old => ({
+    updatePlanDraft(old => ({
       ...old,
       collectionHardFilters: syncCollectionHardFiltersFromPgyFilters(normalizedFilters, old.collectionHardFilters || []),
       pgyCollectionPlan: {
@@ -125,72 +233,145 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
 
   const updateWeight = (key, value) => {
     const number = Math.max(0, Number(value || 0));
-    setPlanDraft(old => ({ ...old, scoringWeights: { ...(old.scoringWeights || {}), [key]: number } }));
+    updatePlanDraft(old => ({ ...old, scoringWeights: { ...(old.scoringWeights || {}), [key]: number } }));
   };
 
-  const updateSchemeFilters = (schemeIndex, updater) => {
-    setPlanDraft(old => {
-      const schemes = [...(old.pgyCollectionPlan?.schemes || [])];
-      const current = schemes[schemeIndex];
-      if (!current) return old;
-      schemes[schemeIndex] = updater({ ...current });
+  const patchScheme = (targetIndex, patcher) => {
+    updatePlanDraft(old => {
+      const oldPlan = old.pgyCollectionPlan || {};
+      const nextSchemes = (oldPlan.schemes || []).map((scheme, index) => (
+        index === targetIndex ? patcher(scheme) : scheme
+      ));
       return {
         ...old,
         pgyCollectionPlan: {
-          ...(old.pgyCollectionPlan || {}),
-          schemes,
+          ...oldPlan,
+          schemes: nextSchemes,
         },
       };
     });
   };
 
-  const updateSchemeFilterValue = (schemeIndex, group, filterIndex, value) => {
-    updateSchemeFilters(schemeIndex, (scheme) => {
-      const key = group === 'required' ? 'required_filters' : 'additional_filters';
-      const legacyKey = group === 'required' ? 'base_filters' : 'extra_filters';
-      const filters = [...(group === 'required' ? getSchemeRequiredFilters(scheme) : getSchemeAdditionalFilters(scheme))];
-      if (!filters[filterIndex]) return scheme;
-      filters[filterIndex] = { ...filters[filterIndex], value };
-      return { ...scheme, [key]: filters, [legacyKey]: filters, filters: [] };
+  const updateSchemeActiveFilters = (targetIndex, filters = []) => {
+    const requiredFilters = filters.filter(item => REQUIRED_SCHEME_FIELDS.has(item.field));
+    const enabledAdditionalFilters = filters.filter(item => !REQUIRED_SCHEME_FIELDS.has(item.field));
+    patchScheme(targetIndex, scheme => {
+      const additionalFilters = mergeOptionItems(getSchemeAdditionalFilters(scheme), enabledAdditionalFilters, pgyFilterKey);
+      return {
+        ...scheme,
+        required_filters: requiredFilters,
+        base_filters: requiredFilters,
+        additional_filters: additionalFilters,
+        extra_filters: additionalFilters,
+        enabled_additional_filters: enabledAdditionalFilters,
+        enabled_extra_filters: enabledAdditionalFilters,
+      };
     });
   };
 
-  const moveSchemeAdditionalFilter = (schemeIndex, filterIndex, direction) => {
-    updateSchemeFilters(schemeIndex, (scheme) => {
-      const filters = [...getSchemeAdditionalFilters(scheme)];
-      const nextIndex = filterIndex + direction;
-      if (nextIndex < 0 || nextIndex >= filters.length) return scheme;
-      [filters[filterIndex], filters[nextIndex]] = [filters[nextIndex], filters[filterIndex]];
-      return { ...scheme, additional_filters: filters, extra_filters: filters, filters: [] };
+  const toggleSchemeAdditionalFilter = (targetIndex, filter) => {
+    patchScheme(targetIndex, scheme => {
+      const enabled = scheme.enabled_additional_filters || scheme.enabled_extra_filters || [];
+      const exists = enabled.some(item => pgyFilterKey(item) === pgyFilterKey(filter));
+      const nextEnabled = exists ? enabled.filter(item => pgyFilterKey(item) !== pgyFilterKey(filter)) : [...enabled, filter];
+      return {
+        ...scheme,
+        enabled_additional_filters: nextEnabled,
+        enabled_extra_filters: nextEnabled,
+      };
+    });
+  };
+
+  const toggleScheme = (id) => {
+    setSelectedSchemeIds(old => {
+      const nextIds = old.includes(id) ? old.filter(item => item !== id) : [...old, id];
+      editingPlanRef.current = true;
+      setPlanStatus('正在自动保存筛选条件...');
+      setPlanDraft(plan => ({
+        ...plan,
+        pgyCollectionPlan: {
+          ...(plan.pgyCollectionPlan || {}),
+          enabled_scheme_ids: nextIds,
+        },
+      }));
+      return nextIds;
     });
   };
 
   const savePlan = async () => {
     setPlanStatus('正在保存筛选计划...');
     try {
-      const nextPlan = syncScreeningCriteria(planDraft);
+      const nextPlan = syncScreeningCriteria({
+        ...planDraft,
+        pgyCollectionPlan: {
+          ...(planDraft.pgyCollectionPlan || {}),
+          enabled_scheme_ids: selectedSchemeIds,
+        },
+      });
       await onSavePlan?.(nextPlan);
-      setPlanDraft(nextPlan);
+      editingPlanRef.current = false;
+      setPlanDraft(normalizeWorkbenchPlan(nextPlan));
       setPlanStatus('采集筛选计划已保存，并同步到项目配置');
     } catch (error) {
       setPlanStatus(error.message || '筛选计划保存失败');
     }
   };
 
+  const saveSchemeConfig = async (id) => {
+    setSchemeSaveStatus(old => ({ ...old, [id]: '正在保存本方案...' }));
+    try {
+      const nextPlan = syncScreeningCriteria({
+        ...planDraft,
+        pgyCollectionPlan: {
+          ...(planDraft.pgyCollectionPlan || {}),
+          enabled_scheme_ids: selectedSchemeIds,
+        },
+      });
+      await onSavePlan?.(nextPlan);
+      editingPlanRef.current = false;
+      setPlanDraft(normalizeWorkbenchPlan(nextPlan));
+      setSchemeSaveStatus(old => ({ ...old, [id]: '本方案已保存，采集会使用当前配置' }));
+      setPlanStatus('方案配置已保存，并同步到项目配置');
+    } catch (error) {
+      setSchemeSaveStatus(old => ({ ...old, [id]: error.message || '本方案保存失败' }));
+    }
+  };
+
   const runCollect = async () => {
     if (collecting) return;
+    if (schemes.length && selectedSchemeIds.length === 0) {
+      setCollectStatus('请先勾选至少一个采集方案');
+      return;
+    }
     setCollecting(true);
-    setCollectStatus(`正在采集，目标上限 ${collectLimit} 个...`);
+    setStoppingCollect(false);
+    activeBatchIdRef.current = '';
+    setCollectStatus(`正在采集，目标上限 ${collectLimit} 个，已选 ${selectedSchemeIds.length || 1} 套方案...`);
     setCollectProgress({ status: 'running', total_count: 0, success_count: 0, progress_stage: 'starting', progress_message: '正在启动采集任务' });
+    setCollectSchemeResults([]);
     let stopped = false;
     const pollProgress = async () => {
       if (stopped || !onLatestBatch) return;
       try {
         const batch = await onLatestBatch();
         if (batch?.batch_id) {
+          if (!activeBatchIdRef.current) {
+            if (batch.status !== 'running') return;
+            activeBatchIdRef.current = batch.batch_id;
+          } else if (batch.batch_id !== activeBatchIdRef.current) {
+            return;
+          }
           setCollectProgress(batch);
           const stageText = batch.progress_message || batch.status || '采集中';
-          setCollectStatus(`${stageText} · 已采集 ${batch.total_count || 0} · 已入库 ${batch.success_count || 0}`);
+          setCollectStatus(`${stageText} · 已采集 ${batch.total_count || 0} · 已进筛选 ${batch.success_count || 0}`);
+          const schemes = batchSchemes(batch);
+          if (schemes.length) setCollectSchemeResults(schemes);
+          if (batch.status && batch.status !== 'running') {
+            stopped = true;
+            window.clearInterval(progressTimer);
+            setCollecting(false);
+            setStoppingCollect(false);
+          }
         }
       } catch {
         // Ignore transient polling failures; the final collect response still settles the UI.
@@ -199,13 +380,24 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
     const progressTimer = window.setInterval(pollProgress, 2000);
     pollProgress();
     try {
-      const result = await onCollect(syncScreeningCriteria(planDraft), { limit: collectLimit });
+      const result = await onCollect(syncScreeningCriteria(planDraft), {
+        limit: collectLimit,
+        schemeIds: selectedSchemeIds,
+        multiScheme: true,
+        preflight: true,
+      });
+      activeBatchIdRef.current = result?.batch?.batch_id || activeBatchIdRef.current;
       stopped = true;
       window.clearInterval(progressTimer);
+      const schemes = batchSchemes(result);
+      if (schemes.length) setCollectSchemeResults(schemes);
       if (result?.ok) {
         const count = result.batch?.success_count ?? result.creators?.length ?? 0;
         setCollectProgress(result.batch || null);
-        setCollectStatus(`采集完成，已入库 ${count} 个达人`);
+        setCollectStatus(`采集完成，已进入筛选工作台 ${count} 个达人`);
+      } else if (result?.stopped || result?.batch?.status === 'stopped') {
+        setCollectProgress(result.batch || null);
+        setCollectStatus('采集已停止');
       } else {
         setCollectProgress(result?.batch || null);
         setCollectStatus(result?.message || result?.error || '采集未完成');
@@ -218,6 +410,23 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
       stopped = true;
       window.clearInterval(progressTimer);
       setCollecting(false);
+      setStoppingCollect(false);
+      activeBatchIdRef.current = '';
+    }
+  };
+
+  const stopCollect = async () => {
+    if (!collecting || stoppingCollect) return;
+    setStoppingCollect(true);
+    setCollectStatus('正在请求停止采集...');
+    try {
+      const result = await onStopCollect?.();
+      activeBatchIdRef.current = result?.batch?.batch_id || activeBatchIdRef.current;
+      if (result?.batch) setCollectProgress(result.batch);
+      setCollectStatus(result?.message || '已发送停止请求，当前步骤结束后会停止');
+    } catch (error) {
+      setCollectStatus(error.message || '停止采集失败');
+      setStoppingCollect(false);
     }
   };
 
@@ -235,7 +444,7 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
         </div>
         <div className="collection-section-heading">
           <h4><Activity size={16} /> 指标预览</h4>
-          <span>基于当前项目达人池与初筛通过率自动推算</span>
+          <span>基于筛选工作台候选与初筛通过率自动推算</span>
         </div>
         <div className="collection-metric-preview-grid">
           {collectionMetrics.map(metric => {
@@ -275,6 +484,11 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
               <button className="btn btn-primary collector-action collector-action-primary" onClick={runCollect} disabled={collecting}>
                 <Download size={16} />{collecting ? '采集中...' : '一键采集'}
               </button>
+              {collecting && (
+                <button className="btn btn-secondary collector-action collector-action-stop" onClick={stopCollect} disabled={stoppingCollect}>
+                  <Square size={15} />{stoppingCollect ? '停止中...' : '停止采集'}
+                </button>
+              )}
             </div>
           </div>
           {collectStatus && (
@@ -290,9 +504,9 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
                 <small>候选达人</small>
               </div>
               <div className="collector-progress-row">
-                <span>入库</span>
+                <span>筛选</span>
                 <strong>{collectProgress.success_count || 0}</strong>
-                <small>已写入达人池</small>
+                <small>已进工作台</small>
               </div>
               <div className="collector-progress-row">
                 <span>阶段</span>
@@ -317,122 +531,180 @@ export function OverviewTab({ project, onCollect, onLatestBatch, onSavePlan, onT
       <div className="collection-workbench-grid" style={{ marginBottom: 24 }}>
         <div className="card screening-section-card collection-plan-panel">
           <div className="collection-plan-collapsible-header">
-            <button type="button" className="collection-plan-collapse-button" onClick={() => setPlanExpanded(value => !value)}>
-              <Filter size={16} />
-              <span>采集筛选计划</span>
-              <small>{planSummary}</small>
-              <ChevronDown size={16} className={planExpanded ? 'is-open' : ''} />
+            <button
+              type="button"
+              className={`collection-plan-collapse-button ${planExpanded ? 'is-expanded' : ''}`}
+              onClick={() => setPlanExpanded(value => !value)}
+              aria-expanded={planExpanded}
+            >
+              <span className="collection-plan-collapse-main">
+                <span className="collection-plan-collapse-icon">
+                  <Filter size={15} />
+                </span>
+                <span className="collection-plan-collapse-copy">
+                  <strong>采集筛选计划</strong>
+                  <small>{planSummary}</small>
+                </span>
+              </span>
+              <span className="collection-plan-collapse-action">
+                <span className="collection-plan-toggle-text">{planExpanded ? '收起计划' : '展开计划'}</span>
+                <ChevronDown size={16} className={planExpanded ? 'is-open' : ''} />
+              </span>
             </button>
             <div className="collection-plan-header-badges">
               <Badge variant={planDraft.briefType === 'complex' ? 'amber' : 'blue'}>{planDraft.briefType === 'complex' ? '复杂需求' : '标准需求'}</Badge>
               {planDirty && <Badge variant="purple">未应用</Badge>}
             </div>
           </div>
-          {!planExpanded ? (
-            <div className="collection-plan-compact">
-              <SelectedChips
-                items={(planDraft.collectionHardFilters || []).slice(0, 4)}
-                getKey={hardFilterKey}
-                getLabel={hardFilterLabel}
-                onRemove={(item) => setPlanDraft(old => ({ ...old, collectionHardFilters: (old.collectionHardFilters || []).filter(next => hardFilterKey(next) !== hardFilterKey(item)) }))}
-                emptyText="暂无采集前条件"
-              />
-              {(planDraft.collectionHardFilters || []).length > 4 && <span className="collection-compact-more">+{(planDraft.collectionHardFilters || []).length - 4}</span>}
-            </div>
-          ) : (
+          {planExpanded ? (
             <>
-          <div className="collection-plan-block">
-            <div className="collection-plan-title-row">
-              <div>
-                <div className="collection-plan-title">采集前筛选条件</div>
-                <div className="collection-plan-subtitle">按蒲公英「找博主」筛选区组织，选中项会写入采集计划。</div>
-              </div>
-            </div>
-            <PgyFindBloggerFilterPanel
-              filters={activePgyFilters}
-              onChange={updatePgyFilters}
-            />
-            {(pgyPlan.schemes || []).length > 0 && (
-              <div className="collection-plan-block" style={{ marginTop: 16 }}>
-                <div className="collection-plan-title-row">
-                  <div>
-                    <div className="collection-plan-title">方案筛选条件</div>
-                    <div className="collection-plan-subtitle">必备筛选先执行；附加筛选按顺序叠加。</div>
-                  </div>
-                </div>
-                <div style={{ display: 'grid', gap: 12 }}>
-                  {(pgyPlan.schemes || []).map((scheme, schemeIndex) => {
+              {schemes.length > 0 && (
+                <div className="collection-scheme-card-grid">
+                  {schemes.map((scheme, index) => {
+                    const id = schemeKey(scheme, index);
+                    const selected = selectedSchemeIds.includes(id);
+                    const expanded = expandedSchemeId === id;
                     const requiredFilters = getSchemeRequiredFilters(scheme);
                     const additionalFilters = getSchemeAdditionalFilters(scheme);
-                    const schemeKey = scheme.scheme_id || scheme.id || scheme.name || schemeIndex;
+                    const enabledAdditionalFilters = scheme.enabled_additional_filters || scheme.enabled_extra_filters || [];
+                    const editableFilters = mergeOptionItems(requiredFilters, enabledAdditionalFilters, pgyFilterKey);
+                    const result = schemeResultById.get(id) || {};
                     return (
-                      <div key={schemeKey} className="collection-selected-card" style={{ alignItems: 'stretch' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
-                          <strong style={{ color: 'var(--text-primary)' }}>{scheme.name || schemeKey}</strong>
-                          <Badge variant="blue">{scheme.target_count_range || pgyPlan.target_count_range || '50-2000'}</Badge>
+                      <div key={id} className={`collection-scheme-card ${selected ? 'is-selected' : ''}`}>
+                        <div className="collection-scheme-card-head">
+                          <label className="collection-scheme-check">
+                            <input
+                              type="checkbox"
+                              checked={selected}
+                              onChange={() => toggleScheme(id)}
+                            />
+                            <span>
+                              <strong>{schemeDisplayName(scheme, index)}</strong>
+                              <small>{scheme.name || id}</small>
+                            </span>
+                          </label>
+                          <button type="button" className="collection-scheme-config-button" onClick={() => setExpandedSchemeId(expanded ? '' : id)}>
+                            <Settings size={14} />配置
+                            <ChevronDown size={14} className={expanded ? 'is-open' : ''} />
+                          </button>
                         </div>
-                        <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
-                          <div style={{ color: 'var(--text-secondary)', fontSize: 13 }}>必备筛选条件</div>
-                          {requiredFilters.map((filter, filterIndex) => (
-                            <div key={`${filter.field}-${filterIndex}`} className="collection-filter-row">
-                              <span>{filter.field}</span>
-                              <input
-                                value={filter.value || ''}
-                                onChange={(event) => updateSchemeFilterValue(schemeIndex, 'required', filterIndex, event.target.value)}
-                              />
-                            </div>
+                        <div className="collection-scheme-goal">{scheme.goal || '按该方案独立应用蒲公英筛选并采集'}</div>
+                        <div className="collection-scheme-chip-row">
+                          {editableFilters.slice(0, 5).map(item => (
+                            <span key={pgyFilterKey(item)}>{pgyFilterLabel(item)}</span>
                           ))}
+                          {editableFilters.length > 5 && <span>+{editableFilters.length - 5}</span>}
                         </div>
-                        <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
-                          <div style={{ color: 'var(--text-secondary)', fontSize: 13 }}>附加筛选条件</div>
-                          {additionalFilters.length === 0 && <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>暂无附加筛选条件</span>}
-                          {additionalFilters.map((filter, filterIndex) => (
-                            <div key={`${filter.field}-${filterIndex}`} className="collection-filter-row">
-                              <span>{filter.field}</span>
-                              <input
-                                value={filter.value || ''}
-                                onChange={(event) => updateSchemeFilterValue(schemeIndex, 'additional', filterIndex, event.target.value)}
-                              />
-                              <button
-                                type="button"
-                                className="btn btn-ghost btn-icon btn-sm"
-                                title="上移"
-                                disabled={filterIndex === 0}
-                                onClick={() => moveSchemeAdditionalFilter(schemeIndex, filterIndex, -1)}
-                              >
-                                <ChevronUp size={14} />
-                              </button>
-                              <button
-                                type="button"
-                                className="btn btn-ghost btn-icon btn-sm"
-                                title="下移"
-                                disabled={filterIndex === additionalFilters.length - 1}
-                                onClick={() => moveSchemeAdditionalFilter(schemeIndex, filterIndex, 1)}
-                              >
-                                <ChevronDown size={14} />
-                              </button>
+                        <div className="collection-scheme-stats">
+                          <div>
+                            <span>蒲公英预估</span>
+                            <strong>{resultCountText(result)}</strong>
+                          </div>
+                          <div>
+                            <span>真实入库</span>
+                            <strong>{result.ingested_count ?? result.collected_count ?? '-'}</strong>
+                          </div>
+                        </div>
+                        <div className="collection-scheme-save-row">
+                          <span className={String(schemeSaveStatus[id] || '').includes('失败') ? 'is-error' : ''}>
+                            {schemeSaveStatus[id] || (selected ? '已勾选，保存后纳入采集' : '未勾选，保存后不纳入采集')}
+                          </span>
+                          <button type="button" className="btn btn-primary btn-sm" onClick={() => saveSchemeConfig(id)}>
+                            <Save size={14} />保存本方案
+                          </button>
+                        </div>
+                        {expanded && (
+                          <div className="collection-scheme-config">
+                            <div className="collection-scheme-config-title">
+                              <span>已应用条件</span>
+                              <small>修改后先保存计划，再启动采集</small>
                             </div>
-                          ))}
-                        </div>
+                            <PgyFindBloggerFilterPanel
+                              filters={editableFilters}
+                              onChange={(nextFilters) => updateSchemeActiveFilters(index, nextFilters)}
+                            />
+                            {additionalFilters.length > 0 && (
+                              <div className="collection-scheme-extra-list">
+                                <span>可选附加条件</span>
+                                <div>
+                                  {additionalFilters.map(item => {
+                                    const active = enabledAdditionalFilters.some(next => pgyFilterKey(next) === pgyFilterKey(item));
+                                    return (
+                                      <button
+                                        key={pgyFilterKey(item)}
+                                        type="button"
+                                        className={active ? 'is-active' : ''}
+                                        onClick={() => toggleSchemeAdditionalFilter(index, item)}
+                                      >
+                                        {active ? <CheckCircle2 size={13} /> : <Plus size={13} />}
+                                        {pgyFilterLabel(item)}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
                 </div>
+              )}
+              <div className="collection-plan-block">
+                <div className="collection-plan-title-row">
+                  <div>
+                    <div className="collection-plan-title">采集前筛选条件</div>
+                    <div className="collection-plan-subtitle">按蒲公英「找博主」筛选区组织，选中项会写入采集计划。</div>
+                  </div>
+                </div>
+                <PgyFindBloggerFilterPanel
+                  filters={activePgyFilters}
+                  onChange={updatePgyFilters}
+                />
               </div>
-            )}
-          </div>
+              <div className="collection-plan-actions">
+                <span className={planStatus.includes('失败') ? 'is-error' : ''}>{planStatus || '修改后点击保存，采集会使用当前筛选计划。'}</span>
+                <button className="btn btn-primary" onClick={savePlan} disabled={!planDirty && planStatus.includes('已保存')}>
+                  <Save size={14} style={{ marginRight: 4 }} />保存计划
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="collection-plan-collapsed-body">
+                <div className="collection-plan-compact">
+                  <SelectedChips
+                    items={selectedSchemes.slice(0, 4)}
+                    getKey={schemeKey}
+                    getLabel={(scheme) => scheme.name || scheme.scheme_id || scheme.id || '未命名方案'}
+                    emptyText="暂无已勾选方案"
+                  />
+                  {selectedSchemes.length > 4 && <span className="collection-compact-more">+{selectedSchemes.length - 4}</span>}
+                </div>
+                <div className="collection-plan-compact">
+                  <SelectedChips
+                    items={(planDraft.collectionHardFilters || []).slice(0, 4)}
+                    getKey={hardFilterKey}
+                    getLabel={hardFilterLabel}
+                    onRemove={(item) => setPlanDraft(old => ({ ...old, collectionHardFilters: (old.collectionHardFilters || []).filter(next => hardFilterKey(next) !== hardFilterKey(item)) }))}
+                    emptyText="暂无采集前条件"
+                  />
+                  {(planDraft.collectionHardFilters || []).length > 4 && <span className="collection-compact-more">+{(planDraft.collectionHardFilters || []).length - 4}</span>}
+                </div>
+              </div>
+              <div className="collection-plan-actions">
+                <span className={planStatus.includes('失败') ? 'is-error' : ''}>{planStatus || '已收起，展开后可继续编辑筛选计划。'}</span>
+                <button className="btn btn-primary" onClick={() => setPlanExpanded(true)}>
+                  <ChevronDown size={14} className="is-open" />展开
+                </button>
+              </div>
             </>
           )}
-          <div className="collection-plan-actions">
-            <span className={planStatus.includes('失败') ? 'is-error' : ''}>{planStatus || '修改后点击保存，采集会使用当前筛选计划。'}</span>
-            <button className="btn btn-primary" onClick={savePlan} disabled={!planDirty && planStatus.includes('已保存')}>
-              <Save size={14} style={{ marginRight: 4 }} />保存计划
-            </button>
-          </div>
         </div>
       </div>
 
-      {/* 达人池预览 */}
+      {/* 筛选工作台候选预览 */}
       <div className="card screening-section-card">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <h4 style={{ margin: 0, color: 'var(--text-primary)' }}>采集结果预览 <span style={{ color: 'var(--text-secondary)', fontWeight: 400, fontSize: 14 }}>（{creators.length}人）</span></h4>

@@ -8,6 +8,7 @@ import {
 } from '../constants/screeningConstants';
 import {
   PGY_FILTER_CATALOG_BY_FIELD,
+  PGY_BLOGGER_CATEGORY_SUBCATEGORY_OPTIONS,
   PGY_MARKETING_GOAL_DEFAULT_METRIC,
   PGY_SINGLE_VALUE_CONTROLS,
 } from '../constants/pgyConstants';
@@ -128,6 +129,27 @@ export function normalizePgyFilterItem(item = {}) {
       特色背景: { field: '特色背景', value: '备考经验', control_type: 'checkbox_popover' },
     };
     return { ...base, ...(map[value] || {}) };
+  }
+  if (field === '博主类目') {
+    let mainValue = value;
+    let subValue = item.sub_value || item.subValue || '';
+    if (!PGY_BLOGGER_CATEGORY_SUBCATEGORY_OPTIONS[mainValue]) {
+      const parent = Object.entries(PGY_BLOGGER_CATEGORY_SUBCATEGORY_OPTIONS)
+        .find(([, options]) => options.includes(mainValue));
+      if (parent) {
+        mainValue = parent[0];
+        subValue = value;
+      }
+    }
+    const validSubcategories = PGY_BLOGGER_CATEGORY_SUBCATEGORY_OPTIONS[mainValue] || [];
+    if (subValue && !validSubcategories.includes(subValue)) subValue = '';
+    const { subValue: _subValue, sub_value: _sub_value, ...rest } = base;
+    return {
+      ...rest,
+      value: mainValue,
+      control_type: 'tag_select_with_hover_subcategory',
+      ...(subValue ? { sub_value: subValue } : {}),
+    };
   }
   if (field === '数据表现' && ['预估阅读/互动单价', 'CPC<2/CPE<20'].includes(value)) {
     return {
@@ -304,6 +326,26 @@ export function makePgyFilterItem(meta, value, subField) {
       control_type: meta.control_type,
       ...(fallbackParent ? { goal: fallbackParent, parent_value: fallbackParent } : {}),
       priority: 'low',
+    };
+  }
+  if (meta.field === '博主类目') {
+    let mainValue = value;
+    let subValue = subField || '';
+    if (!PGY_BLOGGER_CATEGORY_SUBCATEGORY_OPTIONS[mainValue]) {
+      const parent = Object.entries(PGY_BLOGGER_CATEGORY_SUBCATEGORY_OPTIONS)
+        .find(([, options]) => options.includes(mainValue));
+      if (parent) {
+        mainValue = parent[0];
+        subValue = value;
+      }
+    }
+    const validSubcategories = PGY_BLOGGER_CATEGORY_SUBCATEGORY_OPTIONS[mainValue] || [];
+    if (subValue && !validSubcategories.includes(subValue)) subValue = '';
+    return {
+      field: meta.field,
+      value: mainValue,
+      control_type: meta.control_type || 'tag_select_with_hover_subcategory',
+      ...(subValue ? { sub_value: subValue } : {}),
     };
   }
   return {

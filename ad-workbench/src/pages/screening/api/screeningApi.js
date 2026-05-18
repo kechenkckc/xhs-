@@ -4,7 +4,15 @@ export async function api(url, options = {}) {
     ...fetchOptions,
     headers: { 'Content-Type': 'application/json', ...(fetchOptions.headers || {}) },
   });
-  const payload = await response.json().catch(() => ({}));
+  const text = await response.text();
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { message: text.slice(0, 500) };
+    }
+  }
   if (!response.ok || (!allowBusinessError && payload.ok === false)) {
     const detail = payload.detail || payload;
     const message = detail?.message || detail?.error || payload.message || payload.error || response.statusText || '请求失败';

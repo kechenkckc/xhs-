@@ -17,6 +17,7 @@ import { api } from '../../api/screeningApi';
 import {
   DEFAULT_SCORING_HARD_FILTER_FIELDS,
   hardFilterKey,
+  pgyFilterLabel,
 } from '../../constants/screeningConstants';
 import {
   collectionHardFiltersToPgyFilters,
@@ -25,12 +26,24 @@ import {
   pgyFilterKey,
   syncCollectionHardFiltersFromPgyFilters,
 } from '../../utils/pgyFilters';
-import { hardFilterOptionsFor, normalizeWorkbenchPlan, syncScreeningCriteria } from '../../utils/screeningPlan';
+import { getSchemeAdditionalFilters, getSchemeRequiredFilters, hardFilterOptionsFor, normalizeWorkbenchPlan, syncScreeningCriteria } from '../../utils/screeningPlan';
 import { PgyFindBloggerFilterPanel } from '../filters/PgyFindBloggerFilterPanel';
 import { HardFilterCheckPanel } from '../filters/HardFilterCheckPanel';
 
 const URL_PATTERN = /https?:\/\/[^\s"'<>）)]+/g;
 const FEISHU_PERMISSION_HOSTS = new Set(['open.feishu.cn', 'open.larksuite.com']);
+const REQUIRED_SCHEME_FIELDS = new Set(['博主类目', '粉丝量', '粉丝年龄', '合作报价']);
+const SCHEME_LABELS = ['方案一', '方案二', '方案三', '方案四', '方案五', '方案六'];
+
+const schemeKey = (scheme = {}, index = 0) => String(scheme.scheme_id || scheme.id || scheme.name || `scheme_${index + 1}`);
+const schemeDisplayName = (scheme = {}, index = 0) => SCHEME_LABELS[index] || `方案${index + 1}`;
+
+function enabledSchemeIdsFor(pgyPlan = {}) {
+  const schemes = Array.isArray(pgyPlan.schemes) ? pgyPlan.schemes : [];
+  const allIds = schemes.map((scheme, index) => schemeKey(scheme, index));
+  const savedIds = Array.isArray(pgyPlan.enabled_scheme_ids) ? pgyPlan.enabled_scheme_ids.map(String).filter(Boolean) : [];
+  return savedIds.length ? savedIds.filter(id => allIds.includes(id)) : allIds;
+}
 
 function uniqueItems(items = []) {
   return Array.from(new Set(items.filter(Boolean)));
@@ -123,6 +136,9 @@ export function ProjectSetupTab({
   const [standardStatus, setStandardStatus] = useState('');
   const [collectionFilterStatus, setCollectionFilterStatus] = useState('');
   const [scoringFilterStatus, setScoringFilterStatus] = useState('');
+  const [selectedSchemeIds, setSelectedSchemeIds] = useState([]);
+  const [expandedSchemeId, setExpandedSchemeId] = useState('');
+  const [schemeSaveStatus, setSchemeSaveStatus] = useState({});
   const [feishuStatus, setFeishuStatus] = useState('');
   const [feishuSaved, setFeishuSaved] = useState(false);
   const [feishuTestResult, setFeishuTestResult] = useState(null);
@@ -149,11 +165,23 @@ export function ProjectSetupTab({
   const canUseStandardStep = projectInfoCompleted && feishuCompleted;
 
   useEffect(() => {
-    setScreeningPlan(normalizeWorkbenchPlan(project.screeningPlan || {}));
+    const nextPlan = normalizeWorkbenchPlan(project.screeningPlan || {});
+    const nextSchemes = nextPlan.pgyCollectionPlan?.schemes || [];
+    const nextIds = enabledSchemeIdsFor(nextPlan.pgyCollectionPlan || {});
+    setScreeningPlan(nextPlan);
+    setSelectedSchemeIds(nextIds);
+    setExpandedSchemeId(nextIds[0] || (nextSchemes[0] ? schemeKey(nextSchemes[0], 0) : ''));
+    setSchemeSaveStatus({});
   }, [project.screeningPlan]);
 
   useEffect(() => {
-    setScreeningPlan(normalizeWorkbenchPlan(project.screeningPlan || {}));
+    const nextPlan = normalizeWorkbenchPlan(project.screeningPlan || {});
+    const nextSchemes = nextPlan.pgyCollectionPlan?.schemes || [];
+    const nextIds = enabledSchemeIdsFor(nextPlan.pgyCollectionPlan || {});
+    setScreeningPlan(nextPlan);
+    setSelectedSchemeIds(nextIds);
+    setExpandedSchemeId(nextIds[0] || (nextSchemes[0] ? schemeKey(nextSchemes[0], 0) : ''));
+    setSchemeSaveStatus({});
     setSaved(false);
     setFeishuSaved(false);
     setFeishuStatus('');
@@ -286,7 +314,12 @@ export function ProjectSetupTab({
           feishu_fields: fields,
         }),
       });
-      setScreeningPlan(normalizeWorkbenchPlan(syncScreeningCriteria(result.screeningPlan || {})));
+      const nextPlan = normalizeWorkbenchPlan(syncScreeningCriteria(result.screeningPlan || {}));
+      const nextSchemes = nextPlan.pgyCollectionPlan?.schemes || [];
+      const nextIds = enabledSchemeIdsFor(nextPlan.pgyCollectionPlan || {});
+      setScreeningPlan(nextPlan);
+      setSelectedSchemeIds(nextIds);
+      setExpandedSchemeId(nextIds[0] || (nextSchemes[0] ? schemeKey(nextSchemes[0], 0) : ''));
       setStandardStatus(result.source === 'llm' ? '已调用大模型，并结合飞书字段完成优化' : result.message || '测试阶段已生成量化标准');
     } catch (error) {
       setStandardStatus(error.message || error.message_cn || error.detail?.message || '优化量化标准失败，请检查大模型配置和飞书绑定');
@@ -300,7 +333,13 @@ export function ProjectSetupTab({
     setSavingStandard(true);
     setStandardStatus('正在保存量化标准...');
     try {
-      const nextPlan = syncScreeningCriteria(screeningPlan);
+      const nextPlan = syncScreeningCriteria({
+        ...screeningPlan,
+        pgyCollectionPlan: {
+          ...(screeningPlan.pgyCollectionPlan || {}),
+          enabled_scheme_ids: selectedSchemeIds,
+        },
+      });
       await onSaveScreeningPlan(nextPlan, {
         project_name: form.name,
         target_qualified_creator_count: Number(form.creatorCount || 10),
@@ -337,6 +376,8 @@ export function ProjectSetupTab({
     ),
     [screeningPlan.collectionHardFilters, screeningPlan.pgyCollectionPlan?.filters]
   );
+  const pgyPlan = screeningPlan.pgyCollectionPlan || {};
+  const schemes = Array.isArray(pgyPlan.schemes) ? pgyPlan.schemes : [];
 
   const updateCollectionPgyFilters = (filters = []) => {
     const normalizedFilters = markManualPgyFilters(filters);
@@ -355,11 +396,79 @@ export function ProjectSetupTab({
     });
   };
 
+  const patchScheme = (targetIndex, patcher) => {
+    setCollectionFilterStatus('');
+    setScreeningPlan(old => {
+      const oldPlan = old.pgyCollectionPlan || {};
+      const nextSchemes = (oldPlan.schemes || []).map((scheme, index) => (
+        index === targetIndex ? patcher(scheme) : scheme
+      ));
+      return syncScreeningCriteria({
+        ...old,
+        pgyCollectionPlan: {
+          ...oldPlan,
+          schemes: nextSchemes,
+        },
+      });
+    });
+  };
+
+  const updateSchemeActiveFilters = (targetIndex, filters = []) => {
+    const requiredFilters = filters.filter(item => REQUIRED_SCHEME_FIELDS.has(item.field));
+    const enabledAdditionalFilters = filters.filter(item => !REQUIRED_SCHEME_FIELDS.has(item.field));
+    patchScheme(targetIndex, scheme => {
+      const additionalFilters = mergeOptionItems(getSchemeAdditionalFilters(scheme), enabledAdditionalFilters, pgyFilterKey);
+      return {
+        ...scheme,
+        required_filters: requiredFilters,
+        base_filters: requiredFilters,
+        additional_filters: additionalFilters,
+        extra_filters: additionalFilters,
+        enabled_additional_filters: enabledAdditionalFilters,
+        enabled_extra_filters: enabledAdditionalFilters,
+      };
+    });
+  };
+
+  const toggleSchemeAdditionalFilter = (targetIndex, filter) => {
+    patchScheme(targetIndex, scheme => {
+      const enabled = scheme.enabled_additional_filters || scheme.enabled_extra_filters || [];
+      const exists = enabled.some(item => pgyFilterKey(item) === pgyFilterKey(filter));
+      const nextEnabled = exists ? enabled.filter(item => pgyFilterKey(item) !== pgyFilterKey(filter)) : [...enabled, filter];
+      return {
+        ...scheme,
+        enabled_additional_filters: nextEnabled,
+        enabled_extra_filters: nextEnabled,
+      };
+    });
+  };
+
+  const toggleScheme = (id) => {
+    setSelectedSchemeIds(old => {
+      const nextIds = old.includes(id) ? old.filter(item => item !== id) : [...old, id];
+      setCollectionFilterStatus('');
+      setScreeningPlan(plan => syncScreeningCriteria({
+        ...plan,
+        pgyCollectionPlan: {
+          ...(plan.pgyCollectionPlan || {}),
+          enabled_scheme_ids: nextIds,
+        },
+      }));
+      return nextIds;
+    });
+  };
+
   const saveScreeningPlanPart = async (part) => {
     const setStatus = part === 'collection' ? setCollectionFilterStatus : setScoringFilterStatus;
     setStatus('正在保存...');
     try {
-      const nextPlan = syncScreeningCriteria(screeningPlan);
+      const nextPlan = syncScreeningCriteria({
+        ...screeningPlan,
+        pgyCollectionPlan: {
+          ...(screeningPlan.pgyCollectionPlan || {}),
+          enabled_scheme_ids: selectedSchemeIds,
+        },
+      });
       await onSaveScreeningPlan?.(nextPlan, {
         project_name: form.name,
         target_qualified_creator_count: Number(form.creatorCount || 10),
@@ -371,6 +480,31 @@ export function ProjectSetupTab({
       setStatus(part === 'collection' ? '采集前筛选条件已保存，并同步到采集工作台' : '评分筛选条件已保存，并同步到初筛评分工作台');
     } catch (error) {
       setStatus(error.message || '保存失败');
+    }
+  };
+
+  const saveSchemeConfig = async (id) => {
+    setSchemeSaveStatus(old => ({ ...old, [id]: '正在保存本方案...' }));
+    try {
+      const nextPlan = syncScreeningCriteria({
+        ...screeningPlan,
+        pgyCollectionPlan: {
+          ...(screeningPlan.pgyCollectionPlan || {}),
+          enabled_scheme_ids: selectedSchemeIds,
+        },
+      });
+      await onSaveScreeningPlan?.(nextPlan, {
+        project_name: form.name,
+        target_qualified_creator_count: Number(form.creatorCount || 10),
+        period_start: form.periodStart,
+        period_end: form.periodEnd,
+        brief: form.description,
+      });
+      setScreeningPlan(normalizeWorkbenchPlan(nextPlan));
+      setSchemeSaveStatus(old => ({ ...old, [id]: '本方案已保存，采集工作台会使用当前配置' }));
+      setCollectionFilterStatus('方案配置已保存，并同步到采集工作台');
+    } catch (error) {
+      setSchemeSaveStatus(old => ({ ...old, [id]: error.message || '本方案保存失败' }));
     }
   };
 
@@ -502,12 +636,121 @@ export function ProjectSetupTab({
                   <div className="standard-hard-filter-group">
                     <div className="standard-hard-filter-group-title">
                       <span><Download size={14} />采集前筛选条件</span>
-                      <small>按蒲公英「找博主」筛选区展示，AI 生成条件会进入已选条件</small>
+                      <small>按蒲公英「找博主」方案展示，勾选的方案会同步到采集工作台</small>
                     </div>
-                    <PgyFindBloggerFilterPanel
-                      filters={activeCollectionPgyFilters}
-                      onChange={updateCollectionPgyFilters}
-                    />
+                    {schemes.length > 0 ? (
+                      <div className="collection-scheme-card-grid">
+                        {schemes.map((scheme, index) => {
+                          const id = schemeKey(scheme, index);
+                          const selected = selectedSchemeIds.includes(id);
+                          const expanded = expandedSchemeId === id;
+                          const requiredFilters = getSchemeRequiredFilters(scheme);
+                          const additionalFilters = getSchemeAdditionalFilters(scheme);
+                          const enabledAdditionalFilters = scheme.enabled_additional_filters || scheme.enabled_extra_filters || [];
+                          const editableFilters = mergeOptionItems(requiredFilters, enabledAdditionalFilters, pgyFilterKey);
+                          return (
+                            <div key={id} className={`collection-scheme-card ${selected ? 'is-selected' : ''}`}>
+                              <div className="collection-scheme-card-head">
+                                <label className="collection-scheme-check">
+                                  <input
+                                    type="checkbox"
+                                    checked={selected}
+                                    onChange={() => toggleScheme(id)}
+                                  />
+                                  <span>
+                                    <strong>{schemeDisplayName(scheme, index)}</strong>
+                                    <small>{scheme.name || id}</small>
+                                  </span>
+                                </label>
+                                <button
+                                  type="button"
+                                  className={`collection-plan-collapse-button ${expanded ? 'is-expanded' : ''}`}
+                                  onClick={() => setExpandedSchemeId(expanded ? '' : id)}
+                                  aria-expanded={expanded}
+                                >
+                                  <span className="collection-plan-collapse-main">
+                                    <span className="collection-plan-collapse-icon">
+                                      <Settings size={14} />
+                                    </span>
+                                    <span className="collection-plan-collapse-copy">
+                                      <strong>配置方案</strong>
+                                      <small>{expanded ? '收起后回到方案概览' : '展开查看可编辑条件'}</small>
+                                    </span>
+                                  </span>
+                                  <span className="collection-plan-collapse-action">
+                                    <span className="collection-plan-toggle-text">{expanded ? '收起' : '展开'}</span>
+                                    <ChevronDown size={14} className={expanded ? 'is-open' : ''} />
+                                  </span>
+                                </button>
+                              </div>
+                              <div className="collection-scheme-goal">{scheme.goal || '按该方案独立应用蒲公英筛选并采集'}</div>
+                              <div className="collection-scheme-chip-row">
+                                {editableFilters.slice(0, 5).map(item => (
+                                  <span key={pgyFilterKey(item)}>{pgyFilterLabel(item)}</span>
+                                ))}
+                                {editableFilters.length > 5 && <span>+{editableFilters.length - 5}</span>}
+                              </div>
+                              <div className="collection-scheme-stats">
+                                <div>
+                                  <span>蒲公英预估</span>
+                                  <strong>采集时读取</strong>
+                                </div>
+                                <div>
+                                  <span>方案状态</span>
+                                  <strong>{selected ? '纳入采集' : '不采集'}</strong>
+                                </div>
+                              </div>
+                              <div className="collection-scheme-save-row">
+                                <span className={String(schemeSaveStatus[id] || '').includes('失败') ? 'is-error' : ''}>
+                                  {schemeSaveStatus[id] || (selected ? '已勾选，保存后纳入采集' : '未勾选，保存后不纳入采集')}
+                                </span>
+                                <button type="button" className="btn btn-primary btn-sm" onClick={() => saveSchemeConfig(id)}>
+                                  <Save size={14} />保存本方案
+                                </button>
+                              </div>
+                              {expanded && (
+                                <div className="collection-scheme-config">
+                                  <div className="collection-scheme-config-title">
+                                    <span>已应用条件</span>
+                                    <small>这里修改后保存，采集工作台会沿用同一方案</small>
+                                  </div>
+                                  <PgyFindBloggerFilterPanel
+                                    filters={editableFilters}
+                                    onChange={(nextFilters) => updateSchemeActiveFilters(index, nextFilters)}
+                                  />
+                                  {additionalFilters.length > 0 && (
+                                    <div className="collection-scheme-extra-list">
+                                      <span>可选附加条件</span>
+                                      <div>
+                                        {additionalFilters.map(item => {
+                                          const active = enabledAdditionalFilters.some(next => pgyFilterKey(next) === pgyFilterKey(item));
+                                          return (
+                                            <button
+                                              key={pgyFilterKey(item)}
+                                              type="button"
+                                              className={active ? 'is-active' : ''}
+                                              onClick={() => toggleSchemeAdditionalFilter(index, item)}
+                                            >
+                                              {active ? <CheckCircle2 size={13} /> : <Plus size={13} />}
+                                              {pgyFilterLabel(item)}
+                                            </button>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <PgyFindBloggerFilterPanel
+                        filters={activeCollectionPgyFilters}
+                        onChange={updateCollectionPgyFilters}
+                      />
+                    )}
                     <div className="standard-filter-save-row">
                       <span className={collectionFilterStatus.includes('失败') ? 'is-error' : ''}>{collectionFilterStatus || '保存后采集工作台会同步使用当前条件。'}</span>
                       <button type="button" className="btn btn-primary btn-sm" onClick={() => saveScreeningPlanPart('collection')}>
@@ -585,10 +828,17 @@ export function ProjectSetupTab({
                     </div>
                     <div className="project-setup-preview-grid">
                       <div className="project-setup-preview-card">
-                        <div style={{ color: 'var(--text-secondary)', fontSize: 12, marginBottom: 8 }}>页面筛选条件</div>
+                        <div style={{ color: 'var(--text-secondary)', fontSize: 12, marginBottom: 8 }}>方案映射</div>
                         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                          {(screeningPlan.pgyCollectionPlan.filters || []).map((item, i) => (
-                            <span key={`${item.field}-${item.value}-${i}`} className="tag">{item.field}：{item.value}</span>
+                          {schemes.length > 0 ? schemes.map((scheme, i) => {
+                            const id = schemeKey(scheme, i);
+                            return (
+                              <span key={id} className="tag">
+                                {schemeDisplayName(scheme, i)}：{scheme.name || id}{selectedSchemeIds.includes(id) ? '' : '（未勾选）'}
+                              </span>
+                            );
+                          }) : (screeningPlan.pgyCollectionPlan.filters || []).map((item, i) => (
+                            <span key={`${item.field}-${item.value}-${i}`} className="tag">{pgyFilterLabel(item)}</span>
                           ))}
                         </div>
                       </div>

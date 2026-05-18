@@ -45,15 +45,18 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
   const [poolMessage, setPoolMessage] = useState('');
   const creators = useMemo(() => {
     if (poolData?.groups) {
-      return Object.values(poolData.groups).flat().map(mapBackendCreator);
+      return Object.entries(poolData.groups)
+        .filter(([stage]) => stage !== '筛选工作台')
+        .flatMap(([, items]) => items || [])
+        .map(mapBackendCreator);
     }
     return getProjectCreators(project).map((creator, index) => ({
       ...creator,
       ...(getCreatorStatus(project.id, creator.id, screeningStatus) || {}),
       poolStage: getPoolStage({ ...creator, ...(getCreatorStatus(project.id, creator.id, screeningStatus) || {}) }, index),
-    }));
+    })).filter(creator => getPoolStage(creator) !== '筛选工作台');
   }, [poolData, project, screeningStatus]);
-  const [activeStage, setActiveStage] = useState('已合作跟进中');
+  const [activeStage, setActiveStage] = useState('合格达人待合作');
   const [collectionDateFilter, setCollectionDateFilter] = useState('全部');
   const [activeTagFilter, setActiveTagFilter] = useState('');
   const [expandedId, setExpandedId] = useState(null);
@@ -94,6 +97,7 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
     const result = Object.fromEntries(Object.keys(stageConfig).map(stage => [stage, []]));
     if (poolData?.groups) {
       Object.entries(poolData.groups).forEach(([stage, items]) => {
+        if (!stageConfig[stage]) return;
         result[stage] = (items || [])
           .map(mapBackendCreator)
           .filter(creator => collectionDateFilter === '全部' || getDateKey(getCreatorCollectedAt(creator)) === collectionDateFilter)
@@ -158,7 +162,7 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
         body: JSON.stringify({ project_id: project.id, auto_writeback_enabled: nextEnabled }),
       });
       setWritebackSettings(payload.settings || { auto_writeback_enabled: nextEnabled });
-      setPoolMessage(nextEnabled ? '已开启自动写回：合格达人完成详情补采后会写入飞书' : '已关闭自动写回：可手动批量写入合格达人');
+      setPoolMessage(nextEnabled ? '已开启自动写回：合格达人完成详情完善后会写入飞书' : '已关闭自动写回：可手动批量写入合格达人');
     } catch (error) {
       setPoolMessage(error.message || '写回设置保存失败');
     } finally {
@@ -216,13 +220,13 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
     setDetailBusy(true);
     setPoolMessage(`正在完善${label}详情...`);
     try {
-      await onCollectDetails({
+      const result = await onCollectDetails({
         creatorIds: targetCreators.map(creator => creator.id),
         segment: `pool:${label}`,
         segmentLabel: label,
       });
       await loadCreatorPool();
-      setPoolMessage(`已提交${label}详情页完善，共 ${targetCreators.length} 位达人`);
+      setPoolMessage(result?.message || `已完成${label}详情页完善，共 ${targetCreators.length} 位达人`);
     } finally {
       setDetailBusy(false);
     }
@@ -254,7 +258,7 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
         <div>
           <div className="creator-pool-eyebrow">Project Creator Pool</div>
           <h3>项目达人池</h3>
-          <p>沉淀当前项目可合作达人，按合作进度分层管理，并保留合作中达人的近期数据更新记录。</p>
+          <p>采集达人先在筛选工作台完成评分匹配，人工通过后再进入项目达人池分层管理。</p>
         </div>
         <div className="creator-pool-hero-stats">
           <div><strong>{creators.length}</strong><span>池内达人</span></div>
@@ -281,7 +285,7 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
             className={`creator-pool-writeback-toggle ${writebackSettings.auto_writeback_enabled ? 'is-on' : ''}`}
             onClick={handleToggleAutoWriteback}
             disabled={writebackBusy}
-            title="开启后，详情补采完成且评分合格的真实达人会自动写入飞书"
+            title="开启后，详情完善完成且评分合格的真实达人会自动写入飞书"
           >
             {writebackSettings.auto_writeback_enabled ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}
             <span>{writebackSettings.auto_writeback_enabled ? '自动写回已开' : '自动写回已关'}</span>
@@ -293,7 +297,7 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
             className="btn btn-sm btn-primary"
             onClick={() => handleCollectPoolDetails(activeStageCreators, activeStage)}
             disabled={detailBusy || !activeStageCreators.length}
-            title="手动完善当前分组内所有达人详情，不受自动补采优先级限制"
+            title="手动完善当前分组内所有达人详情，不受自动详情完善优先级限制"
           >
             <FileText size={14} />完善当前分组{activeStageCreators.length ? ` ${activeStageCreators.length}` : ''}
           </button>
@@ -452,7 +456,7 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
                             className="btn btn-sm btn-secondary"
                             onClick={() => handleCollectPoolDetails([creator], creator.name)}
                             disabled={detailBusy}
-                            title="手动完善该达人详情，不受自动补采优先级限制"
+                            title="手动完善该达人详情，不受自动详情完善优先级限制"
                           >
                             <FileText size={13} />完善详情
                           </button>

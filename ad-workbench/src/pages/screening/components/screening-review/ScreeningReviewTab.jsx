@@ -20,7 +20,8 @@ import { getProjectCreators, getCreatorStatus, getDefaultCreatorStatus } from '.
 import { getReviewVariant, getScoreColor, getScoreTier } from '../../utils/creatorScoring';
 import { mergeOptionItems } from '../../utils/pgyFilters';
 import { hardFilterOptionsFor, normalizeWorkbenchPlan, syncScreeningCriteria } from '../../utils/screeningPlan';
-import { getCreatorAvatarUrl, getPgyUrl } from '../../utils/creatorMappers';
+import { getCreatorAvatarUrl, getCreatorDisplayId, getCreatorRealNoteCases, getPgyUrl } from '../../utils/creatorMappers';
+import { getCreatorAdRecommendation, getCreatorLightProfile } from '../../utils/creatorScoring';
 import { SelectedChips } from '../filters/SelectedChips';
 import { HardFilterCheckPanel } from '../filters/HardFilterCheckPanel';
 import { CreatorDetailModal } from './CreatorDetailModal';
@@ -36,7 +37,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   );
 
   const [statusFilter, setStatusFilter] = useState('全部');
-  const [tierFilter, setTierFilter] = useState('S');
+  const [tierFilter, setTierFilter] = useState('全部');
   const [typeFilter, setTypeFilter] = useState('全部');
   const [searchTerm, setSearchTerm] = useState('');
   const [sortField, setSortField] = useState('baseScore');
@@ -51,6 +52,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   const [planDraft, setPlanDraft] = useState(() => normalizeWorkbenchPlan(project.screeningPlan || {}));
   const [planExpanded, setPlanExpanded] = useState(false);
   const [planStatus, setPlanStatus] = useState('');
+  const [scoreRun, setScoreRun] = useState({ status: 'idle', message: '' });
 
   useEffect(() => {
     setPlanDraft(normalizeWorkbenchPlan(project.screeningPlan || {}));
@@ -64,9 +66,9 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   const filtered = useMemo(() => {
     let list = [...screeningCandidates];
     if (statusFilter !== '全部') list = list.filter(c => c.review === statusFilter);
-    list = list.filter(c => getScoreTier(c.baseScore).key === tierFilter);
+    if (tierFilter !== '全部') list = list.filter(c => getScoreTier(c.baseScore).key === tierFilter);
     if (typeFilter !== '全部') list = list.filter(c => c.type === typeFilter);
-    if (searchTerm) list = list.filter(c => c.name.includes(searchTerm));
+    if (searchTerm) list = list.filter(c => `${c.name} ${getCreatorDisplayId(c)} ${c.id}`.includes(searchTerm));
     list.sort((a, b) => {
       const av = a[sortField], bv = b[sortField];
       if (typeof av === 'number' && typeof bv === 'number') return sortDir === 'desc' ? bv - av : av - bv;
@@ -97,7 +99,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
       S: { label: 'S档', desc: '100分以上，必须补采', count: 0, variant: 'green', color: '#10B981' },
       A: { label: 'A档', desc: '90-99分，优先补采', count: 0, variant: 'blue', color: '#3B82F6' },
       'B+': { label: 'B+档', desc: '80-89分，高潜补采', count: 0, variant: 'amber', color: '#F59E0B' },
-      B: { label: 'B档', desc: '70-79分，暂缓补采', count: 0, variant: 'amber', color: '#D97706' },
+      B: { label: 'B档', desc: '70-79分，暂缓观察', count: 0, variant: 'amber', color: '#D97706' },
       C: { label: 'C档', desc: '70分以下，不补采', count: 0, variant: 'red', color: '#EF4444' },
     };
     screeningCandidates.forEach(creator => {
@@ -106,7 +108,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
     });
     return tiers;
   }, [screeningCandidates]);
-  const activeTier = tierStats[tierFilter] || null;
+  const activeTier = tierFilter === '全部' ? null : tierStats[tierFilter] || null;
   const savedPlan = useMemo(() => normalizeWorkbenchPlan(project.screeningPlan || {}), [project.screeningPlan]);
   const planDirty = JSON.stringify(planDraft.scoringHardFilters || []) !== JSON.stringify(savedPlan.scoringHardFilters || []);
   const scoringHardFilterOptions = useMemo(
@@ -222,25 +224,59 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
     return payload;
   };
 
-  const handleCollectCurrentTierDetails = () => {
+  const handleCollectCurrentTierDetails = async () => {
     if (!filtered.length || !onCollectDetails) return;
-    const segmentLabel = activeTier?.label || `${tierFilter}档`;
-    onCollectDetails({
+    const segmentLabel = activeTier?.label || '全部档位';
+    setPlanStatus(`正在完善${segmentLabel} ${filtered.length} 位达人详情...`);
+    const result = await onCollectDetails({
       creatorIds: filtered.map(creator => creator.id),
       segment: tierFilter,
       segmentLabel,
     });
+    setPlanStatus(result?.message || `已完成${segmentLabel}详情完善`);
+    await onRefresh?.();
+  };
+
+  const runAiScore = async (source = 'toolbar') => {
+    if (!onScore) {
+      setScoreRun({ status: 'error', message: '当前项目未接入 AI 评分接口' });
+      return null;
+    }
+    if (!screeningCandidates.length) {
+      setScoreRun({ status: 'error', message: '暂无可评分达人，请先完成采集或导入候选达人' });
+      return null;
+    }
+    const startedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    setScoreRun({
+      status: 'running',
+      message: `AI 评分进行中：正在核算 ${screeningCandidates.length} 位达人投流效果、合作笔记、人设优势和风险...`,
+    });
+    try {
+      const result = await onScore({ source });
+      if (result?.ok === false) {
+        throw new Error(result.message || result.error || 'AI 评分失败');
+      }
+      const scored = result?.scored ?? result?.refreshed?.creators?.length ?? screeningCandidates.length;
+      setScoreRun({
+        status: 'success',
+        message: `AI 评分完成：${scored} 位达人已更新评分和推荐理由 · ${startedAt}`,
+      });
+      return result;
+    } catch (error) {
+      setScoreRun({ status: 'error', message: error.message || 'AI 评分失败，请稍后重试' });
+      return null;
+    }
   };
 
   const saveScoringPlan = async (runScore = false) => {
-    setPlanStatus(runScore ? '正在保存评分筛选条件并重新评分...' : '正在保存评分筛选条件...');
+    setPlanStatus(runScore ? '正在保存评分筛选条件并进行 AI 评分...' : '正在保存评分筛选条件...');
     try {
       const nextPlan = syncScreeningCriteria(planDraft);
       await onSavePlan?.(nextPlan);
       setPlanDraft(normalizeWorkbenchPlan(nextPlan));
       if (runScore) {
-        await onScore?.();
-        setPlanStatus('评分筛选条件已保存，并已触发重新评分');
+        const result = await runAiScore('save-plan');
+        setPlanStatus(result ? '评分筛选条件已保存，AI 评分已完成' : '评分筛选条件已保存，但 AI 评分未完成');
       } else {
         setPlanStatus('评分筛选条件已保存，并同步到项目配置');
       }
@@ -309,6 +345,72 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   };
 
   const scoreDimLabels = { budget: '预算匹配', fans: '粉丝量级', cpe: 'CPE效率', engagement: '互动质量', persona: '人设匹配', content: '内容风格' };
+  const scoreBusy = scoreRun.status === 'running';
+
+  const renderLightProfileSummary = (creator) => {
+    const profile = getCreatorLightProfile(creator, project);
+    return (
+      <div className="creator-light-profile">
+        <div className="creator-light-profile-score">
+          <strong>{profile.contentValueScore}</strong>
+          <span>内容价值</span>
+          <Badge variant={profile.hasDeepProfile ? 'green' : 'default'}>{profile.hasDeepProfile ? '深档案' : '轻档案'}</Badge>
+        </div>
+        <div className="creator-light-profile-text">
+          <div>{profile.mainStrengths.slice(0, 2).join('、')}</div>
+          <small>{profile.mainRisks[0]} · {profile.nextAction}</small>
+        </div>
+      </div>
+    );
+  };
+
+  const renderAdRecommendation = (creator) => {
+    const recommendation = getCreatorAdRecommendation(creator, getCreatorRealNoteCases(creator));
+    return (
+      <div className="screening-ai-reason-card">
+        <div className="screening-ai-reason-head">
+          <div>
+            <span>AI 推荐理由</span>
+            <strong>{recommendation.verdict}</strong>
+          </div>
+          <Badge variant={recommendation.verdict.includes('偏高') ? 'amber' : recommendation.verdict.includes('待补') ? 'default' : 'green'}>
+            {recommendation.action}
+          </Badge>
+        </div>
+
+        <div className="screening-ai-metric-strip">
+          {recommendation.costMetrics.map(item => (
+            <div className={`screening-ai-metric is-${item.tone}`} key={item.label}>
+              <span>{item.label}</span>
+              <strong>{item.value}</strong>
+              <small>{item.status}</small>
+            </div>
+          ))}
+        </div>
+
+        <div className="screening-ai-note-metrics">
+          <div className="screening-ai-section-title">合作笔记数据</div>
+          <div className="screening-ai-note-grid">
+            {recommendation.noteMetrics.map(item => (
+              <span key={item.label}><strong>{item.value}</strong>{item.label}</span>
+            ))}
+          </div>
+          <p>{recommendation.noteSummary}</p>
+        </div>
+
+        <div className="screening-ai-pros-cons">
+          <div>
+            <div className="screening-ai-section-title">优势</div>
+            {recommendation.strengths.map(item => <p key={item}>{item}</p>)}
+          </div>
+          <div>
+            <div className="screening-ai-section-title">短板/风险</div>
+            {recommendation.weaknesses.map(item => <p key={item}>{item}</p>)}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div>
@@ -316,11 +418,19 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
         <div>
           <div className="screening-workbench-eyebrow">Scoring & Human Review</div>
           <h3>筛选工作台</h3>
-          <p>展示采集后的初步评分结果，按基础分100+加成分20分层，只让高分/高潜达人进入详情页补采。</p>
+          <p>展示找博主数据层级结果，按预算效果、近30天表现和T级基准分层，只让高分/高潜达人进入详情页完善。</p>
         </div>
         <button className="btn btn-primary" onClick={() => onTabChange?.('score-preview')}>
           <Users size={14} />查看项目达人池
         </button>
+      </div>
+
+      <div className={`screening-action-status is-${scoreRun.status}`}>
+        <div>
+          {scoreBusy ? <RefreshCw size={15} className="is-spinning" /> : <Sparkles size={15} />}
+          <span>{scoreRun.message || 'AI 评分会按投流效果、合作笔记数据、达人优势和短板重新生成分数与推荐理由。'}</span>
+        </div>
+        {scoreRun.status === 'success' && <button type="button" onClick={() => setScoreRun({ status: 'idle', message: '' })}>收起</button>}
       </div>
 
       <div className="screening-tier-grid" style={{ marginBottom: 20 }}>
@@ -383,13 +493,14 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
           </div>
         )}
         <div className="collection-plan-actions">
-          <span className={planStatus.includes('失败') ? 'is-error' : ''}>{planStatus || '平时折叠；修改后保存，重新评分会使用当前条件。'}</span>
+          <span className={planStatus.includes('失败') ? 'is-error' : ''}>{planStatus || '平时折叠；修改后保存，AI 评分会使用当前条件。'}</span>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button className="btn btn-secondary" onClick={() => saveScoringPlan(false)} disabled={!planDirty && planStatus.includes('已保存')}>
               <Save size={14} style={{ marginRight: 4 }} />保存条件
             </button>
-            <button className="btn btn-primary" onClick={() => saveScoringPlan(true)}>
-              <Sparkles size={14} style={{ marginRight: 4 }} />保存并重新评分
+            <button className="btn btn-primary" onClick={() => saveScoringPlan(true)} disabled={scoreBusy}>
+              {scoreBusy ? <RefreshCw size={14} className="is-spinning" style={{ marginRight: 4 }} /> : <Sparkles size={14} style={{ marginRight: 4 }} />}
+              {scoreBusy ? 'AI 评分中' : '保存并 AI 评分'}
             </button>
           </div>
         </div>
@@ -411,6 +522,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
             <option value="人工复核">人工复核</option>
           </select>
           <select className="select-field" style={{ width: 110 }} value={tierFilter} onChange={e => setTierFilter(e.target.value)}>
+            <option value="全部">全部档位</option>
             <option value="S">S档</option>
             <option value="A">A档</option>
             <option value="B+">B+档</option>
@@ -425,8 +537,16 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-sm btn-secondary" onClick={onImport}><Upload size={14} style={{ marginRight: 4 }} />导入模板</button>
-          <button className="btn btn-sm btn-secondary" onClick={onCollect}><Bot size={14} style={{ marginRight: 4 }} />蒲公英采集</button>
-          <button className="btn btn-sm btn-secondary" onClick={onScore}><Sparkles size={14} style={{ marginRight: 4 }} />重新评分</button>
+          <button className="btn btn-sm btn-secondary" onClick={() => onCollect?.()}><Bot size={14} style={{ marginRight: 4 }} />蒲公英采集</button>
+          <button
+            className="btn btn-sm btn-secondary"
+            onClick={() => runAiScore('toolbar')}
+            disabled={scoreBusy || !screeningCandidates.length}
+            title="重新核算投流效果、合作笔记数据、达人优势和短板"
+          >
+            {scoreBusy ? <RefreshCw size={14} className="is-spinning" style={{ marginRight: 4 }} /> : <Sparkles size={14} style={{ marginRight: 4 }} />}
+            {scoreBusy ? '评分中' : 'AI评分'}
+          </button>
           <button
             className="btn btn-sm btn-primary"
             onClick={() => openInviteModal(creators.filter(c => selectedIds.includes(c.id)), '初筛找博主批量邀约')}
@@ -439,9 +559,9 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
             className="btn btn-sm btn-primary"
             onClick={handleCollectCurrentTierDetails}
             disabled={!filtered.length}
-            title={`批量完善当前${activeTier?.label || tierFilter}分段的达人详情页`}
+            title={`批量完善当前${activeTier?.label || '全部档位'}分段的达人详情页`}
           >
-            <FileText size={14} style={{ marginRight: 4 }} />完善{activeTier?.label || tierFilter}{filtered.length ? ` ${filtered.length}` : ''}
+            <FileText size={14} style={{ marginRight: 4 }} />完善{activeTier?.label || '全部档位'}{filtered.length ? ` ${filtered.length}` : ''}
           </button>
           <button className="btn btn-sm btn-ghost" onClick={onRefresh}><RefreshCw size={14} /></button>
           <button className="btn btn-sm btn-secondary" onClick={() => openBatchModal('pass')} disabled={!selectedIds.length} title="批量通过当前勾选达人"><UserCheck size={14} style={{ marginRight: 4 }} />批量通过{selectedIds.length ? ` ${selectedIds.length}` : ''}</button>
@@ -468,6 +588,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
               <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }} onClick={() => toggleSort('followersNum')}>粉丝数 <SortIcon field="followersNum" /></th>
               <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }} onClick={() => toggleSort('quoteNum')}>报价 <SortIcon field="quoteNum" /></th>
               <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }} onClick={() => toggleSort('baseScore')}>初筛总分 <SortIcon field="baseScore" /></th>
+              <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>内容建模</th>
               <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>档位</th>
               <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>风险</th>
               <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>审核状态</th>
@@ -495,7 +616,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
                       {renderCreatorAvatar(creator)}
                       <div>
                         {renderCreatorName(creator, { color: 'var(--text-primary)', fontWeight: 600 })}
-                        <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>ID: {creator.id}</div>
+                        <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{getCreatorDisplayId(creator)}</div>
                       </div>
                     </div>
                   </td>
@@ -507,6 +628,9 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
                     <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
                       基础 {creator.baseOnlyScore || 0} + 加成 {creator.bonusScore || 0} · 完整度 {creator.informationCompletenessLabel}
                     </span>
+                  </td>
+                  <td style={{ padding: '12px', minWidth: 210 }}>
+                    {renderLightProfileSummary(creator)}
                   </td>
                   <td style={{ padding: '12px' }}>
                     {(() => {
@@ -559,7 +683,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
                 </tr>
                 {expandedId === creator.id && (
                   <tr style={{ background: 'var(--bg-raised)' }}>
-                    <td colSpan={11} style={{ padding: '16px 24px', borderBottom: '1px solid var(--border-primary)' }}>
+                    <td colSpan={12} style={{ padding: '16px 24px', borderBottom: '1px solid var(--border-primary)' }}>
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
                         {/* 评分维度 */}
                         <div>
@@ -576,17 +700,14 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
                         </div>
                         {/* AI 推荐理由 */}
                         <div>
-                          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12, fontWeight: 600 }}>AI 推荐理由</div>
-                          <div style={{ padding: 12, background: 'var(--bg-secondary)', borderRadius: 8, borderLeft: '3px solid #8B5CF6' }}>
-                            <p style={{ margin: 0, color: 'var(--text-primary)', fontSize: 13, lineHeight: 1.7 }}>{creator.aiReason || '暂无 AI 评估'}</p>
-                          </div>
+                          {renderAdRecommendation(creator)}
                           {(creator.risk || []).length > 0 && (
-                            <div style={{ marginTop: 12 }}>
-                              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 }}>风险提示</div>
+                            <div className="screening-ai-risk-list">
+                              <div>风险提示</div>
                               {(creator.risk || []).map((r, i) => (
-                                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                                  <AlertTriangle size={12} style={{ color: '#F59E0B', flexShrink: 0 }} />
-                                  <span style={{ fontSize: 12, color: 'var(--text-primary)' }}>{r}</span>
+                                <div key={i}>
+                                  <AlertTriangle size={12} />
+                                  <span>{r}</span>
                                 </div>
                               ))}
                             </div>

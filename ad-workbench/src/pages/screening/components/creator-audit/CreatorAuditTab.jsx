@@ -71,12 +71,116 @@ function normalizeNoteComments(note) {
     .slice(0, 6);
 }
 
+function normalizeNoteTopics(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(item => String(item || '').trim())
+    .filter(Boolean);
+}
+
+function deriveNoteTopics(note, parsedNote = {}) {
+  const text = [
+    note.title,
+    note.content,
+    note.summary,
+    note.description,
+    parsedNote.content,
+    parsedNote.cover_text,
+    normalizeNoteComments(note).join(' '),
+  ].join(' ').toLowerCase();
+  const topics = [];
+  if (/学习|作业|答疑|效率|方法|工具|课程|教辅/.test(text)) topics.push('学习工具');
+  if (/亲子|孩子|家长|妈妈|爸爸|陪读/.test(text)) topics.push('亲子家庭');
+  if (/测评|体验|开箱|对比|攻略|清单/.test(text)) topics.push('测评种草');
+  if (/真实|好用|有用|种草|建议|避坑/.test(text)) topics.push('真实分享');
+  if (/卧室|家居|收纳|装修|生活/.test(text)) topics.push('家居生活');
+  const hashtags = String(note.content || note.summary || '').match(/#[^#\s]+/g) || [];
+  return Array.from(new Set([
+    ...normalizeNoteTopics(note.topics || note.tags),
+    ...normalizeNoteTopics(parsedNote.topics),
+    ...hashtags.map(tag => tag.replace(/^#/, '')),
+    ...topics,
+  ])).slice(0, 6);
+}
+
+function formatNoteMetricValue(value) {
+  if (value === undefined || value === null || value === '') return '待补';
+  const text = String(value).trim();
+  if (!text) return '待补';
+  return /^\d+(?:\.\d+)?$/.test(text) ? compactNumber(text) : text;
+}
+
+function getNoteDetailModel(noteModal, noteParseResult) {
+  const note = noteModal?.note || {};
+  const parsed = noteParseResult?.note || {};
+  const content = String(
+    parsed.content
+    || note.content
+    || note.summary
+    || note.description
+    || note.note_content
+    || note.note_text
+    || ''
+  ).trim();
+  const title = String(parsed.title || note.title || '').trim();
+  const coverUrl = parsed.cover_url || note.coverUrl || note.cover_url || '';
+  const coverText = String(parsed.cover_text || note.coverText || note.cover_text || '').trim();
+  const publishedAt = parsed.published_at || note.publishedAt || note.published_at || '';
+  const comments = normalizeNoteComments({
+    ...note,
+    comments: Array.isArray(parsed.comments) && parsed.comments.length ? parsed.comments : note.comments,
+  });
+  const topics = deriveNoteTopics(note, parsed);
+  const metrics = {
+    readCount: parsed.metrics?.read_count ?? note.readCount ?? '',
+    likeCount: parsed.metrics?.like_count ?? note.likeCount ?? '',
+    saveCount: parsed.metrics?.save_count ?? note.saveCount ?? '',
+    commentCount: parsed.metrics?.comment_count ?? note.commentCount ?? '',
+    shareCount: parsed.metrics?.share_count ?? note.shareCount ?? '',
+    exposureCount: parsed.metrics?.exposure_count ?? note.exposureCount ?? note.impressionCount ?? '',
+    followCount: parsed.metrics?.follow_count ?? note.followCount ?? '',
+  };
+  const metricLabels = new Set(['阅读量', '点赞量', '收藏量', '评论量', '分享量', '曝光量', '关注量']);
+  const backendMissingFields = Array.isArray(parsed.missing_fields) ? parsed.missing_fields.map(item => String(item || '').trim()).filter(Boolean) : [];
+  const missingFields = Array.from(new Set([
+    ...backendMissingFields.filter(item => !metricLabels.has(item)),
+    ...(!coverUrl && !coverText ? ['封面'] : []),
+    ...(!title ? ['标题'] : []),
+    ...(!content ? ['正文'] : []),
+    ...(!topics.length ? ['话题'] : []),
+    ...(!comments.length ? ['评论样本'] : []),
+    ...(!publishedAt ? ['发布时间'] : []),
+  ]));
+  const missingMetrics = [
+    ['阅读量', metrics.readCount],
+    ['点赞量', metrics.likeCount],
+    ['收藏量', metrics.saveCount],
+    ['评论量', metrics.commentCount],
+    ['分享量', metrics.shareCount],
+    ['曝光量', metrics.exposureCount],
+    ['关注量', metrics.followCount],
+  ].filter(([label, value]) => !value || backendMissingFields.includes(label)).map(([label]) => label);
+  return {
+    title,
+    content,
+    coverUrl,
+    coverText,
+    publishedAt,
+    comments,
+    topics,
+    metrics,
+    missingFields,
+    missingMetrics,
+  };
+}
+
 function getNoteEvidence(note) {
   const comments = normalizeNoteComments(note);
   return {
     title: String(note.title || '').trim(),
     coverText: String(note.coverText || note.cover_text || '').trim(),
     coverUrl: note.coverUrl || note.cover_url || '',
+    content: String(note.content || note.summary || note.description || '').trim(),
     comments,
     metricsText: [
       note.readCount ? `阅读${note.readCount}` : '',
@@ -138,7 +242,7 @@ function analyzeNoteTone(note, project) {
       ? '基于标题、封面和评论区可见信息，内容表达接近日常种草或真实经验分享。'
       : score >= 68
         ? '可见信息有可借用场景，但封面细节、评论反馈或项目关联仍需人工确认。'
-        : '当前只凭可见证据不足以确认调性，建议补采更多封面/评论样本后再判断。',
+        : '当前只凭可见证据不足以确认调性，建议完善更多封面/评论样本后再判断。',
   };
 }
 
@@ -150,12 +254,15 @@ async function parseXhsNoteLink({ link, note, creator, project }) {
       cover_url: note.coverUrl || '',
       cover_text: note.coverText || note.cover_text || '',
       published_at: note.publishedAt || '',
+      content: note.content || note.summary || note.description || '',
+      topics: deriveNoteTopics(note),
       comments: normalizeNoteComments(note),
       metrics: {
         read_count: note.readCount || '',
         like_count: note.likeCount || '',
         save_count: note.saveCount || '',
         comment_count: note.commentCount || '',
+        share_count: note.shareCount || '',
       },
     },
     creator: { id: creator.id, name: creator.name },
@@ -188,6 +295,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
   const [noteModal, setNoteModal] = useState(null);
   const [parsingNote, setParsingNote] = useState(false);
   const [noteParseResult, setNoteParseResult] = useState(null);
+  const noteDetail = useMemo(() => getNoteDetailModel(noteModal, noteParseResult), [noteModal, noteParseResult]);
 
   useEffect(() => {
     setSelectedIds([]);
@@ -234,17 +342,17 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
   const collectForCreators = async (targetCreators, label = '审号工作台') => {
     if (!targetCreators.length || !onCollectDetails) return;
     setBusy(true);
-    setLocalMessage(`正在补采 ${targetCreators.length} 位达人详情页...`);
+    setLocalMessage(`正在完善 ${targetCreators.length} 位达人详情页...`);
     try {
-      await onCollectDetails({
+      const result = await onCollectDetails({
         creatorIds: targetCreators.map(creator => creator.id),
         segment: 'audit',
         segmentLabel: label,
       });
       await onRefresh?.();
-      setLocalMessage(`已提交 ${targetCreators.length} 位达人详情页补采，并触发匹配度刷新`);
+      setLocalMessage(result?.message || `已完成 ${targetCreators.length} 位达人详情页完善，并触发匹配度刷新`);
     } catch (error) {
-      setLocalMessage(error.message || '详情页补采失败');
+      setLocalMessage(error.message || '详情页完善失败');
     } finally {
       setBusy(false);
     }
@@ -312,7 +420,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
         return completeness === '待补' || !hasCompleteNoteCaseEvidence(creator) || !getPgyUrl(creator);
       })
       .map(({ creator }) => creator),
-    '待补采达人'
+    '待完善达人'
   );
 
   const updateReview = async (creator, status, reason) => {
@@ -394,7 +502,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
         <div className="creator-audit-task-stats">
           <div><strong>{avgMatch}%</strong><span>平均匹配</span></div>
           <div><strong>{strongCount}</strong><span>强匹配</span></div>
-          <div><strong>{needDetailCount}</strong><span>待补采</span></div>
+          <div><strong>{needDetailCount}</strong><span>待完善</span></div>
         </div>
       </div>
 
@@ -426,10 +534,10 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
       <div className="creator-audit-toolbar">
         <div className="creator-audit-toolbar-left">
           <button className="btn btn-sm btn-primary" onClick={collectVisible} disabled={busy || !filteredRows.length}>
-            <FileText size={14} />一键补采{selectedCreators.length ? ` ${selectedCreators.length}` : ''}
+            <FileText size={14} />一键完善{selectedCreators.length ? ` ${selectedCreators.length}` : ''}
           </button>
           <button className="btn btn-sm btn-secondary" onClick={collectNeedDetail} disabled={busy || !needDetailCount}>
-            <Database size={14} />补采待完善 {needDetailCount}
+            <Database size={14} />详情待完善 {needDetailCount}
           </button>
           <button className="btn btn-sm btn-secondary" onClick={onScore} disabled={busy}>
             <Sparkles size={14} />重新匹配
@@ -539,7 +647,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                       <UserX size={13} />淘汰
                     </button>
                     <button className="btn btn-sm btn-secondary" onClick={(event) => { event.stopPropagation(); collectForCreators([creator], creator.name); }} disabled={busy}>
-                      <FileText size={13} />补采
+                      <FileText size={13} />完善
                     </button>
                     <button className="btn btn-sm btn-primary" onClick={(event) => { event.stopPropagation(); openInviteModal([creator], '审号工作台单个邀约'); }} disabled={busy || !onPgyInvite}>
                       <Send size={13} />邀约
@@ -690,11 +798,62 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
               </button>
             </div>
             <div className="creator-audit-note-panel-body">
-              <div className="creator-audit-note-preview">
-                <div>
-                  {noteModal.note.coverUrl ? <img src={noteModal.note.coverUrl} alt={noteModal.note.title} /> : <span>{noteModal.note.brand.slice(0, 2)}</span>}
+              <div className="creator-audit-note-main">
+                <div className="creator-audit-note-preview">
+                  <div className="creator-audit-note-cover-frame">
+                    {noteDetail.coverUrl ? <img src={noteDetail.coverUrl} alt={noteDetail.title || noteModal.note.title} /> : <span>{noteModal.note.brand.slice(0, 2)}</span>}
+                    {noteDetail.topics.length > 0 && (
+                      <div className="creator-audit-note-cover-tags">
+                        {noteDetail.topics.slice(0, 3).map(item => <span key={item}>{item}</span>)}
+                      </div>
+                    )}
+                  </div>
                 </div>
-                <p>{noteModal.note.summary || noteModal.match.reason || '当前只采集到封面、标题和基础互动数据，接入真实解析后会展示正文、话题、评论精选与组件数据。'}</p>
+                <div className="creator-audit-note-copy">
+                  <div className="creator-audit-note-title-row">
+                    <strong>{noteDetail.title || noteModal.note.title || '标题待补'}</strong>
+                    {noteModal.note.noteType && <Badge variant="blue">{noteModal.note.noteType}</Badge>}
+                  </div>
+                  <p>{noteDetail.content || noteModal.match.reason || '正文待补。当前先接入封面、标题和基础数据，真实正文解析后会在这里直接展示。'}</p>
+                  <div className="creator-audit-note-topic-row">
+                    {noteDetail.topics.length ? noteDetail.topics.map(item => <span className="tag" key={item}>{item}</span>) : <span className="tag creator-audit-risk">话题待补</span>}
+                  </div>
+                </div>
+                <div className="creator-audit-note-data-card">
+                  <div className="creator-audit-note-data-head">
+                    <div><FileText size={14} /><strong>笔记数据</strong></div>
+                    <span>{noteDetail.publishedAt || '发布时间待补'}</span>
+                  </div>
+                  <div className="creator-audit-note-metrics-grid">
+                    {[
+                      ['阅读量', noteDetail.metrics.readCount],
+                      ['点赞量', noteDetail.metrics.likeCount],
+                      ['收藏量', noteDetail.metrics.saveCount],
+                      ['评论量', noteDetail.metrics.commentCount],
+                      ['分享量', noteDetail.metrics.shareCount],
+                      ['曝光量', noteDetail.metrics.exposureCount],
+                      ['关注量', noteDetail.metrics.followCount],
+                    ].map(([label, value]) => (
+                      <div className="creator-audit-note-metric" key={label}>
+                        <span>{label}</span>
+                        <strong>{formatNoteMetricValue(value)}</strong>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="creator-audit-note-missing">
+                    <span>缺失信息</span>
+                    <div className="creator-audit-note-missing-list">
+                      {noteDetail.missingFields.length || noteDetail.missingMetrics.length ? (
+                        <>
+                          {noteDetail.missingFields.map(item => <span className="tag creator-audit-risk" key={item}>{item}</span>)}
+                          {noteDetail.missingMetrics.map(item => <span className="tag creator-audit-risk" key={item}>{item}</span>)}
+                        </>
+                      ) : (
+                        <span className="tag">暂无缺失</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
               </div>
               <div className="creator-audit-note-side">
                 <div className="creator-audit-link-box">
@@ -723,7 +882,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                 </div>
                 <div className="creator-audit-parse-card">
                   <div><Database size={14} /><strong>解析端口</strong></div>
-                  <p>{parsingNote ? '正在请求 /api/xhs/notes/parse ...' : (noteParseResult?.message || '当前只分析标题、封面、评论区和基础互动数；完整正文后续再接入。')}</p>
+                  <p>{parsingNote ? '正在请求 /api/xhs/notes/parse ...' : (noteParseResult?.message || '当前会优先解析标题、封面、正文、话题与笔记数据；缺失项会单独标出来。')}</p>
                   <pre>{JSON.stringify(noteParseResult || { endpoint: '/api/xhs/notes/parse', status: 'pending' }, null, 2)}</pre>
                 </div>
               </div>

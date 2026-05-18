@@ -22,11 +22,25 @@ DEFAULT_CONFIG = {
 }
 
 
+def normalize_base_url(value: Any, protocol: str = "openai-compatible") -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = DEFAULT_CONFIG["base_url"]
+    text = re.sub(r"^(https?://)+", lambda match: match.group(0).split("://", 1)[0] + "://", text, flags=re.I)
+    if not re.match(r"^https?://", text, flags=re.I):
+        text = f"https://{text}"
+    text = text.rstrip("/")
+    if protocol == "openai-compatible" and not text.endswith("/v1"):
+        text = f"{text}/v1"
+    return text
+
+
 def read_ai_config(path: Path = AI_PROVIDER_PATH) -> dict[str, Any]:
     if not path.exists():
         return {**DEFAULT_CONFIG, "path": str(path), "api_key_configured": False, "api_key_source": "none"}
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     config = {**DEFAULT_CONFIG, **payload}
+    config["base_url"] = normalize_base_url(config.get("base_url"), str(config.get("protocol") or DEFAULT_CONFIG["protocol"]))
     inline_key = bool(config.get("api_key"))
     env_key = bool(config.get("api_key_env") and os.getenv(config["api_key_env"]))
     public = {k: v for k, v in config.items() if k != "api_key"}
@@ -48,6 +62,7 @@ def write_ai_config(payload: dict[str, Any], path: Path = AI_PROVIDER_PATH) -> d
     for key in ("protocol", "base_url", "model", "api_key_env", "temperature", "max_tokens", "timeout_seconds"):
         if key in payload:
             config[key] = payload[key]
+    config["base_url"] = normalize_base_url(config.get("base_url"), str(config.get("protocol") or DEFAULT_CONFIG["protocol"]))
     if payload.get("api_key"):
         config["api_key"] = payload["api_key"]
     elif not payload.get("keep_existing_api_key"):
@@ -60,6 +75,7 @@ def write_ai_config(payload: dict[str, Any], path: Path = AI_PROVIDER_PATH) -> d
 def test_ai_config(payload: dict[str, Any]) -> dict[str, Any]:
     saved_config = _private_ai_config()
     config = {**saved_config, **payload}
+    config["base_url"] = normalize_base_url(config.get("base_url"), str(config.get("protocol") or DEFAULT_CONFIG["protocol"]))
     if not payload.get("api_key") and saved_config.get("api_key"):
         config["api_key"] = saved_config["api_key"]
     api_key = config.get("api_key") or os.getenv(config.get("api_key_env") or "")
@@ -74,13 +90,19 @@ def test_ai_config(payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{base_url}/models"
         response = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout)
     if response.status_code >= 400:
-        return {"ok": False, "error": f"模型服务返回 HTTP {response.status_code}"}
-    return {"ok": True, "message": "API 连接测试成功"}
+        return {"ok": False, "error": f"模型服务返回 HTTP {response.status_code}: {response.text[:300]}", "url": url}
+    try:
+        response.json()
+    except ValueError:
+        return {"ok": False, "error": f"模型服务未返回 JSON: {response.text[:300]}", "url": url}
+    return {"ok": True, "message": "API 连接测试成功", "url": url}
 
 
 def _private_ai_config(path: Path = AI_PROVIDER_PATH) -> dict[str, Any]:
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-    return {**DEFAULT_CONFIG, **(payload or {})}
+    config = {**DEFAULT_CONFIG, **(payload or {})}
+    config["base_url"] = normalize_base_url(config.get("base_url"), str(config.get("protocol") or DEFAULT_CONFIG["protocol"]))
+    return config
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -99,6 +121,7 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 def chat_json(messages: list[dict[str, str]], config: dict[str, Any] | None = None) -> dict[str, Any]:
     config = {**_private_ai_config(), **(config or {})}
+    config["base_url"] = normalize_base_url(config.get("base_url"), str(config.get("protocol") or DEFAULT_CONFIG["protocol"]))
     api_key = config.get("api_key") or os.getenv(config.get("api_key_env") or "")
     if not api_key:
         raise RuntimeError("未配置 API Key 或环境变量，无法调用大模型")

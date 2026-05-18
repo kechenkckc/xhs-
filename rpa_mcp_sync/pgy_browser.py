@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 
 from .config_store import ROOT
-from .creator_store import _threshold_from_text
+from .creator_store import _threshold_from_text, sanitize_creator_type
 
 CDP_URL = "http://127.0.0.1:9222/json/version"
 PGY_KOL_URL = "https://pgy.xiaohongshu.com/solar/pre-trade/note/kol"
 PGY_ALL_NON_LIVE_METRICS = "全部非直播指标"
 PGY_DETAIL_SCREENSHOT_DIR = ROOT / "runtime" / "pgy_detail_screenshots"
+PGY_BLOGGER_CATEGORY_TAXONOMY_PATH = ROOT / "config" / "pgy_blogger_category_taxonomy.json"
 
 PGY_DISPLAY_METRICS = [
     PGY_ALL_NON_LIVE_METRICS,
@@ -41,6 +45,34 @@ PGY_REQUIRED_NON_LIVE_METRICS = [
     "视频预估互动单价",
     "邀约48h回复率",
 ]
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _duration_text(seconds: float | int | None) -> str:
+    if seconds is None:
+        return ""
+    safe_seconds = max(0.0, float(seconds))
+    if safe_seconds < 60:
+        return f"{safe_seconds:.1f}秒" if safe_seconds < 10 else f"{round(safe_seconds)}秒"
+    minutes = int(safe_seconds // 60)
+    remainder = int(round(safe_seconds % 60))
+    if remainder >= 60:
+        minutes += 1
+        remainder = 0
+    return f"{minutes}分{remainder:02d}秒"
+
+
+def _elapsed_timing(started_at: str, started_perf: float) -> dict[str, Any]:
+    duration_seconds = round(max(0.0, time.perf_counter() - started_perf), 2)
+    return {
+        "started_at": started_at,
+        "finished_at": _now_text(),
+        "duration_seconds": duration_seconds,
+        "duration_text": _duration_text(duration_seconds),
+    }
 
 
 PGY_EXPORT_FIELD_ALIASES = {
@@ -153,6 +185,16 @@ PGY_TABLE_TO_PAYLOAD_FIELDS = {
     "场均观播人数": "live_avg_viewers",
     "场均观看人数": "live_avg_viewers",
     "场均销售额": "live_avg_sales",
+}
+
+PGY_DETAIL_CATEGORY_STOP_LINES = {
+    "粉丝数",
+    "获赞与收藏",
+    "收藏",
+    "邀约",
+    "合作报价",
+    "图文笔记一口价",
+    "视频笔记一口价",
 }
 
 PGY_NON_LIVE_ROW_METRIC_FIELDS = [
@@ -311,6 +353,59 @@ PGY_MARKETING_GOAL_METRIC_PARENT = {
     for metric in group["options"]
 }
 
+
+def _load_pgy_blogger_category_taxonomy() -> dict[str, list[str]]:
+    try:
+        payload = json.loads(PGY_BLOGGER_CATEGORY_TAXONOMY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    result: dict[str, list[str]] = {}
+    for item in payload.get("categories") or []:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("value") or "").strip()
+        subcategories = [
+            str(subcategory).strip()
+            for subcategory in (item.get("subcategories") or [])
+            if str(subcategory).strip()
+        ]
+        if value:
+            result[value] = subcategories
+    return result
+
+
+PGY_BLOGGER_CATEGORY_TAXONOMY = _load_pgy_blogger_category_taxonomy()
+PGY_BLOGGER_CATEGORY_OPTIONS = list(PGY_BLOGGER_CATEGORY_TAXONOMY) or [
+    "美妆",
+    "护肤",
+    "个人护理",
+    "母婴",
+    "时尚",
+    "美食",
+    "家居家装",
+    "影视综资讯",
+    "运动健身",
+    "宠物",
+    "文化艺术",
+    "兴趣爱好",
+    "生活记录",
+    "教育",
+    "职场",
+    "情感",
+    "摄影",
+    "游戏",
+    "科技数码",
+    "出行旅游",
+    "音乐",
+    "搞笑",
+    "健康养生",
+    "汽车",
+    "婚嫁",
+    "商业财经",
+    "素材",
+    "其他",
+]
+
 PGY_FILTER_CATALOG = [
     {
         "field": "营销目标",
@@ -328,38 +423,13 @@ PGY_FILTER_CATALOG = [
     },
     {
         "field": "博主类目",
-        "control_type": "tag",
-        "options": [
-            "美妆",
-            "护肤",
-            "个人护理",
-            "母婴",
-            "时尚",
-            "美食",
-            "家居家装",
-            "影视综资讯",
-            "运动健身",
-            "宠物",
-            "文化艺术",
-            "兴趣爱好",
-            "生活记录",
-            "教育",
-            "职场",
-            "情感",
-            "摄影",
-            "游戏",
-            "科技数码",
-            "出行旅游",
-            "音乐",
-            "搞笑",
-            "健康养生",
-            "汽车",
-            "婚嫁",
-            "商业财经",
-            "素材",
-            "其他",
+        "control_type": "tag_select_with_hover_subcategory",
+        "options": PGY_BLOGGER_CATEGORY_OPTIONS,
+        "option_groups": [
+            {"label": value, "options": subcategories}
+            for value, subcategories in PGY_BLOGGER_CATEGORY_TAXONOMY.items()
         ],
-        "notes": "一层标签，可直接点击。",
+        "notes": "先选择主类目；有 sub_value 时悬停/展开主类目后选择对应二级类目。二级类目必须来自本地白名单。",
     },
     {
         "field": "家庭身份",
@@ -652,6 +722,28 @@ def _number_from_text(value: str) -> float | None:
         return None
 
 
+def _looks_like_quote_text(value: Any) -> bool:
+    text = _clean_text(value)
+    if not text or text in {"-", "--"}:
+        return False
+    if "%" in text or "占比" in text or "比例" in text:
+        return False
+    if any(marker in text for marker in ["¥", "￥", "元", "万", "w", "W"]):
+        return _number_from_text(text) is not None
+    number = _number_from_text(text)
+    return number is not None and number >= 1000
+
+
+def _looks_like_count_text(value: Any) -> bool:
+    text = _clean_text(value)
+    if not text or text in {"-", "--"}:
+        return False
+    if "%" in text or "占比" in text or "比例" in text:
+        return False
+    number = _number_from_text(text)
+    return number is not None and number >= 1000
+
+
 def _format_filter_number(value: Any) -> str:
     if value in (None, ""):
         return ""
@@ -679,6 +771,45 @@ def _range_numbers_from_text(value: str) -> tuple[float | None, float | None]:
     if min_match:
         return _number_from_text(min_match.group(1)), None
     return None, None
+
+
+PGY_MIN_ONLY_RANGE_FIELDS = {"粉丝量", "曝光中位数", "阅读中位数", "互动中位数", "合作订单数"}
+PGY_MIN_ONLY_SUBFIELD_RANGE_FIELDS = {"传播规模", "合作信用度"}
+PGY_MIN_ONLY_SUBFIELDS = {"曝光中位数", "阅读中位数", "互动中位数", "外溢进店中位数", "邀约48h回复率"}
+PGY_BOUNDED_RANGE_FIELDS = {"合作报价"}
+PGY_MAX_ONLY_RANGE_FIELDS = {"外溢进店单价"}
+PGY_MAX_ONLY_SUBFIELD_RANGE_FIELDS = {"预估阅读单价", "预估互动单价", "预估CPM"}
+
+
+def _range_policy_for_item(item: dict[str, Any], sub_field: str = "") -> str:
+    field = str(item.get("field") or "")
+    explicit_policy = str(item.get("range_policy") or item.get("rangePolicy") or "").strip()
+    if explicit_policy in {"min_only", "max_only", "bounded", "default"}:
+        return explicit_policy
+    if field in PGY_BOUNDED_RANGE_FIELDS:
+        return "bounded"
+    if field in PGY_MAX_ONLY_RANGE_FIELDS or field in PGY_MAX_ONLY_SUBFIELD_RANGE_FIELDS:
+        return "max_only"
+    if field in PGY_MIN_ONLY_RANGE_FIELDS:
+        return "min_only"
+    if field in PGY_MIN_ONLY_SUBFIELD_RANGE_FIELDS and sub_field in PGY_MIN_ONLY_SUBFIELDS:
+        return "min_only"
+    return "default"
+
+
+def _apply_range_policy(item: dict[str, Any], min_value: Any, max_value: Any, sub_field: str = "") -> tuple[Any, Any]:
+    policy = _range_policy_for_item(item, sub_field)
+    if policy == "min_only":
+        if min_value in (None, "") and max_value not in (None, ""):
+            min_value = max_value
+        return min_value, ""
+    if policy == "max_only":
+        if max_value in (None, "") and min_value not in (None, ""):
+            max_value = min_value
+        return "", max_value
+    if policy == "bounded":
+        return min_value, max_value
+    return min_value, max_value
 
 
 def _split_filter_values(value: str) -> list[str]:
@@ -721,21 +852,25 @@ def _range_for_subfield(item: dict[str, Any], sub_field: str) -> tuple[Any, Any]
     if isinstance(ranges, dict):
         config = ranges.get(sub_field)
         if isinstance(config, dict):
-            return config.get("min", item.get("min", "")), config.get("max", item.get("max", ""))
+            return _apply_range_policy(item, config.get("min", item.get("min", "")), config.get("max", item.get("max", "")), sub_field)
         if isinstance(config, (list, tuple)) and len(config) >= 2:
-            return config[0], config[1]
+            return _apply_range_policy(item, config[0], config[1], sub_field)
     text = str(item.get("value") or "")
     for segment in _split_filter_values(text):
         if sub_field in segment:
             parsed_min, parsed_max = _range_numbers_from_text(segment)
-            return (
+            return _apply_range_policy(
+                item,
                 item.get("min", parsed_min if parsed_min is not None else 0),
                 item.get("max", parsed_max if parsed_max is not None else ""),
+                sub_field,
             )
     parsed_min, parsed_max = _range_numbers_from_text(text)
-    return (
+    return _apply_range_policy(
+        item,
         item.get("min", parsed_min if parsed_min is not None else 0),
         item.get("max", parsed_max if parsed_max is not None else ""),
+        sub_field,
     )
 
 
@@ -806,6 +941,102 @@ def _gender_ratio(lines: list[str], gender: str) -> float | None:
         if value is not None:
             return value
     return None
+
+
+def _parse_region_distribution_line(value: Any) -> dict[str, Any]:
+    text = _clean_text(value)
+    if not text:
+        return {}
+    top_regions = [
+        {"label": match.group(1), "ratio": float(match.group(2)) / 100}
+        for match in re.finditer(r"([\u4e00-\u9fffA-Za-z .]+?)（([0-9]+(?:\.[0-9]+)?)%）", text)
+    ]
+    summary: dict[str, Any] = {"raw_text": text, "source": "visible_text"}
+    if top_regions:
+        summary["top_regions"] = top_regions
+    dominant = top_regions[0] if top_regions else None
+    if dominant:
+        summary["dominant"] = dominant
+    if "按省份" in text:
+        summary["scope"] = "province"
+    elif "按城市" in text:
+        summary["scope"] = "city"
+    elif "省份" in text:
+        summary["scope"] = "province"
+    elif "城市" in text:
+        summary["scope"] = "city"
+    return summary
+
+
+def _parse_device_distribution_line(value: Any) -> dict[str, Any]:
+    text = _clean_text(value)
+    if not text:
+        return {}
+    match = re.search(r"([^，,]+?)用户占比\s*([0-9]+(?:\.[0-9]+)?)%", text)
+    summary_text = text
+    insight = ""
+    if "消费力较强" in text:
+        insight = "消费力较强"
+    elif "消费力" in text and "，" in text:
+        insight = text.split("，", 1)[-1].strip()
+    if match:
+        summary_text = f"{match.group(1).strip()}用户占比{match.group(2)}%"
+        if insight:
+            summary_text = f"{summary_text}，{insight}"
+    summary: dict[str, Any] = {"raw_text": summary_text, "source": "visible_text"}
+    if match:
+        summary["dominant"] = {
+            "label": match.group(1).strip(),
+            "ratio": float(match.group(2)) / 100,
+        }
+    if insight:
+        summary["insight"] = insight
+    return summary
+
+
+def _build_detail_collection_summary(detail: dict[str, Any]) -> dict[str, Any]:
+    raw = detail.get("raw_payload") if isinstance(detail.get("raw_payload"), dict) else {}
+    fan_analysis = raw.get("fan_analysis") if isinstance(raw.get("fan_analysis"), dict) else {}
+    note_performance = raw.get("note_performance") if isinstance(raw.get("note_performance"), dict) else {}
+    service_performance = raw.get("service_performance") if isinstance(raw.get("service_performance"), dict) else {}
+    note_cases = []
+    for key in ("cooperation_note_cases", "recent_notes", "note_cases", "recent_note_briefs"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            note_cases.extend(item for item in value if isinstance(item, dict) or isinstance(item, str))
+    modules: list[str] = []
+    if detail.get("nickname") and detail.get("followers_count") is not None:
+        modules.append("basic_profile")
+    if note_performance or detail.get("daily_read_median") is not None or detail.get("cooperation_read_median") is not None:
+        modules.append("note_performance")
+    if fan_analysis or detail.get("fans_35_plus_ratio") is not None:
+        modules.append("fan_analysis")
+    if detail.get("audience_age_distribution") or detail.get("audience_gender_distribution"):
+        modules.append("audience_chart")
+    if detail.get("audience_region_distribution"):
+        modules.append("region_distribution")
+    if detail.get("audience_device_distribution"):
+        modules.append("device_distribution")
+    if service_performance or detail.get("reply_rate_48h") is not None:
+        modules.append("service_performance")
+    if note_cases:
+        modules.append("note_cases")
+    if detail.get("audience_profile_screenshot"):
+        modules.append("audience_profile_screenshot")
+    return {
+        "modules": modules,
+        "module_count": len(modules),
+        "note_case_count": len(note_cases),
+        "has_basic_profile": "basic_profile" in modules,
+        "has_note_performance": "note_performance" in modules,
+        "has_fan_analysis": "fan_analysis" in modules,
+        "has_audience_chart": "audience_chart" in modules,
+        "has_region_distribution": "region_distribution" in modules,
+        "has_device_distribution": "device_distribution" in modules,
+        "has_service_performance": "service_performance" in modules,
+        "has_note_cases": "note_cases" in modules,
+        "has_audience_profile_screenshot": "audience_profile_screenshot" in modules,
+    }
 
 
 def _merge_ratio_metric(target: dict[str, Any], key: str, value: Any) -> None:
@@ -1145,6 +1376,120 @@ def _merge_note_case_assets(cases: list[dict[str, Any]], assets: list[dict[str, 
             next_case["source_url"] = source_url
         merged.append(next_case)
     return merged
+
+
+def _comment_summary(comments: Any, limit: int = 3, max_chars: int = 240) -> str:
+    if not isinstance(comments, list):
+        return ""
+    texts: list[str] = []
+    for item in comments:
+        text = str(item.get("content") if isinstance(item, dict) else item or "").strip()
+        if text:
+            texts.append(text)
+        if len(texts) >= limit:
+            break
+    summary = "；".join(texts)
+    return summary[:max_chars]
+
+
+def _note_title_key(value: Any) -> str:
+    return re.sub(r"[\s，,。.!！?？:：;；《》\"'“”‘’（）()【】\\[\\]-]+", "", str(value or "")).lower()
+
+
+def _note_detail_match_score(case: dict[str, Any], note: dict[str, Any], index: int, note_index: int) -> int:
+    score = 0
+    if case.get("note_id") and note.get("note_id") and str(case.get("note_id")) == str(note.get("note_id")):
+        score += 100
+    if case.get("note_url") and note.get("note_url") and str(case.get("note_url")) == str(note.get("note_url")):
+        score += 80
+    case_title = _note_title_key(case.get("title"))
+    note_title = _note_title_key(note.get("title"))
+    if case_title and note_title:
+        if case_title == note_title:
+            score += 60
+        elif case_title in note_title or note_title in case_title:
+            score += 35
+    if case.get("published_at") and note.get("published_at") and str(case.get("published_at"))[:10] == str(note.get("published_at"))[:10]:
+        score += 18
+    if _number_from_text(str(case.get("read_count") or "")) is not None and _number_from_text(str(note.get("read_count") or "")) is not None:
+        if _number_from_text(str(case.get("read_count") or "")) == _number_from_text(str(note.get("read_count") or "")):
+            score += 22
+    if index == note_index:
+        score += 8
+    return score
+
+
+def _merge_note_detail_into_case(case: dict[str, Any], note: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(case)
+    for key in [
+        "note_id",
+        "note_url",
+        "content",
+        "comments",
+        "cover_url",
+        "comment_count",
+        "share_count",
+        "follow_count",
+        "note_type",
+        "component_click_data",
+    ]:
+        value = note.get(key)
+        if value not in ("", None, []) and not merged.get(key):
+            merged[key] = value
+    if not merged.get("comment_summary"):
+        summary = _comment_summary(merged.get("comments"))
+        if summary:
+            merged["comment_summary"] = summary
+    if note.get("source"):
+        merged["note_detail_source"] = note["source"]
+    return merged
+
+
+def _enrich_note_cases_with_details(cases: list[dict[str, Any]], notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not cases or not notes:
+        return cases
+    usable_notes = [note for note in notes if isinstance(note, dict) and (note.get("note_id") or note.get("note_url") or note.get("title"))]
+    if not usable_notes:
+        return cases
+    enriched: list[dict[str, Any]] = []
+    used: set[int] = set()
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict):
+            enriched.append(case)
+            continue
+        scored = [
+            (_note_detail_match_score(case, note, index, note_index), note_index, note)
+            for note_index, note in enumerate(usable_notes)
+            if note_index not in used
+        ]
+        scored = [item for item in scored if item[0] >= 8]
+        if not scored:
+            enriched.append(case)
+            continue
+        scored.sort(key=lambda item: item[0], reverse=True)
+        _, note_index, note = scored[0]
+        used.add(note_index)
+        enriched.append(_merge_note_detail_into_case(case, note))
+    return enriched
+
+
+def _merge_note_details_into_payload(detail: dict[str, Any]) -> dict[str, Any]:
+    raw = detail.get("raw_payload")
+    if not isinstance(raw, dict):
+        return detail
+    notes = raw.get("recent_notes") if isinstance(raw.get("recent_notes"), list) else []
+    if not notes:
+        return detail
+    for key in ["note_cases", "cooperation_note_cases"]:
+        if isinstance(raw.get(key), list):
+            raw[key] = _enrich_note_cases_with_details(raw[key], notes)
+    pages = raw.get("cooperation_note_case_pages")
+    if isinstance(pages, list):
+        for page_item in pages:
+            if isinstance(page_item, dict) and isinstance(page_item.get("cases"), list):
+                page_item["cases"] = _enrich_note_cases_with_details(page_item["cases"], notes)
+    detail["raw_payload"] = raw
+    return detail
 
 
 def _annotate_note_cases_with_traffic_reference(detail: dict[str, Any]) -> dict[str, Any]:
@@ -1614,6 +1959,10 @@ def _case_key(case: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def _collect_note_case_pages(page: Any, max_cases: int = 24) -> dict[str, Any]:
+    _ensure_note_detail_api_pages(page, max_pages=3)
+    api_result = _api_note_case_pages_from_cache(page, note_type=3, max_cases=max_cases) or _api_note_case_pages_from_cache(page, note_type=4, max_cases=max_cases)
+    if api_result:
+        return api_result
     _click_in_container(page, ".note-case-wrapper", "合作笔记", contains=["笔记案例"], target_occurrence="first")
     collected: list[dict[str, Any]] = []
     pages: list[dict[str, Any]] = []
@@ -1643,6 +1992,10 @@ def _collect_note_case_pages(page: Any, max_cases: int = 24) -> dict[str, Any]:
 
 
 def _collect_overview_note_states(page: Any) -> dict[str, Any]:
+    _ensure_detail_summary_api_cache(page)
+    api_states = _overview_from_api_cache(page)
+    if api_states:
+        return api_states
     states: dict[str, Any] = {}
     selector = ".detail-item"
     contains = ["笔记数据", "按规模", "按成本"]
@@ -1663,6 +2016,10 @@ def _collect_overview_note_states(page: Any) -> dict[str, Any]:
 
 
 def _collect_performance_states(page: Any) -> dict[str, Any]:
+    _ensure_detail_summary_api_cache(page)
+    api_states = _performance_from_api_cache(page)
+    if api_states:
+        return api_states
     states: dict[str, Any] = {}
     selector = ".trans-data-wrapper"
     contains = ["数据表现", "日常笔记", "合作笔记"]
@@ -1692,16 +2049,22 @@ def _collect_detail_interaction_states(page: Any) -> dict[str, Any]:
         raw["data_performance_error"] = str(exc)
     result: dict[str, Any] = {"raw_payload": raw}
     scale_metrics = (
-        raw.get("data_performance", {})
-        .get("cooperation", {})
+        (
+            raw.get("data_performance", {}).get("cooperation")
+            or raw.get("data_performance", {}).get("daily")
+            or {}
+        )
         .get("scale", {})
         .get("metrics", {})
         if isinstance(raw.get("data_performance"), dict)
         else {}
     )
     cost_metrics = (
-        raw.get("data_performance", {})
-        .get("cooperation", {})
+        (
+            raw.get("data_performance", {}).get("cooperation")
+            or raw.get("data_performance", {}).get("daily")
+            or {}
+        )
         .get("cost", {})
         .get("metrics", {})
         if isinstance(raw.get("data_performance"), dict)
@@ -1800,15 +2163,16 @@ def parse_export_file(path: str | Path) -> dict[str, Any]:
 
 def _merge_filters(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for group in groups:
         for item in group or []:
             field = str(item.get("field") or "")
             value = str(item.get("value") or "")
             sub_field = str(item.get("sub_field") or item.get("subField") or "")
+            sub_value = str(item.get("sub_value") or item.get("subValue") or "")
             if not field or not value:
                 continue
-            key = (field, value, sub_field)
+            key = (field, value, sub_field, sub_value)
             if key in seen:
                 continue
             seen.add(key)
@@ -1956,6 +2320,25 @@ def _normalize_pgy_filter_item(item: dict[str, Any]) -> dict[str, Any]:
     field = str(item.get("field") or "")
     value = str(item.get("value") or "")
     normalized = {**item, "field": field, "value": value, "reason": str(item.get("reason") or "")}
+    if field == "博主类目":
+        main_value = value.strip()
+        sub_value = str(item.get("sub_value") or item.get("subValue") or "").strip()
+        normalized.pop("sub_value", None)
+        normalized.pop("subValue", None)
+        if main_value not in PGY_BLOGGER_CATEGORY_TAXONOMY:
+            for category, subcategories in PGY_BLOGGER_CATEGORY_TAXONOMY.items():
+                if main_value in subcategories:
+                    main_value, sub_value = category, main_value
+                    break
+        valid_subcategories = PGY_BLOGGER_CATEGORY_TAXONOMY.get(main_value) or []
+        if sub_value and sub_value not in valid_subcategories:
+            sub_value = ""
+        return {
+            **normalized,
+            "value": main_value,
+            "control_type": "tag_select_with_hover_subcategory",
+            **({"sub_value": sub_value} if sub_value else {}),
+        }
     if field == "营销目标":
         parent = str(item.get("goal") or item.get("parent_value") or item.get("parentValue") or "").strip()
         metric = value.strip()
@@ -2013,10 +2396,44 @@ def _normalize_pgy_filter_item(item: dict[str, Any]) -> dict[str, Any]:
             "min": min_value,
             "max": max_value,
         }
+    if field in PGY_MIN_ONLY_RANGE_FIELDS:
+        parsed_min, parsed_max = _range_numbers_from_text(value)
+        min_value = normalized.get("min", parsed_min if parsed_min is not None else parsed_max)
+        return {
+            **normalized,
+            "control_type": normalized.get("control_type") or ("number_range" if field == "合作订单数" else "preset_or_number_range"),
+            "min": min_value if min_value not in (None, "") else "",
+            "max": "",
+            "range_policy": "min_only",
+        }
+    if field in PGY_MIN_ONLY_SUBFIELD_RANGE_FIELDS:
+        return {
+            **normalized,
+            "control_type": normalized.get("control_type") or ("subfield_preset_or_percent_range" if field == "合作信用度" else "multi_subfield_preset_or_number_range"),
+            "range_policy": "min_only",
+        }
+    if field in PGY_MAX_ONLY_RANGE_FIELDS:
+        parsed_min, parsed_max = _range_numbers_from_text(value)
+        max_value = normalized.get("max", parsed_max if parsed_max is not None else parsed_min)
+        return {
+            **normalized,
+            "control_type": normalized.get("control_type") or "preset_or_number_range",
+            "min": "",
+            "max": max_value if max_value not in (None, "") else "",
+            "range_policy": "max_only",
+        }
+    if field in PGY_MAX_ONLY_SUBFIELD_RANGE_FIELDS:
+        parsed_min, parsed_max = _range_numbers_from_text(value)
+        max_value = normalized.get("max", parsed_max if parsed_max is not None else parsed_min)
+        return {
+            **normalized,
+            "control_type": normalized.get("control_type") or "subfield_preset_or_number_range",
+            "min": "",
+            "max": max_value if max_value not in (None, "") else "",
+            "range_policy": "max_only",
+        }
     if field == "粉丝年龄" and value in {"35岁以上优先", "35岁以上≥40%"}:
         return {**normalized, "value": "35～44 占比高", "control_type": "dropdown"}
-    if field == "粉丝量":
-        return {**normalized, "control_type": normalized.get("control_type") or "preset_or_number_range"}
     if field == "粉丝年龄":
         return {**normalized, "control_type": normalized.get("control_type") or "dropdown"}
     if field in {"地域", "粉丝地域"}:
@@ -2139,7 +2556,8 @@ def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None
     filters: list[dict[str, str]] = []
 
     def add(field: str, value: str, reason: str, **extra: Any) -> None:
-        if not any(item["field"] == field and item["value"] == value for item in filters):
+        sub_value = str(extra.get("sub_value") or extra.get("subValue") or "")
+        if not any(item["field"] == field and item["value"] == value and str(item.get("sub_value") or item.get("subValue") or "") == sub_value for item in filters):
             filters.append({"field": field, "value": value, "reason": reason, **{key: val for key, val in extra.items() if val not in (None, "", [])}})
 
     if any(keyword in text for keyword in ["曝光", "声量", "阅读", "播放"]):
@@ -2157,7 +2575,26 @@ def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None
     ]
     for category, keywords in category_map:
         if any(keyword in text for keyword in keywords):
-            add("博主类目", category, f"Brief 命中 {category} 场景")
+            sub_values: list[str] = []
+            if category == "教育":
+                if any(keyword in text for keyword in ["家庭教育", "家长", "父母", "亲子", "大孩", "小升初", "初中", "高中"]):
+                    sub_values.append("家庭教育")
+                if any(keyword in text for keyword in ["k12", "K12", "小升初", "初中", "高中", "小学", "教辅", "答疑"]):
+                    sub_values.append("k12教育")
+                if any(keyword in text for keyword in ["学习日常", "学习博主", "学霸", "学习效率", "学习工具"]):
+                    sub_values.append("学习日常")
+            if category == "母婴":
+                if any(keyword in text for keyword in ["育儿", "陪伴", "家长", "父母", "大孩", "小升初", "初中", "高中"]):
+                    sub_values.append("育儿经验")
+                if any(keyword in text for keyword in ["早教", "启蒙"]):
+                    sub_values.append("早教")
+                if any(keyword in text for keyword in ["日常", "家庭"]):
+                    sub_values.append("母婴日常")
+            if sub_values:
+                for sub_value in sub_values:
+                    add("博主类目", category, f"Brief 命中 {category}-{sub_value} 场景", sub_value=sub_value)
+            else:
+                add("博主类目", category, f"Brief 命中 {category} 场景")
 
     persona_map = [
         ("家庭身份", ["家庭", "亲子", "妈妈", "爸爸", "孩子"]),
@@ -2211,7 +2648,7 @@ def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None
         add("行业推荐博主", "我的行业", "Brief 提到行业推荐/行业匹配", control_type="nested_select_popover", pending_detail="打开后继续选择我的行业")
 
     return {
-        "filters": _merge_filters(_hard_filters_to_pgy_filters((screening_plan or {}).get("collectionHardFilters") or (screening_plan or {}).get("hardFilters") or []), filters),
+        "filters": _normalize_pgy_filters(_merge_filters(_hard_filters_to_pgy_filters((screening_plan or {}).get("collectionHardFilters") or (screening_plan or {}).get("hardFilters") or []), filters)),
         "hard_filters": (screening_plan or {}).get("collectionHardFilters") or (screening_plan or {}).get("hardFilters") or [],
         "display_metrics": PGY_DISPLAY_METRICS,
         "detail_fields": ["基础画像", "粉丝画像", "报价", "合作表现", "内容表现"],
@@ -2389,6 +2826,9 @@ def _filter_value_candidates(item: dict[str, Any]) -> list[str]:
     raw_value = str(item.get("value") or "").strip()
     selection_value = _item_selection_value(item)
     candidates = [selection_value, raw_value]
+    sub_value = str(item.get("sub_value") or item.get("subValue") or "").strip()
+    if str(item.get("field") or "") == "博主类目" and sub_value:
+        candidates = [sub_value, f"{selection_value}-{sub_value}", f"{selection_value}/{sub_value}", f"{selection_value}：{sub_value}", selection_value, raw_value]
     if str(item.get("field") or "") == "营销目标":
         parent = str(item.get("goal") or item.get("parent_value") or item.get("parentValue") or "").strip()
         if selection_value in PGY_MARKETING_GOAL_DEFAULT_METRIC:
@@ -2419,6 +2859,9 @@ def _infer_option_group(field: str, value: str) -> str:
 def _filter_already_selected(page: Any, item: dict[str, str]) -> bool:
     selected_text = _clean_text(_selected_filter_text(page))
     field = _clean_text(item.get("field") or "")
+    sub_value = _clean_text(str(item.get("sub_value") or item.get("subValue") or ""))
+    if field == "博主类目" and sub_value:
+        return bool(selected_text and sub_value in selected_text)
     values = [_clean_text(candidate) for candidate in _filter_value_candidates(item)]
     values = [value for value in values if value]
     if not selected_text or not values:
@@ -2426,6 +2869,35 @@ def _filter_already_selected(page: Any, item: dict[str, str]) -> bool:
     if any(value in selected_text for value in values):
         return True
     return bool(field and field in selected_text and any(value and value in selected_text for value in values))
+
+
+def _verify_filter_selected(page: Any, item: dict[str, Any]) -> bool:
+    control_type = str(item.get("control_type") or "")
+    if control_type in {"brand_search_recommendation"}:
+        return True
+    page.wait_for_timeout(500)
+    return _filter_already_selected(page, item)
+
+
+def _filter_acceptance_required(item: dict[str, Any]) -> bool:
+    field = str(item.get("field") or "")
+    control_type = str(item.get("control_type") or "")
+    if field in {"博主类目", "粉丝量", "粉丝年龄", "合作报价", "互动中位数", "阅读中位数", "预估阅读单价", "预估互动单价"}:
+        return True
+    return control_type in {
+        "tag",
+        "tag_select_with_hover_subcategory",
+        "dropdown",
+        "select_popover",
+        "single_select_popover",
+        "dropdown_single",
+        "checkbox_popover",
+        "preset_or_number_range",
+        "preset_or_percent_range",
+        "subfield_preset_or_number_range",
+        "subfield_preset_or_percent_range",
+        "multi_subfield_preset_or_number_range",
+    }
 
 
 def _parse_row_text(text: str, page_url: str, table_payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -2502,6 +2974,7 @@ def _parse_row_text(text: str, page_url: str, table_payload: dict[str, Any] | No
         raw_payload["raw_table"] = table_payload["raw_table"]
     creator_id_seed = f"pgy:list:{nickname}:{location}"
     creator = {
+        **row_metrics,
         "creator_id": creator_id_seed,
         "source": "pgy",
         "nickname": nickname,
@@ -2512,17 +2985,20 @@ def _parse_row_text(text: str, page_url: str, table_payload: dict[str, Any] | No
         "ip_city": location,
         "persona_tags": "/".join(tags),
         "raw_payload": raw_payload,
-        **row_metrics,
     }
     for key, value in table_payload.items():
         if key == "raw_table":
             continue
-        if value not in (None, ""):
+        if key in {"quote_price", "video_quote_price"} and not _looks_like_quote_text(value):
+            continue
+        if value not in (None, "") and creator.get(key) in (None, ""):
             creator[key] = value
-    if table_payload.get("followers_count") not in (None, ""):
+    if table_payload.get("followers_count") not in (None, "") and _looks_like_count_text(table_payload["followers_count"]):
         creator["followers_count"] = _number_from_text(str(table_payload["followers_count"]))
-    if table_payload.get("quote_price") not in (None, ""):
+    if creator.get("quote_price") in (None, "") and table_payload.get("quote_price") not in (None, "") and _looks_like_quote_text(table_payload["quote_price"]):
         creator["quote_price"] = _number_from_text(str(table_payload["quote_price"]))
+    if creator.get("video_quote_price") in (None, "") and table_payload.get("video_quote_price") not in (None, "") and _looks_like_quote_text(table_payload["video_quote_price"]):
+        creator["video_quote_price"] = _number_from_text(str(table_payload["video_quote_price"]))
     return creator
 
 
@@ -2577,7 +3053,7 @@ def _extract_row_table_payload(row: Any, headers: list[str]) -> dict[str, Any]:
                 ),
                 "",
             )
-        if field:
+        if field and (field not in {"quote_price", "video_quote_price"} or _looks_like_quote_text(value)):
             payload[field] = value
     return payload
 
@@ -2630,9 +3106,11 @@ def _extract_detail_fields(text: str, url: str) -> dict[str, Any]:
         home_city = lines[name_index + 6] if name_index + 6 < len(lines) and lines[name_index + 1] == "小红书号：" else ""
         categories_start = name_index + 7 if name_index + 1 < len(lines) and lines[name_index + 1] == "小红书号：" else name_index + 1
         for line in lines[categories_start:]:
-            if line == "粉丝数":
+            if line in PGY_DETAIL_CATEGORY_STOP_LINES or line.startswith("与") or "相似的博主" in line:
                 break
-            primary_categories.append(line)
+            category = sanitize_creator_type(line)
+            if category:
+                primary_categories.append(category)
     note_case_items = _extract_note_cases(lines)
     note_performance = {
         "exposure_median": _metric_value_after(lines, "曝光中位数"),
@@ -2668,6 +3146,8 @@ def _extract_detail_fields(text: str, url: str) -> dict[str, Any]:
         "device_distribution": _line_between(lines, "用户设备分布", "用户兴趣"),
     }
     fan_analysis = {key: value for key, value in fan_analysis.items() if value not in ("", None)}
+    region_distribution = _parse_region_distribution_line(fan_analysis.get("region_distribution"))
+    device_distribution = _parse_device_distribution_line(fan_analysis.get("device_distribution"))
     services = {
         "active_days_7d": _metric_value_after(lines, "近7天活跃天数"),
         "reply_rate_48h": _ratio_after_label(lines, "邀约48小时回复率"),
@@ -2717,11 +3197,15 @@ def _extract_detail_fields(text: str, url: str) -> dict[str, Any]:
     if ip_city:
         result["ip_city"] = ip_city
     if primary_categories:
-        result["creator_type"] = "/".join(primary_categories)
+        result["creator_type"] = sanitize_creator_type("/".join(primary_categories))
     if topic_point:
         result["topic_point"] = topic_point
     if personal_intro:
         result["personal_intro"] = personal_intro
+    if region_distribution:
+        result["audience_region_distribution"] = region_distribution
+    if device_distribution:
+        result["audience_device_distribution"] = device_distribution
     metric_mapping = {
         "daily_exposure_median": note_performance.get("exposure_median"),
         "daily_read_median": note_performance.get("read_median"),
@@ -2792,10 +3276,129 @@ def _detail_url_fields(url: str, source: str = "") -> dict[str, Any]:
     }
 
 
+def _kol_api_key(kol: dict[str, Any]) -> str:
+    for field in ["userId", "user_id", "bloggerId", "blogger_id", "kolId", "kol_id", "redId"]:
+        value = str(kol.get(field) or "").strip()
+        if value:
+            return f"{field}:{value}"
+    return "|".join(
+        str(kol.get(field) or "").strip()
+        for field in ["name", "nickName", "nickname", "location", "city", "fansCount", "picturePrice"]
+    )
+
+
+def _remember_kol_api_kols(page: Any, kols: list[dict[str, Any]]) -> None:
+    if not kols:
+        return
+    pool = getattr(page, "_pgy_api_kol_pool", []) or []
+    keys = getattr(page, "_pgy_api_kol_keys", set()) or set()
+    if not isinstance(pool, list):
+        pool = []
+    if not isinstance(keys, set):
+        keys = set(keys) if isinstance(keys, (list, tuple)) else set()
+    for kol in kols:
+        if not isinstance(kol, dict):
+            continue
+        key = _kol_api_key(kol)
+        if not key or key in keys:
+            continue
+        keys.add(key)
+        pool.append(kol)
+    setattr(page, "_pgy_api_kol_pool", pool)
+    setattr(page, "_pgy_api_kol_keys", keys)
+    setattr(page, "_pgy_latest_api_kols", [kol for kol in kols if isinstance(kol, dict)])
+
+
+def _kol_nested_value(payload: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    for value in payload.values():
+        if isinstance(value, dict):
+            nested = _kol_nested_value(value, *keys)
+            if nested not in (None, ""):
+                return nested
+    return None
+
+
+def _creator_from_api_kol(kol: dict[str, Any], page_number: int = 0, row_index: int = 0) -> dict[str, Any]:
+    user_id = str(_kol_nested_value(kol, "userId", "user_id", "bloggerId", "blogger_id", "kolId", "kol_id") or "").strip()
+    nickname = str(_kol_nested_value(kol, "name", "nickName", "nickname") or "").strip()
+    creator_id = f"pgy-api:{user_id}" if user_id else f"pgy-api:{_kol_api_key(kol)}"
+    creator: dict[str, Any] = {
+        "creator_id": creator_id,
+        "source": "pgy",
+        "nickname": nickname,
+        "ip_city": str(_kol_nested_value(kol, "location", "city") or "").strip(),
+        "raw_payload": {
+            "list_api_kol": kol,
+            "collection_source": "list_api",
+            "collection_page": page_number,
+            "collection_row_index": row_index,
+        },
+    }
+    if user_id:
+        creator.update(_detail_url_fields(f"https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/{user_id}", source="list_api"))
+    red_id = _kol_nested_value(kol, "redId", "red_id", "xiaohongshuId", "xiaohongshu_id")
+    if red_id not in (None, ""):
+        creator["xiaohongshu_id"] = str(red_id).strip()
+    avatar = _kol_nested_value(kol, "headPhoto", "avatar", "avatarUrl", "imageUrl")
+    if avatar not in (None, ""):
+        creator["avatar_url"] = str(avatar).strip()
+    metric_fields = {
+        "followers_count": ("fansCount", "fans_count", "followerCount", "followersCount"),
+        "liked_collected_count": ("likeCollectCountInfo", "likedCollectedCount", "likeCollectCount"),
+        "quote_price": ("picturePrice", "quotePrice", "imageQuotePrice", "picPrice"),
+        "video_quote_price": ("videoPrice", "videoQuotePrice"),
+        "daily_exposure_median": ("impMedian", "mAccumImpNum", "exposureMedian"),
+        "daily_read_median": ("readMedian", "readMedianNum"),
+        "daily_interaction_median": ("interactionMedian", "mEngagementNum"),
+        "image_read_unit_price": ("pictureReadUnitPrice", "imageReadUnitPrice"),
+        "image_interaction_unit_price": ("pictureInteractionUnitPrice", "imageInteractionUnitPrice"),
+        "video_read_unit_price": ("videoReadUnitPrice",),
+        "video_interaction_unit_price": ("videoInteractionUnitPrice",),
+        "reply_rate_48h": ("responseRate", "replyRate48h"),
+    }
+    for field, keys in metric_fields.items():
+        value = _kol_nested_value(kol, *keys)
+        if value not in (None, ""):
+            creator[field] = _number_from_text(str(value))
+    for ratio_field, keys in {
+        "fans_25_34_ratio": ("fans25To34Rate", "fans_25_34_ratio"),
+        "fans_35_44_ratio": ("fans35To44Rate", "fans_35_44_ratio"),
+        "fans_44_plus_ratio": ("fans44PlusRate", "fans_44_plus_ratio"),
+        "active_fans_ratio": ("activeFansRate",),
+        "read_fans_ratio": ("readFansRate",),
+        "interaction_fans_ratio": ("engageFansRate", "interactionFansRate"),
+    }.items():
+        value = _kol_nested_value(kol, *keys)
+        if value not in (None, ""):
+            creator[ratio_field] = _ratio_from_percent_value(value)
+    if creator.get("fans_35_44_ratio") is not None or creator.get("fans_44_plus_ratio") is not None:
+        creator["fans_35_plus_ratio"] = min((creator.get("fans_35_44_ratio") or 0) + (creator.get("fans_44_plus_ratio") or 0), 1)
+    content_tags = []
+    for item in kol.get("contentTags") or []:
+        if isinstance(item, dict):
+            if item.get("taxonomy1Tag"):
+                content_tags.append(str(item["taxonomy1Tag"]))
+            content_tags.extend(str(tag) for tag in item.get("taxonomy2Tags") or [] if str(tag).strip())
+        elif str(item).strip():
+            content_tags.append(str(item).strip())
+    if content_tags:
+        creator["creator_type"] = sanitize_creator_type("/".join(dict.fromkeys(content_tags)))
+    personal_tags = [str(item).strip() for item in kol.get("personalTags") or [] if str(item).strip()]
+    if personal_tags:
+        creator["persona_tags"] = "、".join(personal_tags)
+    return creator
+
+
 def _install_kol_response_capture(page: Any) -> None:
     if getattr(page, "_pgy_kol_response_capture_installed", False):
         return
     setattr(page, "_pgy_latest_api_kols", [])
+    setattr(page, "_pgy_api_kol_pool", [])
+    setattr(page, "_pgy_api_kol_keys", set())
 
     def handle_response(response: Any) -> None:
         if "/api/solar/cooperator/blogger/v2" not in getattr(response, "url", ""):
@@ -2808,7 +3411,16 @@ def _install_kol_response_capture(page: Any) -> None:
         kols = data.get("kols") if isinstance(data, dict) else []
         if not isinstance(kols, list) or not kols:
             return
-        setattr(page, "_pgy_latest_api_kols", kols)
+        _remember_kol_api_kols(page, kols)
+        try:
+            request = response.request
+            setattr(page, "_pgy_latest_kol_request", {
+                "url": getattr(response, "url", ""),
+                "method": getattr(request, "method", "GET"),
+                "post_data": getattr(request, "post_data", "") or "",
+            })
+        except Exception:
+            pass
 
     try:
         page.on("response", handle_response)
@@ -2817,7 +3429,164 @@ def _install_kol_response_capture(page: Any) -> None:
         pass
 
 
-def _api_kol_link_fields(page: Any, row_index: int, creator: dict[str, Any]) -> dict[str, Any]:
+def _prime_kol_api_capture(page: Any, reload_if_empty: bool = True) -> bool:
+    for _ in range(6):
+        kols = getattr(page, "_pgy_latest_api_kols", []) or []
+        if isinstance(kols, list) and kols:
+            return True
+        page.wait_for_timeout(400)
+    if not reload_if_empty:
+        return False
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2500)
+    except Exception:
+        return False
+    kols = getattr(page, "_pgy_latest_api_kols", []) or []
+    return isinstance(kols, list) and bool(kols)
+
+
+def _set_nested_pagination(payload: Any, page_number: int, page_size: int) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    changed = False
+    page_keys = {"page", "pageNo", "pageNum", "pageNumber", "pageIndex", "current", "currentPage"}
+    size_keys = {"pageSize", "page_size", "size", "limit"}
+    for key, value in list(payload.items()):
+        if key in page_keys:
+            payload[key] = page_number
+            changed = True
+        elif key in size_keys:
+            payload[key] = page_size
+            changed = True
+        elif isinstance(value, dict):
+            changed = _set_nested_pagination(value, page_number, page_size) or changed
+    return changed
+
+
+def _paginated_kol_request(request_info: dict[str, Any], page_number: int, page_size: int) -> dict[str, Any]:
+    method = str(request_info.get("method") or "GET").upper()
+    url = str(request_info.get("url") or "")
+    post_data = str(request_info.get("post_data") or "")
+    body = post_data
+    if method == "GET":
+        parts = urlsplit(url)
+        pairs = dict(parse_qsl(parts.query, keep_blank_values=True))
+        had_page = False
+        for key in ["page", "pageNo", "pageNum", "pageNumber", "pageIndex", "current", "currentPage"]:
+            if key in pairs:
+                pairs[key] = str(page_number)
+                had_page = True
+        if not had_page:
+            pairs["pageNum"] = str(page_number)
+        for key in ["pageSize", "page_size", "size", "limit"]:
+            if key in pairs:
+                pairs[key] = str(page_size)
+        url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(pairs), parts.fragment))
+    elif post_data:
+        try:
+            payload = json.loads(post_data)
+            if isinstance(payload, dict) and not _set_nested_pagination(payload, page_number, page_size):
+                payload["pageNum"] = page_number
+                payload["pageSize"] = page_size
+            body = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            body = post_data
+    return {"url": url, "method": method, "body": body}
+
+
+def _fetch_kol_api_page(page: Any, request_info: dict[str, Any], page_number: int, page_size: int) -> list[dict[str, Any]]:
+    request_payload = _paginated_kol_request(request_info, page_number, page_size)
+    try:
+        payload = page.evaluate(
+            """
+            async ({ url, method, body }) => {
+              const init = {
+                method,
+                credentials: 'include',
+                headers: {
+                  'accept': 'application/json, text/plain, */*',
+                  'content-type': 'application/json;charset=UTF-8'
+                }
+              };
+              if (method !== 'GET' && body) init.body = body;
+              const response = await fetch(url, init);
+              return await response.json();
+            }
+            """,
+            request_payload,
+        )
+    except Exception:
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    kols = data.get("kols") if isinstance(data, dict) else []
+    if not isinstance(kols, list):
+        return []
+    valid_kols = [kol for kol in kols if isinstance(kol, dict)]
+    _remember_kol_api_kols(page, valid_kols)
+    return valid_kols
+
+
+def _append_expanded_api_creators(page: Any, creators: list[dict[str, Any]], seen: set[str], limit: int) -> int:
+    api_added = _expand_kol_api_pool(page, limit)
+    if not api_added:
+        return 0
+    return _append_api_creators(page, creators, seen, limit)
+
+
+def _expand_kol_api_pool(page: Any, limit: int) -> int:
+    request_info = getattr(page, "_pgy_latest_kol_request", {}) or {}
+    if not isinstance(request_info, dict) or not request_info.get("url"):
+        return 0
+    latest = getattr(page, "_pgy_latest_api_kols", []) or []
+    page_size = max(20, min(100, len(latest) or 20))
+    before = len(getattr(page, "_pgy_api_kol_pool", []) or [])
+    max_pages = max(2, min(80, int((max(limit, before) / page_size) + 6)))
+    idle_rounds = 0
+    for page_number in range(2, max_pages + 1):
+        if len(getattr(page, "_pgy_api_kol_pool", []) or []) >= limit:
+            break
+        pool_before = len(getattr(page, "_pgy_api_kol_pool", []) or [])
+        kols = _fetch_kol_api_page(page, request_info, page_number, page_size)
+        pool_after = len(getattr(page, "_pgy_api_kol_pool", []) or [])
+        if not kols or pool_after <= pool_before:
+            idle_rounds += 1
+        else:
+            idle_rounds = 0
+        if idle_rounds >= 2:
+            break
+        page.wait_for_timeout(250)
+    return max(0, len(getattr(page, "_pgy_api_kol_pool", []) or []) - before)
+
+
+def _append_api_creators(
+    page: Any,
+    creators: list[dict[str, Any]],
+    seen: set[str],
+    limit: int,
+) -> int:
+    pool = getattr(page, "_pgy_api_kol_pool", []) or []
+    if not isinstance(pool, list):
+        return 0
+    added = 0
+    for index, kol in enumerate(pool, start=1):
+        if len(creators) >= limit:
+            break
+        if not isinstance(kol, dict):
+            continue
+        creator = _creator_from_api_kol(kol, page_number=((index - 1) // 20) + 1, row_index=index)
+        if not creator.get("nickname") and not creator.get("pgy_url") and not creator.get("xiaohongshu_id"):
+            continue
+        key = _creator_collection_key(creator)
+        if key in seen:
+            continue
+        seen.add(key)
+        creators.append(creator)
+        added += 1
+    return added
+
+
+def _match_api_kol(page: Any, row_index: int, creator: dict[str, Any]) -> dict[str, Any]:
     kols = getattr(page, "_pgy_latest_api_kols", []) or []
     if not isinstance(kols, list):
         return {}
@@ -2833,66 +3602,869 @@ def _api_kol_link_fields(page: Any, row_index: int, creator: dict[str, Any]) -> 
         if marker in seen_ids:
             continue
         seen_ids.add(marker)
-        kol_name = _clean_text(str(kol.get("name") or kol.get("nickName") or kol.get("nickname") or ""))
-        kol_location = _clean_text(str(kol.get("location") or kol.get("city") or ""))
+        kol_name = _clean_text(str(_kol_nested_value(kol, "name", "nickName", "nickname") or ""))
+        kol_location = _clean_text(str(_kol_nested_value(kol, "location", "city") or ""))
         if nickname and kol_name and kol_name != nickname:
             continue
         if location and kol_location and kol_location != location and row_index >= len(kols):
             continue
-        user_id = str(kol.get("userId") or kol.get("user_id") or kol.get("bloggerId") or kol.get("kolId") or "").strip()
-        if not user_id:
-            continue
-        fields = _detail_url_fields(
-            f"https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/{user_id}",
-            source="list_api",
-        )
-        if not fields:
-            continue
-        if kol.get("redId"):
-            fields["xiaohongshu_id"] = str(kol.get("redId") or "")
-        if kol.get("headPhoto"):
-            fields["avatar_url"] = str(kol.get("headPhoto") or "")
-        return fields
+        return kol
     return {}
 
 
-def _collect_row_profile_url(context: Any, row: Any) -> dict[str, Any]:
-    existing_pages = set(context.pages)
-    trigger = row.locator(".kol-name").first
-    if not trigger.count():
-        trigger = row.locator(".profile").first
-    if not trigger.count():
+def _api_kol_link_fields(page: Any, row_index: int, creator: dict[str, Any]) -> dict[str, Any]:
+    kol = _match_api_kol(page, row_index, creator)
+    if not kol:
         return {}
-    detail_page = None
+    user_id = str(_kol_nested_value(kol, "userId", "user_id", "bloggerId", "blogger_id", "kolId", "kol_id") or "").strip()
+    if not user_id:
+        return {}
+    fields = _detail_url_fields(
+        f"https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/{user_id}",
+        source="list_api",
+    )
+    if not fields:
+        return {}
+    red_id = _kol_nested_value(kol, "redId", "red_id", "xiaohongshuId", "xiaohongshu_id")
+    if red_id not in (None, ""):
+        fields["xiaohongshu_id"] = str(red_id).strip()
+    avatar = _kol_nested_value(kol, "headPhoto", "avatar", "avatarUrl", "imageUrl")
+    if avatar not in (None, ""):
+        fields["avatar_url"] = str(avatar).strip()
+    return fields
+
+
+def _recent_note_type_label(value: Any) -> str:
     try:
-        try:
-            with context.expect_page(timeout=5000) as page_info:
-                trigger.click(timeout=2000)
-            detail_page = page_info.value
-        except Exception:
-            try:
-                trigger.click(timeout=2000)
-                detail_page = next((page for page in context.pages if page not in existing_pages and "/blogger-detail/" in page.url), None)
-            except Exception:
-                detail_page = None
-        if not detail_page:
-            return {}
-        try:
-            detail_page.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception:
-            pass
-        for _ in range(12):
-            fields = _detail_url_fields(detail_page.url, source="nickname_click")
-            if fields:
-                return fields
-            detail_page.wait_for_timeout(250)
+        note_type = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if note_type == 2:
+        return "视频笔记"
+    if note_type == 1:
+        return "图文笔记"
+    return ""
+
+
+def _normalize_media_url(value: Any) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        return f"https:{url}"
+    if url.startswith("http://"):
+        return f"https://{url[7:]}"
+    return url
+
+
+def _recent_note_briefs_from_kol(kol: dict[str, Any], max_notes: int = 2) -> list[dict[str, Any]]:
+    note_list = kol.get("noteList")
+    if not isinstance(note_list, list):
+        return []
+    briefs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(note_list):
+        if not isinstance(item, dict):
+            continue
+        note_id = str(item.get("noteId") or item.get("id") or "").strip()
+        if not note_id or note_id in seen:
+            continue
+        seen.add(note_id)
+        briefs.append(
+            {
+                "note_id": note_id,
+                "cover_url": _normalize_media_url(item.get("imageUrl") or item.get("cover") or item.get("coverUrl")),
+                "note_type": _recent_note_type_label(item.get("noteType")) or str(item.get("noteType") or ""),
+                "content_category": str(item.get("contentTag") or "").strip(),
+                "feature_tags": [str(tag).strip() for tag in (item.get("featureTags") or []) if str(tag).strip()],
+                "industry_tags": [str(tag).strip() for tag in (item.get("industryTags") or []) if str(tag).strip()],
+                "bind": bool(item.get("bind")),
+                "source": "list_api",
+                "index": index,
+            }
+        )
+        if len(briefs) >= max_notes:
+            break
+    return briefs
+
+
+def _detail_note_cover(data: dict[str, Any]) -> str:
+    images = data.get("imagesList")
+    if isinstance(images, list):
+        for item in images:
+            if isinstance(item, str) and item.strip():
+                return _normalize_media_url(item)
+            if isinstance(item, dict):
+                for key in ("url", "imageUrl", "originUrl", "src", "traceId", "fileId"):
+                    value = _normalize_media_url(item.get(key))
+                    if value:
+                        return value
+    video = data.get("videoInfo")
+    if isinstance(video, dict):
+        for key in ("coverUrl", "imageUrl", "poster", "firstFrameUrl"):
+            value = _normalize_media_url(video.get(key))
+            if value:
+                return value
+    return ""
+
+
+def _recent_note_comments_from_payload(payload: Any, limit: int = 6) -> list[str]:
+    if not isinstance(payload, list):
+        return []
+    comments: list[str] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        comment = item.get("comment")
+        if isinstance(comment, dict):
+            text = str(comment.get("content") or "").strip()
+            if text:
+                comments.append(text)
+        for reply in item.get("l1L2Comments") or []:
+            if not isinstance(reply, dict):
+                continue
+            text = str(reply.get("content") or "").strip()
+            if text:
+                comments.append(text)
+        if len(comments) >= limit:
+            break
+    return comments[:limit]
+
+
+def _fetch_note_detail_from_api(page: Any, note_id: str, comment_limit: int = 5) -> dict[str, Any]:
+    note_id = str(note_id or "").strip()
+    if not note_id:
         return {}
-    finally:
-        if detail_page:
-            try:
-                detail_page.close()
-            except Exception:
-                pass
+    try:
+        payload = page.evaluate(
+            """
+            async ({ noteId, commentLimit }) => {
+              const detailUrl = `https://pgy.xiaohongshu.com/api/solar/note/${noteId}/detail?bizCode=`;
+              const commentUrl = `https://pgy.xiaohongshu.com/api/solar/note/${noteId}/comments?pageSize=${commentLimit}&pageIndex=0`;
+              const [detailRes, commentsRes] = await Promise.all([
+                fetch(detailUrl, { credentials: 'include' }),
+                fetch(commentUrl, { credentials: 'include' }),
+              ]);
+              const detail = await detailRes.json();
+              const comments = await commentsRes.json();
+              return { detail, comments };
+            }
+            """,
+            {"noteId": note_id, "commentLimit": max(1, min(comment_limit, 20))},
+        )
+    except Exception:
+        return {}
+    detail_data = payload.get("detail", {}).get("data") if isinstance(payload, dict) else {}
+    comments_data = payload.get("comments", {}).get("data") if isinstance(payload, dict) else {}
+    if not isinstance(detail_data, dict):
+        return {}
+    component_click_data = detail_data.get("compClickData")
+    return {
+        "note_id": note_id,
+        "title": str(detail_data.get("title") or "").strip(),
+        "content": str(detail_data.get("content") or "").strip(),
+        "note_url": str(detail_data.get("noteLink") or "").strip(),
+        "cover_url": _detail_note_cover(detail_data),
+        "published_at": str(detail_data.get("createTime") or detail_data.get("time") or "").strip(),
+        "read_count": detail_data.get("readNum"),
+        "like_count": detail_data.get("likeNum"),
+        "save_count": detail_data.get("favNum"),
+        "comment_count": detail_data.get("cmtNum"),
+        "share_count": detail_data.get("shareNum"),
+        "follow_count": detail_data.get("followCnt"),
+        "comments": _recent_note_comments_from_payload(comments_data),
+        "component_click_data": component_click_data if isinstance(component_click_data, dict) else {},
+        "source": "note_detail_api",
+    }
+
+
+def _collect_recent_note_details_from_api(page: Any, kol: dict[str, Any], max_notes: int = 2) -> list[dict[str, Any]]:
+    briefs = _recent_note_briefs_from_kol(kol, max_notes=max_notes)
+    detailed: list[dict[str, Any]] = []
+    for brief in briefs:
+        detail = _fetch_note_detail_from_api(page, brief.get("note_id") or "")
+        note = {**brief, **detail}
+        if brief.get("cover_url") and not note.get("cover_url"):
+            note["cover_url"] = brief["cover_url"]
+        if brief.get("content_category") and not note.get("brand"):
+            note["brand"] = brief["content_category"]
+        detailed.append(note)
+    return [item for item in detailed if item.get("note_id")]
+
+
+def _normalize_detail_note_item(item: dict[str, Any], index: int = 0) -> dict[str, Any]:
+    note_id = str(item.get("noteId") or item.get("note_id") or item.get("id") or "").strip()
+    note_type = "视频笔记" if item.get("isVideo") else (_recent_note_type_label(item.get("noteType")) or str(item.get("noteType") or "图文笔记"))
+    note = {
+        "note_id": note_id,
+        "title": str(item.get("title") or item.get("noteTitle") or "").strip(),
+        "cover_url": _normalize_media_url(item.get("imgUrl") or item.get("imageUrl") or item.get("coverUrl") or item.get("cover_url")),
+        "note_type": note_type,
+        "brand": str(item.get("brandName") or item.get("contentTag") or "").strip(),
+        "content_category": str(item.get("contentTag") or item.get("brandName") or "").strip(),
+        "published_at": str(item.get("date") or item.get("createTime") or item.get("time") or "").strip(),
+        "read_count": item.get("readNum") if item.get("readNum") is not None else item.get("read_count"),
+        "like_count": item.get("likeNum") if item.get("likeNum") is not None else item.get("like_count"),
+        "save_count": item.get("collectNum") if item.get("collectNum") is not None else item.get("save_count"),
+        "comment_count": item.get("cmtNum") if item.get("cmtNum") is not None else item.get("comment_count"),
+        "share_count": item.get("shareNum") if item.get("shareNum") is not None else item.get("share_count"),
+        "third_read_user_num": item.get("thirdReadUserNum"),
+        "has_promoted_traffic": bool(item.get("isAdvertise")),
+        "source": "detail_notes_api",
+        "index": index,
+    }
+    return {key: value for key, value in note.items() if value not in ("", None)}
+
+
+def _install_detail_notes_capture(page: Any) -> None:
+    if getattr(page, "_pgy_detail_notes_capture_installed", False):
+        return
+    setattr(page, "_pgy_latest_detail_notes", [])
+
+    def handle_response(response: Any) -> None:
+        if "/api/solar/kol/data_v2/notes_detail" not in getattr(response, "url", ""):
+            return
+        try:
+            payload = response.json()
+        except Exception:
+            return
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        items = data.get("list") if isinstance(data, dict) else []
+        if not isinstance(items, list) or not items:
+            return
+        notes = [_normalize_detail_note_item(item, index) for index, item in enumerate(items) if isinstance(item, dict)]
+        notes = [item for item in notes if item.get("note_id") or item.get("title")]
+        if notes:
+            setattr(page, "_pgy_latest_detail_notes", notes)
+
+    try:
+        page.on("response", handle_response)
+        setattr(page, "_pgy_detail_notes_capture_installed", True)
+    except Exception:
+        pass
+
+
+def _install_detail_api_capture(page: Any) -> None:
+    if getattr(page, "_pgy_detail_api_capture_installed", False):
+        return
+    setattr(page, "_pgy_detail_api_cache", {})
+
+    def handle_response(response: Any) -> None:
+        url = getattr(response, "url", "")
+        if "pgy.xiaohongshu.com/api/" not in url:
+            return
+        interesting = [
+            "/api/solar/cooperator/user/blogger/",
+            "/api/solar/kol/data_v3/fans_summary",
+            "/api/solar/kol/data/",
+            "/api/pgy/kol/data/data_summary",
+            "/api/solar/kol/data_v3/notes_rate",
+            "/api/solar/kol/data_v2/notes_detail",
+        ]
+        if not any(item in url for item in interesting):
+            return
+        try:
+            payload = response.json()
+        except Exception:
+            return
+        data = payload.get("data") if isinstance(payload, dict) else None
+        cache = getattr(page, "_pgy_detail_api_cache", {}) or {}
+        if "/api/solar/cooperator/user/blogger/" in url and isinstance(data, dict):
+            cache["blogger_profile"] = data
+        elif "/api/solar/kol/data_v3/fans_summary" in url and isinstance(data, dict):
+            cache["fans_summary"] = data
+        elif "/fans_profile" in url and isinstance(data, dict):
+            cache["fans_profile"] = data
+        elif "/api/pgy/kol/data/data_summary" in url and isinstance(data, dict):
+            business = "cooperation" if "business=1" in url else "daily"
+            summary_cache = cache.setdefault("data_summary", {})
+            summary_cache[business] = data
+            request_cache = cache.setdefault("requests", {})
+            request_cache.setdefault("data_summary", {})[business] = _response_request_info(response)
+        elif "/api/solar/kol/data_v3/notes_rate" in url and isinstance(data, dict):
+            business = "cooperation" if "business=1" in url else "daily"
+            rate_cache = cache.setdefault("notes_rate", {})
+            rate_cache[business] = data
+            request_cache = cache.setdefault("requests", {})
+            request_cache.setdefault("notes_rate", {})[business] = _response_request_info(response)
+        elif "/api/solar/kol/data_v2/notes_detail" in url and isinstance(data, dict):
+            match_page = re.search(r"[?&]pageNumber=(\d+)", url)
+            match_note_type = re.search(r"[?&]noteType=(\d+)", url)
+            page_no = int(match_page.group(1)) if match_page else 1
+            note_type = int(match_note_type.group(1)) if match_note_type else 0
+            note_detail_cache = cache.setdefault("notes_detail", {})
+            note_type_cache = note_detail_cache.setdefault(note_type, {})
+            note_type_cache[page_no] = data
+            request_cache = cache.setdefault("requests", {})
+            request_cache.setdefault("notes_detail", {}).setdefault(note_type, {})[page_no] = _response_request_info(response)
+        setattr(page, "_pgy_detail_api_cache", cache)
+
+    try:
+        page.on("response", handle_response)
+        setattr(page, "_pgy_detail_api_capture_installed", True)
+    except Exception:
+        pass
+
+
+def _detail_api_cache(page: Any) -> dict[str, Any]:
+    cache = getattr(page, "_pgy_detail_api_cache", None)
+    return cache if isinstance(cache, dict) else {}
+
+
+def _response_request_info(response: Any) -> dict[str, Any]:
+    try:
+        request = response.request
+        return {
+            "url": getattr(response, "url", ""),
+            "method": getattr(request, "method", "GET"),
+            "post_data": getattr(request, "post_data", "") or "",
+        }
+    except Exception:
+        return {"url": getattr(response, "url", ""), "method": "GET", "post_data": ""}
+
+
+def _url_with_query_params(url: str, params: dict[str, Any]) -> str:
+    if not url:
+        return url
+    parts = urlsplit(url)
+    pairs = dict(parse_qsl(parts.query, keep_blank_values=True))
+    for key, value in params.items():
+        if value is None:
+            continue
+        pairs[key] = str(value)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(pairs), parts.fragment))
+
+
+def _fetch_detail_api_data(page: Any, request_info: dict[str, Any], query_params: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not isinstance(request_info, dict) or not request_info.get("url"):
+        return {}
+    method = str(request_info.get("method") or "GET").upper()
+    url = _url_with_query_params(str(request_info.get("url") or ""), query_params or {})
+    body = str(request_info.get("post_data") or "")
+    try:
+        payload = page.evaluate(
+            """
+            async ({ url, method, body }) => {
+              const init = {
+                method,
+                credentials: 'include',
+                headers: {
+                  'accept': 'application/json, text/plain, */*',
+                  'content-type': 'application/json;charset=UTF-8'
+                }
+              };
+              if (method !== 'GET' && body) init.body = body;
+              const response = await fetch(url, init);
+              return await response.json();
+            }
+            """,
+            {"url": url, "method": method, "body": body},
+        )
+    except Exception:
+        return {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+def _detail_cached_request(page: Any, group: str, business: str = "") -> dict[str, Any]:
+    requests = _detail_api_cache(page).get("requests")
+    if not isinstance(requests, dict):
+        return {}
+    group_requests = requests.get(group)
+    if isinstance(group_requests, dict) and business:
+        request = group_requests.get(business)
+        if isinstance(request, dict):
+            return request
+        for value in group_requests.values():
+            if isinstance(value, dict):
+                return value
+    if isinstance(group_requests, dict):
+        for value in group_requests.values():
+            if isinstance(value, dict):
+                return value
+    return {}
+
+
+def _ensure_detail_summary_api_cache(page: Any) -> None:
+    cache = _detail_api_cache(page)
+    for group, cache_key in [("data_summary", "data_summary"), ("notes_rate", "notes_rate")]:
+        group_cache = cache.get(cache_key) if isinstance(cache.get(cache_key), dict) else {}
+        for business, business_value in [("daily", 0), ("cooperation", 1)]:
+            if isinstance(group_cache, dict) and isinstance(group_cache.get(business), dict):
+                continue
+            request = _detail_cached_request(page, group, business)
+            data = _fetch_detail_api_data(page, request, {"business": business_value})
+            if not data:
+                continue
+            cache = _detail_api_cache(page)
+            next_group_cache = cache.setdefault(cache_key, {})
+            next_group_cache[business] = data
+            setattr(page, "_pgy_detail_api_cache", cache)
+
+
+def _first_notes_detail_request(page: Any, note_type: int | None = None) -> dict[str, Any]:
+    requests = _detail_api_cache(page).get("requests")
+    if not isinstance(requests, dict):
+        return {}
+    detail_requests = requests.get("notes_detail")
+    if not isinstance(detail_requests, dict):
+        return {}
+    if note_type is not None and isinstance(detail_requests.get(note_type), dict):
+        for value in detail_requests[note_type].values():
+            if isinstance(value, dict):
+                return value
+    for type_requests in detail_requests.values():
+        if isinstance(type_requests, dict):
+            for value in type_requests.values():
+                if isinstance(value, dict):
+                    return value
+    return {}
+
+
+def _ensure_note_detail_api_pages(page: Any, max_pages: int = 3) -> None:
+    cache = _detail_api_cache(page)
+    notes_detail = cache.get("notes_detail") if isinstance(cache.get("notes_detail"), dict) else {}
+    note_types = list(notes_detail.keys()) if isinstance(notes_detail, dict) and notes_detail else [3, 4]
+    for note_type in note_types:
+        request = _first_notes_detail_request(page, int(note_type) if str(note_type).isdigit() else None)
+        if not request:
+            continue
+        for page_no in range(1, max_pages + 1):
+            cache = _detail_api_cache(page)
+            current = cache.get("notes_detail") if isinstance(cache.get("notes_detail"), dict) else {}
+            current_type = current.get(note_type) if isinstance(current, dict) else {}
+            if isinstance(current_type, dict) and isinstance(current_type.get(page_no), dict):
+                continue
+            data = _fetch_detail_api_data(page, request, {"noteType": note_type, "pageNumber": page_no})
+            items = data.get("list") if isinstance(data, dict) else []
+            if not isinstance(items, list) or not items:
+                break
+            cache = _detail_api_cache(page)
+            cache.setdefault("notes_detail", {}).setdefault(note_type, {})[page_no] = data
+            setattr(page, "_pgy_detail_api_cache", cache)
+
+
+def _ratio_from_percent_value(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return _ratio_from_text(str(value))
+    return number / 100 if number > 1 else number
+
+
+def _metric_string(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, (int, float)):
+        return f"{value:,}"
+    return str(value).strip()
+
+
+def _summary_note_types_text(note_types: Any) -> str:
+    if not isinstance(note_types, list):
+        return ""
+    parts = []
+    for item in note_types:
+        if not isinstance(item, dict):
+            continue
+        tag = str(item.get("contentTag") or "").strip()
+        percent = str(item.get("percent") or "").strip()
+        if tag and percent:
+            parts.append(f"{tag}(占比{percent}%)")
+        elif tag:
+            parts.append(tag)
+    return "、".join(parts)
+
+
+def _build_blogger_advantage_from_api(summary: dict[str, Any], business: str = "daily") -> str:
+    if not isinstance(summary, dict):
+        return ""
+    parts: list[str] = []
+    advantage = str(summary.get("kolAdvantage") or "").strip()
+    if advantage:
+        parts.append(f"{advantage}博主")
+    note_number = summary.get("noteNumber")
+    if note_number not in (None, ""):
+        parts.append(f"发布笔记{note_number}篇")
+    note_types = _summary_note_types_text(summary.get("noteType"))
+    if note_types:
+        parts.append(f"内容类目{note_types}")
+    trade_names = [str(item).strip() for item in (summary.get("tradeNames") or []) if str(item).strip()]
+    if trade_names:
+        parts.append(f"合作行业{'、'.join(trade_names)}")
+    return "".join(parts)
+
+
+def _note_case_from_notes_detail_item(item: dict[str, Any]) -> dict[str, Any]:
+    case = {
+        "note_id": str(item.get("noteId") or "").strip(),
+        "title": str(item.get("title") or "").strip(),
+        "brand": str(item.get("brandName") or item.get("contentTag") or "").strip(),
+        "cover_url": _normalize_media_url(item.get("imgUrl") or item.get("imageUrl") or item.get("coverUrl")),
+        "published_at": str(item.get("date") or item.get("publishTime") or "").strip(),
+        "read_count": item.get("readNum"),
+        "like_count": item.get("likeNum"),
+        "save_count": item.get("collectNum"),
+        "comment_count": item.get("cmtNum"),
+        "share_count": item.get("shareNum"),
+        "has_promoted_traffic": bool(item.get("isAdvertise")),
+        "note_type": "视频笔记" if item.get("isVideo") else "图文笔记",
+        "source": "notes_detail_api",
+    }
+    return {key: value for key, value in case.items() if value not in ("", None, [])}
+
+
+def _api_note_case_pages_from_cache(page: Any, note_type: int = 3, max_cases: int = 24) -> dict[str, Any]:
+    cache = _detail_api_cache(page)
+    notes_detail = cache.get("notes_detail") if isinstance(cache.get("notes_detail"), dict) else {}
+    pages_map = notes_detail.get(note_type) if isinstance(notes_detail, dict) else {}
+    if not isinstance(pages_map, dict):
+        return {}
+    pages: list[dict[str, Any]] = []
+    collected: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for page_no in sorted(pages_map):
+        payload = pages_map.get(page_no)
+        items = payload.get("list") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            continue
+        cases = [_note_case_from_notes_detail_item(item) for item in items if isinstance(item, dict)]
+        pages.append({"page": page_no, "count": len(cases), "cases": cases})
+        for case in cases:
+            key = _case_key(case)
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append(case)
+            if len(collected) >= max_cases:
+                break
+        if len(collected) >= max_cases:
+            break
+    if not collected:
+        return {}
+    return {"cooperation_note_cases": collected, "cooperation_note_case_pages": pages}
+
+
+def _overview_from_api_cache(page: Any) -> dict[str, Any]:
+    cache = _detail_api_cache(page)
+    summary_cache = cache.get("data_summary") if isinstance(cache.get("data_summary"), dict) else {}
+    result: dict[str, Any] = {}
+    for business in ["daily", "cooperation"]:
+        summary = summary_cache.get(business)
+        if not isinstance(summary, dict):
+            continue
+        rate_cache = cache.get("notes_rate") if isinstance(cache.get("notes_rate"), dict) else {}
+        rate_data = rate_cache.get(business) if isinstance(rate_cache, dict) else {}
+        scale_metrics = {
+            "曝光中位数": _metric_string(summary.get("mAccumImpNum")),
+            "阅读中位数": _metric_string(summary.get("readMedian")),
+            "互动中位数": _metric_string(summary.get("mEngagementNum") or summary.get("interactionMedian")),
+        }
+        if business == "cooperation" and summary.get("estimateVideoCpuv") not in (None, ""):
+            scale_metrics["预估阅读单价"] = _metric_string(summary.get("estimateVideoCpuv"))
+        if business == "cooperation" and summary.get("estimateVideoEngageCost") not in (None, ""):
+            scale_metrics["预估互动单价"] = _metric_string(summary.get("estimateVideoEngageCost"))
+        cost_metrics = {
+            "预估CPM": _metric_string(summary.get("estimateVideoCpm") or summary.get("estimatePictureCpm")),
+            "预估阅读单价": _metric_string(summary.get("videoReadCostV2") or summary.get("estimateVideoCpuv") or summary.get("picReadCost")),
+            "预估互动单价": _metric_string(summary.get("estimateVideoEngageCost") or summary.get("estimatePictureEngageCost")),
+        }
+        state = {
+            "text": "",
+            "metrics": {key: value for key, value in scale_metrics.items() if value not in ("", None)},
+        }
+        state_cost = {
+            "text": "",
+            "metrics": {key: value for key, value in cost_metrics.items() if value not in ("", None)},
+        }
+        if isinstance(rate_data, dict):
+            if rate_data.get("interactionRate") not in (None, ""):
+                state["metrics"]["互动率"] = f"{rate_data['interactionRate']}%"
+                state_cost["metrics"]["互动率"] = f"{rate_data['interactionRate']}%"
+            if rate_data.get("videoFullViewRate") not in (None, ""):
+                state["metrics"]["视频完播率"] = f"{rate_data['videoFullViewRate']}%"
+                state_cost["metrics"]["视频完播率"] = f"{rate_data['videoFullViewRate']}%"
+            if rate_data.get("thousandLikePercent") not in (None, ""):
+                state["metrics"]["千赞笔记比例"] = f"{rate_data['thousandLikePercent']}%"
+                state_cost["metrics"]["千赞笔记比例"] = f"{rate_data['thousandLikePercent']}%"
+            if rate_data.get("hundredLikePercent") not in (None, ""):
+                state["metrics"]["百赞笔记比例"] = f"{rate_data['hundredLikePercent']}%"
+                state_cost["metrics"]["百赞笔记比例"] = f"{rate_data['hundredLikePercent']}%"
+        result[business] = {"scale": state, "cost": state_cost}
+    return result
+
+
+def _performance_from_api_cache(page: Any) -> dict[str, Any]:
+    cache = _detail_api_cache(page)
+    rate_cache = cache.get("notes_rate") if isinstance(cache.get("notes_rate"), dict) else {}
+    result: dict[str, Any] = {}
+    for business in ["daily", "cooperation"]:
+        rate_data = rate_cache.get(business)
+        if not isinstance(rate_data, dict):
+            continue
+        scale_metrics = {
+            "曝光中位数": _metric_string(rate_data.get("impMedian")),
+            "阅读中位数": _metric_string(rate_data.get("readMedian")),
+            "互动中位数": _metric_string(rate_data.get("interactionMedian")),
+            "中位点赞量": _metric_string(rate_data.get("likeMedian")),
+            "中位收藏量": _metric_string(rate_data.get("collectMedian")),
+            "中位评论量": _metric_string(rate_data.get("commentMedian")),
+            "中位分享量": _metric_string(rate_data.get("shareMedian")),
+            "中位关注量": _metric_string(rate_data.get("mfollowCnt") or rate_data.get("mFollowCnt")),
+        }
+        cost_metrics = dict(scale_metrics)
+        if rate_data.get("interactionRate") not in (None, ""):
+            scale_metrics["互动率"] = f"{rate_data['interactionRate']}%"
+            cost_metrics["互动率"] = f"{rate_data['interactionRate']}%"
+        if rate_data.get("videoFullViewRate") not in (None, ""):
+            scale_metrics["视频完播率"] = f"{rate_data['videoFullViewRate']}%"
+            cost_metrics["视频完播率"] = f"{rate_data['videoFullViewRate']}%"
+        if rate_data.get("picture3sViewRate") not in (None, ""):
+            scale_metrics["图文3秒阅读率"] = f"{rate_data['picture3sViewRate']}%"
+            cost_metrics["图文3秒阅读率"] = f"{rate_data['picture3sViewRate']}%"
+        if rate_data.get("thousandLikePercent") not in (None, ""):
+            scale_metrics["千赞笔记比例"] = f"{rate_data['thousandLikePercent']}%"
+            cost_metrics["千赞笔记比例"] = f"{rate_data['thousandLikePercent']}%"
+        if rate_data.get("hundredLikePercent") not in (None, ""):
+            scale_metrics["百赞笔记比例"] = f"{rate_data['hundredLikePercent']}%"
+            cost_metrics["百赞笔记比例"] = f"{rate_data['hundredLikePercent']}%"
+        result[business] = {
+            "scale": {"text": "", "metrics": {key: value for key, value in scale_metrics.items() if value not in ("", None)}},
+            "cost": {"text": "", "metrics": {key: value for key, value in cost_metrics.items() if value not in ("", None)}},
+        }
+    return result
+
+
+def _detail_from_api_cache(page: Any, detail: dict[str, Any]) -> dict[str, Any]:
+    cache = _detail_api_cache(page)
+    if not cache:
+        return detail
+    result = dict(detail)
+    raw = result.get("raw_payload") if isinstance(result.get("raw_payload"), dict) else {}
+    profile = cache.get("blogger_profile") if isinstance(cache.get("blogger_profile"), dict) else {}
+    fans_summary = cache.get("fans_summary") if isinstance(cache.get("fans_summary"), dict) else {}
+    fans_profile = cache.get("fans_profile") if isinstance(cache.get("fans_profile"), dict) else {}
+    daily_summary = (cache.get("data_summary") or {}).get("daily") if isinstance(cache.get("data_summary"), dict) else {}
+    if isinstance(profile, dict):
+        if profile.get("name") and not result.get("nickname"):
+            result["nickname"] = str(profile.get("name") or "").strip()
+        if profile.get("redId") and not result.get("xiaohongshu_id"):
+            result["xiaohongshu_id"] = str(profile.get("redId") or "").strip()
+        if profile.get("location") and not result.get("ip_city"):
+            result["ip_city"] = str(profile.get("location") or "").strip()
+        if profile.get("fansCount") not in (None, "") and result.get("followers_count") in (None, ""):
+            result["followers_count"] = _number_from_text(str(profile.get("fansCount")))
+        if profile.get("likeCollectCountInfo") not in (None, "") and result.get("liked_collected_count") in (None, ""):
+            result["liked_collected_count"] = _number_from_text(str(profile.get("likeCollectCountInfo")))
+        if profile.get("picturePrice") not in (None, "") and result.get("quote_price") in (None, ""):
+            result["quote_price"] = _number_from_text(str(profile.get("picturePrice")))
+        if profile.get("videoPrice") not in (None, "") and result.get("video_quote_price") in (None, ""):
+            result["video_quote_price"] = _number_from_text(str(profile.get("videoPrice")))
+        tags = [str(item).strip() for item in (profile.get("personalTags") or []) if str(item).strip()]
+        if tags and not result.get("persona_tags"):
+            result["persona_tags"] = "、".join(tags)
+        content_tags = []
+        for item in (profile.get("contentTags") or []):
+            if not isinstance(item, dict):
+                continue
+            taxonomy1 = str(item.get("taxonomy1Tag") or "").strip()
+            if taxonomy1:
+                content_tags.append(taxonomy1)
+            for tag in item.get("taxonomy2Tags") or []:
+                text = str(tag).strip()
+                if text:
+                    content_tags.append(text)
+        if content_tags and not result.get("creator_type"):
+            result["creator_type"] = sanitize_creator_type("/".join(dict.fromkeys(content_tags)))
+    if isinstance(daily_summary, dict):
+        if daily_summary.get("dateKey"):
+            raw["data_updated_to"] = str(daily_summary.get("dateKey") or "")
+        if not raw.get("blogger_advantage"):
+            raw["blogger_advantage"] = _build_blogger_advantage_from_api(daily_summary, "daily")
+        if daily_summary.get("readMedian") not in (None, "") and result.get("daily_read_median") in (None, ""):
+            result["daily_read_median"] = float(daily_summary["readMedian"])
+        if daily_summary.get("mAccumImpNum") not in (None, "") and result.get("daily_exposure_median") in (None, ""):
+            result["daily_exposure_median"] = float(daily_summary["mAccumImpNum"])
+        if daily_summary.get("mEngagementNum") not in (None, "") and result.get("daily_interaction_median") in (None, ""):
+            result["daily_interaction_median"] = float(daily_summary["mEngagementNum"])
+        if daily_summary.get("responseRate") not in (None, "") and result.get("reply_rate_48h") in (None, ""):
+            result["reply_rate_48h"] = _ratio_from_percent_value(daily_summary.get("responseRate"))
+        if daily_summary.get("activeDayInLast7") not in (None, "") and result.get("active_days_7d") in (None, ""):
+            result["active_days_7d"] = float(daily_summary["activeDayInLast7"])
+    fan_analysis = raw.get("fan_analysis") if isinstance(raw.get("fan_analysis"), dict) else {}
+    if isinstance(fans_summary, dict):
+        mappings = {
+            "fansIncreaseNum": "fan_growth",
+            "fansGrowthRate": "fan_growth_ratio",
+            "activeFansRate": "active_fans_ratio",
+            "readFansRate": "read_fans_ratio",
+            "engageFansRate": "interaction_fans_ratio",
+            "payFansUserRate30d": "order_fans_ratio",
+        }
+        for source_key, target_key in mappings.items():
+            value = fans_summary.get(source_key)
+            if value in (None, "") or fan_analysis.get(target_key) not in (None, ""):
+                continue
+            fan_analysis[target_key] = _ratio_from_percent_value(value) if "Rate" in source_key else float(value)
+        raw["fan_analysis"] = fan_analysis
+        if result.get("active_fans_ratio") in (None, "") and fan_analysis.get("active_fans_ratio") is not None:
+            result["active_fans_ratio"] = fan_analysis["active_fans_ratio"]
+        if result.get("read_fans_ratio") in (None, "") and fan_analysis.get("read_fans_ratio") is not None:
+            result["read_fans_ratio"] = fan_analysis["read_fans_ratio"]
+        if result.get("interaction_fans_ratio") in (None, "") and fan_analysis.get("interaction_fans_ratio") is not None:
+            result["interaction_fans_ratio"] = fan_analysis["interaction_fans_ratio"]
+        if result.get("order_fans_ratio") in (None, "") and fan_analysis.get("order_fans_ratio") is not None:
+            result["order_fans_ratio"] = fan_analysis["order_fans_ratio"]
+        if result.get("fans_growth_ratio") in (None, "") and fan_analysis.get("fan_growth_ratio") is not None:
+            result["fans_growth_ratio"] = fan_analysis["fan_growth_ratio"]
+    if isinstance(fans_profile, dict):
+        gender = fans_profile.get("gender") if isinstance(fans_profile.get("gender"), dict) else {}
+        if gender:
+            female = _ratio_from_percent_value(gender.get("female"))
+            male = _ratio_from_percent_value(gender.get("male"))
+            if female is not None and result.get("female_fans_ratio") in (None, ""):
+                result["female_fans_ratio"] = female
+            if male is not None and result.get("male_fans_ratio") in (None, ""):
+                result["male_fans_ratio"] = male
+        ages = fans_profile.get("ages") if isinstance(fans_profile.get("ages"), list) else []
+        age_segments = []
+        for item in ages:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("group") or "").strip()
+            ratio = _ratio_from_percent_value(item.get("percent"))
+            if not label or ratio is None:
+                continue
+            age_segments.append({"label": label, "ratio": ratio})
+            if label == "25-34" and result.get("fans_25_34_ratio") in (None, ""):
+                result["fans_25_34_ratio"] = ratio
+            if label == "35-44" and result.get("fans_35_44_ratio") in (None, ""):
+                result["fans_35_44_ratio"] = ratio
+            if label in {">44", "44岁以上"} and result.get("fans_44_plus_ratio") in (None, ""):
+                result["fans_44_plus_ratio"] = ratio
+        if age_segments and not result.get("audience_age_distribution"):
+            dominant = max(age_segments, key=lambda item: item.get("ratio") or 0)
+            result["audience_age_distribution"] = {"segments": age_segments, "dominant": dominant, "source": "detail_api"}
+        female = result.get("female_fans_ratio")
+        male = result.get("male_fans_ratio")
+        if female is not None or male is not None:
+            segments = []
+            if female is not None:
+                segments.append({"label": "女性", "key": "female_fans_ratio", "ratio": female})
+            if male is not None:
+                segments.append({"label": "男性", "key": "male_fans_ratio", "ratio": male})
+            dominant = max(segments, key=lambda item: item.get("ratio") or 0)
+            result["audience_gender_distribution"] = {"segments": segments, "dominant": dominant, "source": "detail_api"}
+        provinces = fans_profile.get("provinces") if isinstance(fans_profile.get("provinces"), list) else []
+        if provinces and not result.get("audience_region_distribution"):
+            top_regions = []
+            for item in provinces[:10]:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("name") or "").strip()
+                ratio = _ratio_from_percent_value(item.get("percent"))
+                if label and ratio is not None:
+                    top_regions.append({"label": label, "ratio": ratio})
+            if top_regions:
+                result["audience_region_distribution"] = {
+                    "raw_text": "、".join(f"{item['label']}（{round(item['ratio'] * 100, 1)}%）" for item in top_regions[:3]),
+                    "source": "detail_api",
+                    "top_regions": top_regions,
+                    "dominant": top_regions[0],
+                    "scope": "province",
+                }
+        devices = fans_profile.get("devices") if isinstance(fans_profile.get("devices"), list) else []
+        if devices and not result.get("audience_device_distribution"):
+            top_device = None
+            parsed_devices = []
+            for item in devices:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("name") or "").strip()
+                ratio = _ratio_from_percent_value(item.get("percent"))
+                desc = str(item.get("desc") or "").strip()
+                if label and ratio is not None:
+                    parsed_devices.append({"label": label, "ratio": ratio, "desc": desc})
+            if parsed_devices:
+                top_device = parsed_devices[0]
+                result["audience_device_distribution"] = {
+                    "raw_text": f"{top_device['label']}用户占比{round(top_device['ratio'] * 100, 2)}%" + (f"，{top_device['desc']}" if top_device.get("desc") else ""),
+                    "source": "detail_api",
+                    "dominant": {"label": top_device["label"], "ratio": top_device["ratio"]},
+                    "insight": top_device.get("desc") or "",
+                }
+        interests = fans_profile.get("interests") if isinstance(fans_profile.get("interests"), list) else []
+        if interests and not result.get("topic_point"):
+            topic_labels = [str(item.get("name") or "").strip() for item in interests[:3] if isinstance(item, dict) and str(item.get("name") or "").strip()]
+            if topic_labels:
+                result["topic_point"] = "、".join(topic_labels)
+    result["raw_payload"] = raw
+    return result
+
+
+def _detail_notes_from_capture(page: Any, max_notes: int = 8, include_text: bool = True) -> list[dict[str, Any]]:
+    notes = getattr(page, "_pgy_latest_detail_notes", []) or []
+    if not isinstance(notes, list):
+        return []
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for note in notes:
+        if not isinstance(note, dict):
+            continue
+        key = str(note.get("note_id") or note.get("title") or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged = dict(note)
+        if include_text and note.get("note_id"):
+            detail = _fetch_note_detail_from_api(page, str(note.get("note_id")))
+            merged = {**merged, **{key: value for key, value in detail.items() if value not in ("", None, [])}}
+            if note.get("cover_url") and not merged.get("cover_url"):
+                merged["cover_url"] = note["cover_url"]
+        if merged.get("cover_url"):
+            merged["cover_url"] = _normalize_media_url(merged.get("cover_url"))
+        results.append(merged)
+        if len(results) >= max_notes:
+            break
+    return results
+
+
+def _merge_recent_notes_into_detail(detail: dict[str, Any], page: Any, max_notes: int = 8) -> dict[str, Any]:
+    recent_notes = _detail_notes_from_capture(page, max_notes=max_notes)
+    if not recent_notes:
+        return detail
+    raw = detail.get("raw_payload") if isinstance(detail.get("raw_payload"), dict) else {}
+    existing = raw.get("recent_notes") if isinstance(raw.get("recent_notes"), list) else []
+    by_key: dict[str, dict[str, Any]] = {}
+    for item in [*existing, *recent_notes]:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("note_id") or item.get("title") or "").strip()
+        if not key:
+            continue
+        by_key[key] = {**by_key.get(key, {}), **item}
+    detail["raw_payload"] = {**raw, "recent_notes": list(by_key.values())}
+    return detail
+
+
+def _attach_recent_note_payload(page: Any, row_index: int, creator: dict[str, Any], include_details: bool = False, max_notes: int = 2) -> None:
+    kol = _match_api_kol(page, row_index, creator)
+    if not kol:
+        return
+    raw_payload = creator.get("raw_payload") if isinstance(creator.get("raw_payload"), dict) else {}
+    note_briefs = _recent_note_briefs_from_kol(kol, max_notes=max_notes)
+    if note_briefs:
+        raw_payload["recent_note_briefs"] = note_briefs
+    if include_details:
+        recent_notes = _collect_recent_note_details_from_api(page, kol, max_notes=max_notes)
+        if recent_notes:
+            raw_payload["recent_notes"] = recent_notes
+    if raw_payload:
+        creator["raw_payload"] = raw_payload
 
 
 def _audience_profile_clip(page: Any) -> dict[str, Any] | None:
@@ -3293,7 +4865,28 @@ def _merge_detail_payload(detail: dict[str, Any], extra: dict[str, Any]) -> dict
     return merged
 
 
-def _collect_first_detail_for_creator(context: Any, row: Any) -> dict[str, Any]:
+def _finalize_detail_payload(detail: dict[str, Any]) -> dict[str, Any]:
+    if not detail:
+        return detail
+    finalized = {**detail}
+    raw = finalized.get("raw_payload") if isinstance(finalized.get("raw_payload"), dict) else {}
+    summary = _build_detail_collection_summary(finalized)
+    finalized["detail_collection_summary"] = summary
+    finalized["information_completeness"] = {
+        "module_count": summary.get("module_count", 0),
+        "note_case_count": summary.get("note_case_count", 0),
+        "has_audience_chart": summary.get("has_audience_chart", False),
+        "has_region_distribution": summary.get("has_region_distribution", False),
+        "has_device_distribution": summary.get("has_device_distribution", False),
+    }
+    finalized["raw_payload"] = {**raw, "detail_collection_summary": summary}
+    return finalized
+
+
+def _collect_first_detail_for_creator(context: Any, row: Any, detail_url: str = "") -> dict[str, Any]:
+    if detail_url and "/blogger-detail/" in detail_url:
+        return _collect_detail_by_url(context, detail_url)
+
     existing_pages = set(context.pages)
     trigger = row.locator(".profile").first
     if not trigger.count():
@@ -3313,15 +4906,21 @@ def _collect_first_detail_for_creator(context: Any, row: Any) -> dict[str, Any]:
     if not detail_page:
         return {}
     try:
+        _install_detail_api_capture(detail_page)
+        _install_detail_notes_capture(detail_page)
         detail_page.wait_for_load_state("domcontentloaded", timeout=10000)
         detail_page.wait_for_timeout(3500)
         text = detail_page.locator("body").inner_text(timeout=5000)
         detail = _extract_detail_fields(text, detail_page.url)
         detail = {**_detail_url_fields(detail_page.url, source="detail_page"), **detail}
+        detail = _detail_from_api_cache(detail_page, detail)
+        detail = _merge_recent_notes_into_detail(detail, detail_page)
         detail = _merge_detail_payload(detail, _collect_audience_profile_chart_metrics(detail_page))
         detail = _merge_detail_payload(detail, _collect_detail_interaction_states(detail_page))
         detail = _merge_detail_payload(detail, _capture_audience_profile_screenshot(detail_page, detail))
-        return _annotate_note_cases_with_traffic_reference(detail)
+        detail = _merge_note_details_into_payload(detail)
+        detail = _annotate_note_cases_with_traffic_reference(detail)
+        return _finalize_detail_payload(detail)
     finally:
         try:
             detail_page.close()
@@ -3334,14 +4933,20 @@ def _collect_detail_by_url(context: Any, url: str) -> dict[str, Any]:
         return {}
     detail_page = context.new_page()
     try:
+        _install_detail_api_capture(detail_page)
+        _install_detail_notes_capture(detail_page)
         detail_page.goto(url, wait_until="domcontentloaded", timeout=30000)
         detail_page.wait_for_timeout(3500)
         text = detail_page.locator("body").inner_text(timeout=5000)
         detail = _extract_detail_fields(text, detail_page.url)
+        detail = _detail_from_api_cache(detail_page, detail)
+        detail = _merge_recent_notes_into_detail(detail, detail_page)
         detail = _merge_detail_payload(detail, _collect_audience_profile_chart_metrics(detail_page))
         detail = _merge_detail_payload(detail, _collect_detail_interaction_states(detail_page))
         detail = _merge_detail_payload(detail, _capture_audience_profile_screenshot(detail_page, detail))
-        return _annotate_note_cases_with_traffic_reference(detail)
+        detail = _merge_note_details_into_payload(detail)
+        detail = _annotate_note_cases_with_traffic_reference(detail)
+        return _finalize_detail_payload(detail)
     finally:
         try:
             detail_page.close()
@@ -3611,23 +5216,24 @@ def _extract_current_creator_page(
         seen.add(key)
         raw_payload = creator.get("raw_payload") if isinstance(creator.get("raw_payload"), dict) else {}
         creator["raw_payload"] = {**raw_payload, "collection_page": page_number, "collection_row_index": index + 1}
+        max_detail_count = detail_limit if detail_limit is not None else limit
+        _attach_recent_note_payload(
+            page,
+            index,
+            creator,
+            include_details=include_details and len(creators) < max_detail_count,
+            max_notes=2,
+        )
         avatar = row.locator("img.head-photo").first
         if avatar.count():
             creator["avatar_url"] = avatar.get_attribute("src") or ""
-        max_detail_count = detail_limit if detail_limit is not None else limit
         if include_details and len(creators) < max_detail_count:
-            detail = _collect_first_detail_for_creator(context, row)
+            detail = _collect_first_detail_for_creator(context, row, str(creator.get("pgy_url") or creator.get("profile_url") or ""))
             if detail:
                 raw_payload = creator.get("raw_payload") if isinstance(creator.get("raw_payload"), dict) else {}
                 detail_raw = detail.pop("raw_payload", {})
                 creator.update({key: value for key, value in detail.items() if value not in ("", None)})
                 creator["raw_payload"] = {**raw_payload, "detail": detail_raw}
-        elif collect_profile_urls and not creator.get("pgy_url"):
-            link_fields = _collect_row_profile_url(context, row)
-            if link_fields:
-                raw_payload = creator.get("raw_payload") if isinstance(creator.get("raw_payload"), dict) else {}
-                creator.update(link_fields)
-                creator["raw_payload"] = {**raw_payload, "pgy_url_source": link_fields.get("pgy_url_source")}
         creators.append(creator)
         added += 1
         if len(creators) >= limit:
@@ -3647,6 +5253,7 @@ def _extract_visible_creators(
     page_number = 1
     idle_rounds = 0
     max_rounds = max(4, min(120, (limit // 20) + 8))
+    _append_api_creators(page, creators, seen, limit)
     for _ in range(max_rounds):
         before_count = len(creators)
         _extract_current_creator_page(
@@ -3659,20 +5266,29 @@ def _extract_visible_creators(
             detail_limit=detail_limit,
             page_number=page_number,
         )
+        _append_api_creators(page, creators, seen, limit)
         if len(creators) >= limit:
             break
         added = len(creators) - before_count
+        api_appended = _append_expanded_api_creators(page, creators, seen, limit)
+        if api_appended:
+            idle_rounds = 0
+            if len(creators) >= limit:
+                break
+            continue
         before_signature = _creator_table_signature(page)
         clicked_next = _click_next_creator_page(page, target_page=page_number + 1)
         if clicked_next:
             if _wait_for_creator_table_change(page, before_signature, timeout_ms=12000):
                 page_number += 1
                 idle_rounds = 0
+                _append_api_creators(page, creators, seen, limit)
                 continue
             page.wait_for_timeout(2500)
             if _has_valid_creator_rows(page) and _creator_table_signature(page) != before_signature:
                 page_number += 1
                 idle_rounds = 0
+                _append_api_creators(page, creators, seen, limit)
                 continue
             if added > 0:
                 page_number += 1
@@ -3683,6 +5299,12 @@ def _extract_visible_creators(
             if _creator_table_signature(page) != before_signature:
                 idle_rounds = 0
                 continue
+        api_added = _append_expanded_api_creators(page, creators, seen, limit)
+        if api_added:
+            idle_rounds = 0
+            if len(creators) >= limit:
+                break
+            continue
         idle_rounds = idle_rounds + 1 if added == 0 else 0
         if idle_rounds >= 2 or added == 0:
             break
@@ -3744,6 +5366,73 @@ def _click_filter_tag(page: Any, text: str) -> bool:
         except Exception:
             continue
     return False
+
+
+def _click_blogger_category_subcategory(page: Any, main_value: str, sub_value: str) -> bool:
+    if not main_value or not sub_value:
+        return False
+    main_pattern = re.compile(f"^\\s*{re.escape(main_value)}\\s*$")
+    main_locators = [
+        page.locator(".blogger-list_filter .tag, .blogger-list_filter .selector-body-options *").filter(has_text=main_pattern),
+        page.get_by_text(main_value, exact=True),
+    ]
+    for main_locator in main_locators:
+        try:
+            count = min(main_locator.count(), 20)
+        except Exception:
+            continue
+        for index in range(count):
+            main = main_locator.nth(index)
+            try:
+                if not _is_visible(main):
+                    continue
+                main.scroll_into_view_if_needed(timeout=1200)
+                try:
+                    main.hover(timeout=1500)
+                except Exception:
+                    pass
+                page.wait_for_timeout(500)
+                for selector in [
+                    ".d-popover .tag",
+                    ".d-popover .d-checkbox",
+                    ".d-popover *",
+                    ".filter-select-popover .tag",
+                    ".filter-select-popover *",
+                    ".blogger-list_filter .selector-body-options *",
+                    ".blogger-list_filter *",
+                ]:
+                    sub = page.locator(selector).filter(has_text=re.compile(f"^\\s*{re.escape(sub_value)}\\s*$")).first
+                    if not sub.count() or not _is_visible(sub):
+                        continue
+                    if _click_locator(page, sub, timeout=1800):
+                        page.wait_for_timeout(700)
+                        return True
+                if _click_locator(page, main, timeout=1500):
+                    page.wait_for_timeout(500)
+                    sub = page.get_by_text(sub_value, exact=True).first
+                    if sub.count() and _is_visible(sub) and _click_locator(page, sub, timeout=1800):
+                        page.wait_for_timeout(700)
+                        return True
+            except Exception:
+                continue
+    return False
+
+
+def _apply_blogger_category_filter(page: Any, item: dict[str, Any]) -> tuple[bool, str]:
+    main_value = str(item.get("value") or "").strip()
+    sub_value = str(item.get("sub_value") or item.get("subValue") or "").strip()
+    if not main_value:
+        return False, "博主类目缺少主类目"
+    if sub_value:
+        valid_subcategories = PGY_BLOGGER_CATEGORY_TAXONOMY.get(main_value) or []
+        if sub_value not in valid_subcategories:
+            return False, f"博主类目二级类目不在白名单：{main_value}-{sub_value}"
+        if _click_blogger_category_subcategory(page, main_value, sub_value):
+            return True, f"已选择博主类目：{main_value}-{sub_value}"
+        return False, f"页面未找到或未能选择博主二级类目：{main_value}-{sub_value}"
+    if _click_filter_tag(page, main_value) or _click_text_if_visible(page, main_value):
+        return True, f"已选择博主类目：{main_value}"
+    return False, f"页面未找到博主类目：{main_value}"
 
 
 def _find_filter_trigger(page: Any, field: str) -> Any:
@@ -4265,7 +5954,7 @@ def _apply_single_subfield_number_range(page: Any, popover: Any, item: dict[str,
     if nested is None:
         return False, "子字段区间弹层未出现，已保留在采集计划中"
     min_value, max_value = _range_for_subfield(item, sub_field)
-    if max_value in (None, ""):
+    if _range_policy_for_item(item, sub_field) != "min_only" and max_value in (None, ""):
         match = re.search(r"[≤<]\s*([0-9]+(?:\.[0-9]+)?)", value)
         max_value = match.group(1) if match else ""
     filled = _fill_nested_number_range(nested, min_value, max_value)
@@ -4315,14 +6004,16 @@ def _apply_preset_or_number_range(page: Any, item: dict[str, Any]) -> tuple[bool
     popover, message = _open_filter_popover(page, field)
     if popover is None:
         return False, message
-    candidates = _filter_value_candidates(item)
-    for candidate in [candidate for candidate in dict.fromkeys(candidates) if candidate]:
-        if _select_popover_checkbox(page, popover, candidate):
-            _click_popover_confirm(page, popover)
-            return True, "已在弹层中选择区间筛选项"
+    if _range_policy_for_item(item) != "min_only":
+        candidates = _filter_value_candidates(item)
+        for candidate in [candidate for candidate in dict.fromkeys(candidates) if candidate]:
+            if _select_popover_checkbox(page, popover, candidate):
+                _click_popover_confirm(page, popover)
+                return True, "已在弹层中选择区间筛选项"
     parsed_min, parsed_max = _range_numbers_from_text(value)
     min_value = item.get("min", parsed_min if parsed_min is not None else "")
     max_value = item.get("max", parsed_max if parsed_max is not None else "")
+    min_value, max_value = _apply_range_policy(item, min_value, max_value)
     if min_value in (None, "") and max_value in (None, ""):
         _click_popover_confirm(page, popover)
         return False, "弹层内未找到匹配区间，已保留在采集计划中"
@@ -4332,7 +6023,13 @@ def _apply_preset_or_number_range(page: Any, item: dict[str, Any]) -> tuple[bool
         return False, "区间输入未完整填写，已保留在采集计划中"
     if not _click_popover_confirm(page, popover):
         return False, "区间筛选确认失败，已保留在采集计划中"
-    return True, f"已填写{field}自定义区间 {_format_filter_number(min_value)}～{_format_filter_number(max_value)}"
+    if min_value not in (None, "") and max_value not in (None, ""):
+        range_text = f"{_format_filter_number(min_value)}～{_format_filter_number(max_value)}"
+    elif min_value not in (None, ""):
+        range_text = f"{_format_filter_number(min_value)}以上"
+    else:
+        range_text = f"{_format_filter_number(max_value)}以下"
+    return True, f"已填写{field}自定义区间 {range_text}"
 
 
 def _fill_popover_text_inputs(popover: Any, values: list[str]) -> int:
@@ -4412,6 +6109,8 @@ def _apply_filter_item(page: Any, item: dict[str, Any]) -> tuple[bool, str]:
     field = item.get("field") or ""
     if _filter_already_selected(page, item):
         return True, "页面已存在该筛选条件"
+    if field == "博主类目":
+        return _apply_blogger_category_filter(page, item)
     popover_success, popover_message = _apply_popover_filter_item(page, item)
     if popover_success or popover_message:
         return popover_success, popover_message
@@ -4735,6 +6434,7 @@ def apply_collection_plan(page: Any, plan: dict[str, Any]) -> dict[str, Any]:
     skipped: list[dict[str, str]] = []
     grouped_marketing_goals: dict[str, list[dict[str, Any]]] = {}
     regular_filters: list[dict[str, Any]] = []
+    before_signature = _creator_table_signature(page)
     for item in plan.get("filters") or []:
         if not isinstance(item, dict):
             continue
@@ -4749,12 +6449,16 @@ def apply_collection_plan(page: Any, plan: dict[str, Any]) -> dict[str, Any]:
         skipped.extend(group_skipped)
     for item in regular_filters:
         success, message = _apply_filter_item(page, item)
+        if success and _filter_acceptance_required(item) and not _verify_filter_selected(page, item):
+            success = False
+            message = f"{message}；但已选筛选栏未确认该条件，已阻止作为有效筛选"
         if success:
             applied.append({**item, "message": message})
         else:
             skipped.append({**item, "message": message})
     if applied:
-        page.wait_for_timeout(1800)
+        if not _wait_for_creator_table_change(page, before_signature, timeout_ms=12000):
+            page.wait_for_timeout(2500)
     metric_result = _ensure_display_metrics(page, [str(item) for item in plan.get("display_metrics") or []])
     return {"applied_filters": applied, "skipped_filters": skipped, **metric_result}
 
@@ -4927,6 +6631,26 @@ def start_browser() -> dict[str, Any]:
     return {**browser_status(), "message": "已尝试启动独立 Chrome，请在打开的页面登录蒲公英"}
 
 
+def _select_pgy_list_page(context: Any, *, require_existing: bool = False) -> Any:
+    pages = context.pages
+    list_page = next((item for item in pages if "/solar/pre-trade/note/kol" in (item.url or "")), None)
+    if list_page is not None:
+        try:
+            list_page.bring_to_front()
+        except Exception:
+            pass
+        return list_page
+    if require_existing:
+        return None
+    pgy_page = next((item for item in pages if "pgy.xiaohongshu.com" in (item.url or "")), None)
+    page = pgy_page or (pages[0] if pages else context.new_page())
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    return page
+
+
 def collect_visible_list(
     brief: str = "",
     screening_plan: dict[str, Any] | None = None,
@@ -4949,15 +6673,30 @@ def collect_visible_list(
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
             context = browser.contexts[0] if browser.contexts else browser.new_context()
-            pages = context.pages
-            page = next((item for item in pages if "pgy.xiaohongshu.com" in item.url), pages[0] if pages else context.new_page())
+            preserve_existing_filters = bool(not apply_filters and not reset_filters)
+            page = _select_pgy_list_page(context, require_existing=preserve_existing_filters)
+            if page is None:
+                return {
+                    "ok": False,
+                    "message": "预检后的蒲公英列表页不存在，已停止以避免跳回空筛选列表误采泛达人池",
+                    "current_url": "",
+                }
             _install_kol_response_capture(page)
             setattr(page, "_pgy_latest_api_kols", [])
+            setattr(page, "_pgy_api_kol_pool", [])
+            setattr(page, "_pgy_api_kol_keys", set())
+            setattr(page, "_pgy_latest_kol_request", {})
             if (
                 "pgy.xiaohongshu.com" not in page.url
                 or "/solar/pre-trade/note/kol" not in page.url
                 or reset_filters
             ):
+                if preserve_existing_filters:
+                    return {
+                        "ok": False,
+                        "message": "当前页不是预检后的博主广场列表页，已停止以避免重置筛选条件",
+                        "current_url": page.url,
+                    }
                 page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
             if "/solar/pre-trade/note/kol" not in page.url:
                 return {"ok": False, "message": "请先打开蒲公英博主广场 / 找博主页面", "current_url": page.url}
@@ -4971,6 +6710,9 @@ def collect_visible_list(
                 if apply_filters
                 else {"applied_filters": [], "skipped_filters": [], "selected_metrics": [], "skipped_metrics": []}
             )
+            _prime_kol_api_capture(page, reload_if_empty=bool(not apply_filters and not preserve_existing_filters))
+            if (collect_profile_urls or include_details) and not getattr(page, "_pgy_latest_api_kols", []):
+                _prime_kol_api_capture(page, reload_if_empty=True)
             active_plan = plan
             collection_state = _read_visible_collection_state(page)
             if apply_filters and collection_state["count"] == 0 and collection_state["empty_hint"]:
@@ -5053,15 +6795,45 @@ def collect_details_for_targets(targets: list[dict[str, Any]], limit: int = 20) 
     by_nickname = {str(item.get("nickname") or "").strip(): item for item in pending if item.get("nickname")}
     completed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    started_at = _now_text()
+    started_perf = time.perf_counter()
+
+    def attach_timing(creator: dict[str, Any], timing: dict[str, Any]) -> dict[str, Any]:
+        raw_payload = creator.get("raw_payload") if isinstance(creator.get("raw_payload"), dict) else {}
+        creator["raw_payload"] = {**raw_payload, "detail_collection_timing": timing}
+        creator["detail_collection_timing"] = timing
+        return creator
+
+    def finish_payload(ok: bool, message: str) -> dict[str, Any]:
+        timing = _elapsed_timing(started_at, started_perf)
+        average_seconds = round(timing["duration_seconds"] / max(1, len(completed)), 2) if completed else 0
+        return {
+            "ok": ok,
+            "creators": completed,
+            "failed": failed,
+            "message": message,
+            "started_at": timing["started_at"],
+            "finished_at": timing["finished_at"],
+            "duration_seconds": timing["duration_seconds"],
+            "duration_text": timing["duration_text"],
+            "average_seconds_per_creator": average_seconds,
+            "average_duration_text": _duration_text(average_seconds) if average_seconds else "",
+        }
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
             context = browser.contexts[0] if browser.contexts else browser.new_context()
-            pages = context.pages
-            page = next((item for item in pages if "pgy.xiaohongshu.com" in item.url), pages[0] if pages else context.new_page())
+            page = _select_pgy_list_page(context)
             if "pgy.xiaohongshu.com" not in page.url:
                 page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
+            _install_kol_response_capture(page)
+            setattr(page, "_pgy_latest_api_kols", [])
+            setattr(page, "_pgy_api_kol_pool", [])
+            setattr(page, "_pgy_api_kol_keys", set())
+            setattr(page, "_pgy_latest_kol_request", {})
             page.wait_for_timeout(1000)
+            _prime_kol_api_capture(page, reload_if_empty=True)
             rows = page.locator(".blogger-list_list .d-new-table tbody tr").filter(has_not=page.locator(".skeleton-block"))
             try:
                 row_count = min(rows.count(), 300)
@@ -5076,12 +6848,40 @@ def collect_details_for_targets(targets: list[dict[str, Any]], limit: int = 20) 
                 target = by_nickname.get(str(creator.get("nickname") or "").strip())
                 if not target:
                     continue
-                detail = _collect_first_detail_for_creator(context, row)
+                api_kol = _match_api_kol(page, index, creator)
+                api_recent_note_briefs = _recent_note_briefs_from_kol(api_kol, max_notes=2) if api_kol else []
+                api_recent_notes = _collect_recent_note_details_from_api(page, api_kol, max_notes=2) if api_kol else []
+                link_fields = _extract_row_link_fields(row) or _api_kol_link_fields(page, index, creator)
+                detail_url = str(
+                    target.get("pgy_url")
+                    or target.get("profile_url")
+                    or link_fields.get("pgy_url")
+                    or link_fields.get("profile_url")
+                    or ""
+                )
+                item_started_at = _now_text()
+                item_started_perf = time.perf_counter()
+                detail = _collect_first_detail_for_creator(context, row, detail_url)
+                item_timing = _elapsed_timing(item_started_at, item_started_perf)
                 if detail:
-                    completed.append({**target, **detail, "creator_id": target.get("creator_id")})
+                    merged = {**target, **link_fields, **detail, "creator_id": target.get("creator_id")}
+                    raw_payload = merged.get("raw_payload") if isinstance(merged.get("raw_payload"), dict) else {}
+                    if api_recent_note_briefs:
+                        raw_payload["recent_note_briefs"] = api_recent_note_briefs
+                    if api_recent_notes:
+                        raw_payload["recent_notes"] = api_recent_notes
+                    if raw_payload:
+                        merged["raw_payload"] = raw_payload
+                    attach_timing(merged, item_timing)
+                    completed.append(merged)
                     matched_ids.add(str(target.get("creator_id")))
                 else:
-                    failed.append({"creator_id": target.get("creator_id"), "nickname": target.get("nickname"), "message": "详情页打开失败"})
+                    failed.append({
+                        "creator_id": target.get("creator_id"),
+                        "nickname": target.get("nickname"),
+                        "message": "详情页打开失败",
+                        "detail_collection_timing": item_timing,
+                    })
             for target in pending:
                 creator_id = str(target.get("creator_id") or "")
                 if creator_id in matched_ids:
@@ -5091,11 +6891,25 @@ def collect_details_for_targets(targets: list[dict[str, Any]], limit: int = 20) 
                     if not any(item.get("creator_id") == creator_id for item in failed):
                         failed.append({"creator_id": creator_id, "nickname": target.get("nickname"), "message": "当前列表未找到该达人，且本地没有可打开的详情页链接"})
                     continue
+                item_started_at = _now_text()
+                item_started_perf = time.perf_counter()
                 detail = _collect_detail_by_url(context, url)
+                item_timing = _elapsed_timing(item_started_at, item_started_perf)
                 if detail:
-                    completed.append({**target, **detail, "creator_id": creator_id})
+                    completed.append(attach_timing({**target, **detail, "creator_id": creator_id}, item_timing))
                 else:
-                    failed.append({"creator_id": creator_id, "nickname": target.get("nickname"), "message": "详情页解析失败"})
-        return {"ok": True, "creators": completed, "failed": failed, "message": f"详情页补全完成 {len(completed)} 个，失败 {len(failed)} 个"}
+                    failed.append({
+                        "creator_id": creator_id,
+                        "nickname": target.get("nickname"),
+                        "message": "详情页解析失败",
+                        "detail_collection_timing": item_timing,
+                    })
+        payload = finish_payload(True, "")
+        payload["message"] = (
+            f"详情页补全完成 {len(completed)} 个，失败 {len(failed)} 个"
+            f"；总耗时 {payload['duration_text']}"
+            f"{f'，单个约 {payload['average_duration_text']}' if payload.get('average_duration_text') else ''}"
+        )
+        return payload
     except Exception as error:
-        return {"ok": False, "message": f"详情页补全失败：{error}", "creators": completed, "failed": failed}
+        return finish_payload(False, f"详情页补全失败：{error}")

@@ -21,12 +21,17 @@ import {
   togglePgyCollectionFilter,
 } from '../../utils/pgyFilters';
 import { pgyFilterLabel } from '../../constants/screeningConstants';
-import { PGY_FIND_BLOGGER_FILTER_GROUPS } from '../../constants/pgyConstants';
+import {
+  PGY_BLOGGER_CATEGORY_OPTIONS,
+  PGY_BLOGGER_CATEGORY_SUBCATEGORY_OPTIONS,
+  PGY_FIND_BLOGGER_FILTER_GROUPS,
+} from '../../constants/pgyConstants';
 import { PgyFilterPopover } from './PgyFilterPopover';
 
 export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
   const [openField, setOpenField] = useState(null);
   const [openAnchor, setOpenAnchor] = useState(null);
+  const [activeBloggerCategory, setActiveBloggerCategory] = useState('');
 
   const panelFilters = useMemo(() => normalizePgyFilters(filters || []), [filters]);
   const selectedKeys = useMemo(() => new Set(panelFilters.map(pgyFilterKey)), [panelFilters]);
@@ -81,6 +86,88 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
     </span>
   );
 
+  const renderBloggerCategoryPicker = (row, meta) => {
+    const selectedFieldItems = getPgySelectedItems(panelFilters, row.field);
+    const options = row.values || PGY_BLOGGER_CATEGORY_OPTIONS || meta?.options || [];
+    const clearCategory = () => {
+      setActiveBloggerCategory('');
+      if (meta) onChange?.(panelFilters.filter(item => item.field !== row.field));
+    };
+    const toggleSubcategory = (category, subValue) => {
+      if (!meta) return;
+      const nextItem = makePgyFilterItem(meta, subValue, category);
+      const nextKey = pgyFilterKey(nextItem);
+      const categoryOnlyKey = pgyFilterKey(makePgyFilterItem(meta, category));
+      const exists = panelFilters.some(item => pgyFilterKey(item) === nextKey);
+      const withoutCategoryOnly = panelFilters.filter(item => pgyFilterKey(item) !== categoryOnlyKey);
+      onChange?.(exists
+        ? withoutCategoryOnly.filter(item => pgyFilterKey(item) !== nextKey)
+        : [...withoutCategoryOnly, nextItem]);
+    };
+
+    return (
+      <div className="pgy-blogger-category-picker" onMouseLeave={() => setActiveBloggerCategory('')}>
+        {row.showAll && (
+          <button
+            type="button"
+            className={`pgy-blogger-category-main is-all ${selectedFieldItems.length ? '' : 'is-active'}`}
+            onClick={clearCategory}
+          >
+            全部
+          </button>
+        )}
+        {options.map(category => {
+          const subOptions = PGY_BLOGGER_CATEGORY_SUBCATEGORY_OPTIONS[category] || [];
+          const categoryItems = selectedFieldItems.filter(item => item.value === category);
+          const categorySelected = categoryItems.length > 0;
+          const opened = activeBloggerCategory === category;
+          const categoryOnlySelected = meta ? selectedKeys.has(pgyFilterKey(makePgyFilterItem(meta, category))) : false;
+          return (
+            <span
+              key={category}
+              className={`pgy-blogger-category-item ${opened ? 'is-open' : ''}`}
+              onMouseEnter={() => subOptions.length && setActiveBloggerCategory(category)}
+            >
+              <button
+                type="button"
+                className={`pgy-blogger-category-main ${categorySelected || categoryOnlySelected ? 'is-active' : ''}`}
+                onClick={() => {
+                  if (!meta) return;
+                  if (subOptions.length) {
+                    setActiveBloggerCategory(opened ? '' : category);
+                    return;
+                  }
+                  onChange?.(togglePgyCollectionFilter(panelFilters, meta, category));
+                }}
+              >
+                <span>{category}</span>
+              </button>
+              {subOptions.length > 0 && opened && (
+                <div className="pgy-blogger-subcategory-popover">
+                  {subOptions.map(subValue => {
+                    const subItem = makePgyFilterItem(meta, subValue, category);
+                    const checked = selectedKeys.has(pgyFilterKey(subItem));
+                    return (
+                      <button
+                        key={`${category}-${subValue}`}
+                        type="button"
+                        className={checked ? 'is-active' : ''}
+                        onClick={() => toggleSubcategory(category, subValue)}
+                      >
+                        <span>{subValue}</span>
+                        {checked && <CheckCircle2 size={13} />}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </span>
+          );
+        })}
+      </div>
+    );
+  };
+
   const renderRowContent = (row) => {
     if (row.kind === 'marketingGoal') {
       const meta = getPgyFilterMeta(row.field);
@@ -93,6 +180,9 @@ export function PgyFindBloggerFilterPanel({ filters = [], onChange }) {
     }
     if (row.kind === 'tags') {
       const meta = getPgyFilterMeta(row.field);
+      if (row.field === '博主类目') {
+        return renderBloggerCategoryPicker(row, meta);
+      }
       const values = row.values || meta?.options || [];
       const selectedFieldItems = getPgySelectedItems(panelFilters, row.field);
       return (

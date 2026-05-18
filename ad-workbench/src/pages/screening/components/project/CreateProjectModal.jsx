@@ -23,7 +23,7 @@ export function CreateProjectModal({ isOpen, onClose, onCreate }) {
       id, ...form, budget: Number(form.budget), singleBudget: Number(form.singleBudget), creatorCount: Number(form.creatorCount),
       period: `${form.periodStart} - ${form.periodEnd}`, status: '待启动', currentStep: 1,
       brief: { projectId: id, projectName: form.name, template: '自定义', description: form.description },
-      screeningPlan: { briefType: 'simple', hardFilters: [], scoringWeights: { budget: 20, fans: 20, cpe: 15, engagement: 15, persona: 20, content: 10 } },
+      screeningPlan: { briefType: 'simple', hardFilters: [], scoringWeights: { budget: 15, fans: 5, cpe: 20, engagement: 30, persona: 20, content: 10 } },
       feishuBinding: { linked: false, tableUrl: '', tableName: '', baseToken: '', tableId: '', viewId: '', fieldMapping: [] },
     });
     onClose();

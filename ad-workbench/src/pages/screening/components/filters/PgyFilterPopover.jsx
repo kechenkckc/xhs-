@@ -24,15 +24,23 @@ const POPOVER_MARGIN = 12;
 export function PgyFilterPopover({ meta, filters = [], anchorEl, initialSubField = '', onApply, onClear, onClose }) {
   const popoverRef = useRef(null);
   const [popoverStyle, setPopoverStyle] = useState(null);
+  const isBloggerCategory = meta.field === '博主类目';
   const selectedItems = useMemo(() => getPgySelectedItems(filters, meta.field)
-    .filter(item => !initialSubField || [item.goal, item.parent_value, item.parentValue, item.sub_field, item.subField].includes(initialSubField)), [filters, meta.field, initialSubField]);
+    .filter(item => {
+      if (!initialSubField) return true;
+      if (isBloggerCategory) return item.value === initialSubField;
+      return [item.goal, item.parent_value, item.parentValue, item.sub_field, item.subField].includes(initialSubField);
+    }), [filters, meta.field, initialSubField, isBloggerCategory]);
   const defaultSubField = initialSubField || selectedItems[0]?.sub_field || meta.sub_fields?.[0] || '';
   const [subField, setSubField] = useState(defaultSubField);
   const optionGroups = meta.option_groups || meta.optionGroups || [];
   const [activeGroup, setActiveGroup] = useState(() => (
-    initialSubField || selectedItems[0]?.sub_field || optionGroups[0]?.label || ''
+    initialSubField || (isBloggerCategory ? selectedItems[0]?.value : selectedItems[0]?.sub_field) || optionGroups[0]?.label || ''
   ));
   const [draftItems, setDraftItems] = useState(() => selectedItems.map(item => {
+    if (isBloggerCategory) {
+      return { value: item.sub_value || item.subValue || item.value, subField: item.value || '' };
+    }
     const itemSubField = item.sub_field || item.subField || item.goal || item.parent_value || item.parentValue || '';
     const prefix = itemSubField ? `${itemSubField}：` : '';
     const value = prefix && String(item.value).startsWith(prefix) ? String(item.value).slice(prefix.length) : item.value;

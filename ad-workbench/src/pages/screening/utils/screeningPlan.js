@@ -81,6 +81,42 @@ export function normalizeWorkbenchPlan(plan = {}) {
   const scoringDefaults = hardFilterOptionsFor(DEFAULT_SCORING_HARD_FILTER_FIELDS);
   const collectionHardFilters = normalizeHardFilterList(getLegacyCollectionHardFilters(plan), collectionDefaults);
   const scoringHardFilters = normalizeHardFilterList(getLegacyScoringHardFilters(plan), scoringDefaults);
+  const normalizePlanFilter = (item = {}) => ({
+    field: item.field || '',
+    value: item.value || '',
+    reason: item.reason || '',
+    control_type: item.control_type || '',
+    input_values: item.input_values || [],
+    pending_detail: item.pending_detail || '',
+    sub_field: item.sub_field || '',
+    sub_value: item.sub_value || item.subValue || '',
+    goal: item.goal || '',
+    parent_value: item.parent_value || item.parentValue || '',
+    country: item.country || '',
+    province: item.province || '',
+    city: item.city || '',
+    level: item.level || '',
+    min_items: item.min_items || undefined,
+    manual: item.manual === true,
+    source: item.source || '',
+  });
+  const normalizePlanFilterList = (filters = []) => normalizePgyFilters(filters || []).map(normalizePlanFilter);
+  const schemes = Array.isArray(pgyPlan.schemes)
+    ? pgyPlan.schemes.map(scheme => {
+      const requiredFilters = normalizePlanFilterList(scheme.required_filters || scheme.base_filters || []);
+      const additionalFilters = normalizePlanFilterList(scheme.additional_filters || scheme.extra_filters || []);
+      const enabledAdditionalFilters = normalizePlanFilterList(scheme.enabled_additional_filters || scheme.enabled_extra_filters || []);
+      return {
+        ...scheme,
+        required_filters: requiredFilters,
+        base_filters: requiredFilters,
+        additional_filters: additionalFilters,
+        extra_filters: additionalFilters,
+        enabled_additional_filters: enabledAdditionalFilters,
+        enabled_extra_filters: enabledAdditionalFilters,
+      };
+    })
+    : pgyPlan.schemes;
   return {
     ...plan,
     briefType: plan.briefType || 'complex',
@@ -93,18 +129,8 @@ export function normalizeWorkbenchPlan(plan = {}) {
     pgyCollectionPlan: {
       ...pgyPlan,
       hard_filters: collectionHardFilters,
-      filters: normalizePgyFilters(pgyPlan.filters || []).map(item => ({
-        field: item.field || '',
-        value: item.value || '',
-        reason: item.reason || '',
-        control_type: item.control_type || '',
-        input_values: item.input_values || [],
-        pending_detail: item.pending_detail || '',
-        sub_field: item.sub_field || '',
-        min_items: item.min_items || undefined,
-        manual: item.manual === true,
-        source: item.source || '',
-      })),
+      filters: normalizePlanFilterList(pgyPlan.filters || []),
+      schemes,
       display_metrics: pgyPlan.display_metrics || DEFAULT_PGY_DISPLAY_METRICS,
       detail_fields: pgyPlan.detail_fields || ['基础画像', '粉丝画像', '报价', '合作表现', '内容表现'],
       filter_catalog: pgyPlan.filter_catalog || [],
@@ -143,6 +169,17 @@ export function syncScreeningCriteria(plan = {}) {
     pgyCollectionPlan: {
       ...pgyCollectionPlan,
       filters: pgyFilters.length ? pgyFilters : pgyCollectionPlan.filters,
+      schemes: Array.isArray(pgyCollectionPlan.schemes)
+        ? pgyCollectionPlan.schemes.map(scheme => ({
+          ...scheme,
+          required_filters: normalizePgyFilters(scheme.required_filters || scheme.base_filters || []),
+          base_filters: normalizePgyFilters(scheme.required_filters || scheme.base_filters || []),
+          additional_filters: normalizePgyFilters(scheme.additional_filters || scheme.extra_filters || []),
+          extra_filters: normalizePgyFilters(scheme.additional_filters || scheme.extra_filters || []),
+          enabled_additional_filters: normalizePgyFilters(scheme.enabled_additional_filters || scheme.enabled_extra_filters || []),
+          enabled_extra_filters: normalizePgyFilters(scheme.enabled_additional_filters || scheme.enabled_extra_filters || []),
+        }))
+        : pgyCollectionPlan.schemes,
       hard_filters: collectionHardFilters,
     },
     scoringCriteria: {
