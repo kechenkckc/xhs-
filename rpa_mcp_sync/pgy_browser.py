@@ -3347,18 +3347,30 @@ def _creator_from_api_kol(kol: dict[str, Any], page_number: int = 0, row_index: 
     if avatar not in (None, ""):
         creator["avatar_url"] = str(avatar).strip()
     metric_fields = {
-        "followers_count": ("fansCount", "fans_count", "followerCount", "followersCount"),
+        "followers_count": ("fansNum", "fansCount", "fans_count", "followerCount", "followersCount"),
         "liked_collected_count": ("likeCollectCountInfo", "likedCollectedCount", "likeCollectCount"),
         "quote_price": ("picturePrice", "quotePrice", "imageQuotePrice", "picPrice"),
         "video_quote_price": ("videoPrice", "videoQuotePrice"),
-        "daily_exposure_median": ("impMedian", "mAccumImpNum", "exposureMedian"),
-        "daily_read_median": ("readMedian", "readMedianNum"),
-        "daily_interaction_median": ("interactionMedian", "mEngagementNum"),
-        "image_read_unit_price": ("pictureReadUnitPrice", "imageReadUnitPrice"),
-        "image_interaction_unit_price": ("pictureInteractionUnitPrice", "imageInteractionUnitPrice"),
-        "video_read_unit_price": ("videoReadUnitPrice",),
-        "video_interaction_unit_price": ("videoInteractionUnitPrice",),
-        "reply_rate_48h": ("responseRate", "replyRate48h"),
+        "daily_exposure_median": ("accumCommonImpMedinNum30d", "impMedian", "mAccumImpNum", "exposureMedian"),
+        "daily_read_median": ("clickMidNum", "readMedian", "readMedianNum"),
+        "daily_interaction_median": ("mEngagementNum", "mengagementNum", "interactionMedian"),
+        "image_daily_exposure_median": ("accumPicCommonImpMedinNum30d",),
+        "image_daily_read_median": ("pictureClickMidNum",),
+        "image_daily_interaction_median": ("pictureInterMidNum",),
+        "video_daily_exposure_median": ("accumVideoCommonImpMedinNum30d",),
+        "video_daily_read_median": ("videoClickMidNum",),
+        "video_daily_interaction_median": ("videoInterMidNum",),
+        "cooperation_exposure_median": ("accumCoopImpMedinNum30d",),
+        "cooperation_read_median": ("readMidCoop30",),
+        "cooperation_interaction_median": ("interMidCoop30",),
+        "overflow_store_median": ("mCpuvNum30d", "mcpuvNum30d"),
+        "overflow_store_unit_price": ("estimateCpuv30d",),
+        "image_cpm": ("estimatePictureCpm", "pictureCpm", "picCpm"),
+        "video_cpm": ("estimateVideoCpm", "videoCpm"),
+        "image_read_unit_price": ("pictureReadCost", "pictureReadUnitPrice", "imageReadUnitPrice"),
+        "image_interaction_unit_price": ("estimatePictureEngageCost", "pictureInteractionUnitPrice", "imageInteractionUnitPrice"),
+        "video_read_unit_price": ("videoReadCost", "videoReadCostV2", "videoReadUnitPrice"),
+        "video_interaction_unit_price": ("estimateVideoEngageCost", "videoInteractionUnitPrice"),
     }
     for field, keys in metric_fields.items():
         value = _kol_nested_value(kol, *keys)
@@ -3368,9 +3380,12 @@ def _creator_from_api_kol(kol: dict[str, Any], page_number: int = 0, row_index: 
         "fans_25_34_ratio": ("fans25To34Rate", "fans_25_34_ratio"),
         "fans_35_44_ratio": ("fans35To44Rate", "fans_35_44_ratio"),
         "fans_44_plus_ratio": ("fans44PlusRate", "fans_44_plus_ratio"),
-        "active_fans_ratio": ("activeFansRate",),
+        "active_fans_ratio": ("fansActiveIn28dLv", "activeFansRate"),
+        "fans_growth_ratio": ("fans30GrowthRate", "fansGrowthRate"),
         "read_fans_ratio": ("readFansRate",),
-        "interaction_fans_ratio": ("engageFansRate", "interactionFansRate"),
+        "interaction_fans_ratio": ("fansEngageNum30dLv", "engageFansRate", "interactionFansRate"),
+        "order_fans_ratio": ("payFansUserRate30d",),
+        "reply_rate_48h": ("inviteReply48hNumRatio", "responseRate", "replyRate48h"),
     }.items():
         value = _kol_nested_value(kol, *keys)
         if value not in (None, ""):
@@ -3396,9 +3411,7 @@ def _creator_from_api_kol(kol: dict[str, Any], page_number: int = 0, row_index: 
 def _install_kol_response_capture(page: Any) -> None:
     if getattr(page, "_pgy_kol_response_capture_installed", False):
         return
-    setattr(page, "_pgy_latest_api_kols", [])
-    setattr(page, "_pgy_api_kol_pool", [])
-    setattr(page, "_pgy_api_kol_keys", set())
+    _reset_kol_response_capture_state(page)
 
     def handle_response(response: Any) -> None:
         if "/api/solar/cooperator/blogger/v2" not in getattr(response, "url", ""):
@@ -3429,6 +3442,13 @@ def _install_kol_response_capture(page: Any) -> None:
         pass
 
 
+def _reset_kol_response_capture_state(page: Any) -> None:
+    setattr(page, "_pgy_latest_api_kols", [])
+    setattr(page, "_pgy_api_kol_pool", [])
+    setattr(page, "_pgy_api_kol_keys", set())
+    setattr(page, "_pgy_latest_kol_request", {})
+
+
 def _prime_kol_api_capture(page: Any, reload_if_empty: bool = True) -> bool:
     for _ in range(6):
         kols = getattr(page, "_pgy_latest_api_kols", []) or []
@@ -3444,6 +3464,10 @@ def _prime_kol_api_capture(page: Any, reload_if_empty: bool = True) -> bool:
         return False
     kols = getattr(page, "_pgy_latest_api_kols", []) or []
     return isinstance(kols, list) and bool(kols)
+
+
+def _should_reload_for_api_prime(*, apply_filters: bool, preserve_existing_filters: bool, preflight_only: bool) -> bool:
+    return bool(not apply_filters and not preserve_existing_filters and not preflight_only)
 
 
 def _set_nested_pagination(payload: Any, page_number: int, page_size: int) -> bool:
@@ -4969,6 +4993,21 @@ def _creator_collection_key(creator: dict[str, Any]) -> str:
     )
 
 
+def _creator_match_keys(creator: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for field in ["pgy_blogger_id", "pgy_url", "profile_url", "xiaohongshu_id"]:
+        value = str(creator.get(field) or "").strip()
+        if value:
+            keys.add(f"{field}:{value}")
+    nickname = _clean_text(str(creator.get("nickname") or ""))
+    if nickname:
+        keys.add(f"nickname:{nickname}")
+        location = _clean_text(str(creator.get("ip_city") or ""))
+        if location:
+            keys.add(f"nickname_location:{nickname}:{location}")
+    return keys
+
+
 def _creator_table_signature(page: Any) -> str:
     try:
         rows = _creator_list_rows(page)
@@ -6488,6 +6527,68 @@ def _read_visible_collection_state(page: Any) -> dict[str, Any]:
     }
 
 
+def _click_first_visible_text(page: Any, scope_selector: str, text_pattern: re.Pattern[str]) -> bool:
+    candidates = page.locator(scope_selector).filter(has_text=text_pattern)
+    try:
+        count = min(candidates.count(), 80)
+    except Exception:
+        return False
+    for index in range(count):
+        candidate = candidates.nth(index)
+        try:
+            if _is_visible(candidate) and _click_locator(page, candidate, timeout=1200):
+                page.wait_for_timeout(700)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _clear_current_pgy_filters(page: Any) -> dict[str, Any]:
+    clicked: list[str] = []
+    before_signature = _creator_table_signature(page)
+    clear_pattern = re.compile(r"^\s*(清空|重置|清除|清空筛选|重置筛选|清除筛选|全部清除)\s*$")
+    for selector in [
+        ".blogger-list_filter button",
+        ".blogger-list_filter .d-button",
+        ".blogger-list_filter [role=button]",
+        ".blogger-list_filter *",
+    ]:
+        if _click_first_visible_text(page, selector, clear_pattern):
+            clicked.append("clear_button")
+            break
+
+    close_selectors = [
+        ".blogger-list_filter .d-tag .d-icon-close",
+        ".blogger-list_filter .d-tag-close",
+        ".blogger-list_filter .tag .close",
+        ".blogger-list_filter [class*='close']",
+    ]
+    for selector in close_selectors:
+        close_buttons = page.locator(selector)
+        try:
+            count = min(close_buttons.count(), 40)
+        except Exception:
+            continue
+        for index in range(count):
+            button = close_buttons.nth(index)
+            try:
+                if not _is_visible(button):
+                    continue
+                if _click_locator(page, button, timeout=1000):
+                    clicked.append("filter_tag_close")
+                    page.wait_for_timeout(250)
+            except Exception:
+                continue
+
+    if clicked:
+        _wait_for_creator_table_change(page, before_signature, timeout_ms=5000)
+    return {
+        "cleared_filters": bool(clicked),
+        "clear_actions": clicked,
+    }
+
+
 def _apply_relaxed_plan_after_empty_result(page: Any, plan: dict[str, Any], plan_result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     current_plan = plan
     current_result = plan_result
@@ -6501,7 +6602,7 @@ def _apply_relaxed_plan_after_empty_result(page: Any, plan: dict[str, Any], plan
         if relaxed_plan is None:
             continue
         try:
-            if reset_filters or "/solar/pre-trade/note/kol" in page.url:
+            if reset_filters or "/solar/pre-trade/note/kol" not in page.url:
                 page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(1500)
         except Exception:
@@ -6655,7 +6756,7 @@ def collect_visible_list(
     brief: str = "",
     screening_plan: dict[str, Any] | None = None,
     apply_filters: bool = True,
-    limit: int = 1000,
+    limit: int = 5000,
     include_details: bool = True,
     collect_profile_urls: bool = True,
     export_metrics: bool = True,
@@ -6682,14 +6783,11 @@ def collect_visible_list(
                     "current_url": "",
                 }
             _install_kol_response_capture(page)
-            setattr(page, "_pgy_latest_api_kols", [])
-            setattr(page, "_pgy_api_kol_pool", [])
-            setattr(page, "_pgy_api_kol_keys", set())
-            setattr(page, "_pgy_latest_kol_request", {})
+            if not preserve_existing_filters:
+                _reset_kol_response_capture_state(page)
             if (
                 "pgy.xiaohongshu.com" not in page.url
                 or "/solar/pre-trade/note/kol" not in page.url
-                or reset_filters
             ):
                 if preserve_existing_filters:
                     return {
@@ -6704,15 +6802,22 @@ def collect_visible_list(
             login_hint = page.locator("text=登录").first
             if login_hint.count() and "login" in page.url.lower():
                 return {"ok": False, "message": "蒲公英尚未登录，请在打开的 Chrome 页面完成登录", "current_url": page.url}
+            if reset_filters and apply_filters:
+                _clear_current_pgy_filters(page)
             plan = build_collection_plan(brief, screening_plan)
             plan_result = (
                 apply_collection_plan(page, plan)
                 if apply_filters
                 else {"applied_filters": [], "skipped_filters": [], "selected_metrics": [], "skipped_metrics": []}
             )
-            _prime_kol_api_capture(page, reload_if_empty=bool(not apply_filters and not preserve_existing_filters))
+            allow_api_reload = _should_reload_for_api_prime(
+                apply_filters=apply_filters,
+                preserve_existing_filters=preserve_existing_filters,
+                preflight_only=preflight_only,
+            )
+            _prime_kol_api_capture(page, reload_if_empty=allow_api_reload)
             if (collect_profile_urls or include_details) and not getattr(page, "_pgy_latest_api_kols", []):
-                _prime_kol_api_capture(page, reload_if_empty=True)
+                _prime_kol_api_capture(page, reload_if_empty=allow_api_reload)
             active_plan = plan
             collection_state = _read_visible_collection_state(page)
             if apply_filters and collection_state["count"] == 0 and collection_state["empty_hint"]:
@@ -6748,7 +6853,7 @@ def collect_visible_list(
                     **plan_result,
                     **recommendation_count,
                 }
-            collect_limit = max(1, min(limit, 1000))
+            collect_limit = max(1, min(limit, 5000))
             creators = _extract_visible_creators(
                 page,
                 collect_limit,
@@ -6828,10 +6933,7 @@ def collect_details_for_targets(targets: list[dict[str, Any]], limit: int = 20) 
             if "pgy.xiaohongshu.com" not in page.url:
                 page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
             _install_kol_response_capture(page)
-            setattr(page, "_pgy_latest_api_kols", [])
-            setattr(page, "_pgy_api_kol_pool", [])
-            setattr(page, "_pgy_api_kol_keys", set())
-            setattr(page, "_pgy_latest_kol_request", {})
+            _reset_kol_response_capture_state(page)
             page.wait_for_timeout(1000)
             _prime_kol_api_capture(page, reload_if_empty=True)
             rows = page.locator(".blogger-list_list .d-new-table tbody tr").filter(has_not=page.locator(".skeleton-block"))

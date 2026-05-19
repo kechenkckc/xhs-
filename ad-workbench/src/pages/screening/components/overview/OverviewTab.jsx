@@ -72,7 +72,7 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
   const [expandedSchemeId, setExpandedSchemeId] = useState('');
   const [collectSchemeResults, setCollectSchemeResults] = useState([]);
   const [schemeSaveStatus, setSchemeSaveStatus] = useState({});
-  const [collectLimit, setCollectLimit] = useState(1000);
+  const [collectLimit, setCollectLimit] = useState(5000);
   const [collectStatus, setCollectStatus] = useState('');
   const [collecting, setCollecting] = useState(false);
   const [stoppingCollect, setStoppingCollect] = useState(false);
@@ -477,7 +477,7 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
                   value={collectLimit}
                   onChange={(event) => {
                     const nextValue = Number(event.target.value || 1);
-                    setCollectLimit(Math.max(1, Math.min(1000, nextValue)));
+                    setCollectLimit(Math.max(1, Math.min(5000, nextValue)));
                   }}
                 />
               </label>

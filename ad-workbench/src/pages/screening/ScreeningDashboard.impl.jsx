@@ -490,7 +490,7 @@ export default function ScreeningDashboard() {
       : currentProject?.screeningPlan || {};
     if (activePlan) updateCurrentProject({ screening_plan: activePlan });
     if (!projectId) return { ok: false, error: '未选择项目' };
-    const limit = Math.max(1, Math.min(1000, Number(options.limit || 1000)));
+    const limit = Math.max(1, Math.min(5000, Number(options.limit || 5000)));
     const schemeIds = Array.isArray(options.schemeIds) ? options.schemeIds.map(String).filter(Boolean) : [];
     if (activePlan && Object.keys(activePlan).length > 0) {
       const saveResult = await safeApi(`/api/projects/${projectId}`, {

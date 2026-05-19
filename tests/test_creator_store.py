@@ -1,14 +1,22 @@
 import csv
 import json
+import threading
+import time
 import uuid
 
+from rpa_mcp_sync.creator_store import connect
+
 from rpa_mcp_sync.creator_store import (
+    cleanup_project_creator_duplicates,
     change_creator_stage,
     creator_pool,
     creator_pool_detail,
+    detail_completion_actionable_missing_fields,
+    detail_completion_actionable_needs,
     export_creator_pool_csv,
     generate_test_creators,
     get_creator,
+    needs_detail_completion,
     quality_feishu_rows,
     review_creator,
     score_creator,
@@ -69,6 +77,113 @@ def test_creator_upsert_deduplicates_and_scores():
     assert scored["traffic_score"] is not None
     assert scored["persona_score"] is not None
     assert scored["content_score"] is not None
+
+
+def test_needs_detail_completion_only_counts_actionable_detail_fields():
+    creator = {
+        "creator_id": "pytest-detail-actionable",
+        "nickname": "详情字段达人",
+        "pgy_url": "https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/test-detail-actionable",
+        "total_score": 96,
+        "hard_filter_passed": 1,
+        "detail_collection_priority": "高优先级",
+        "daily_read_median": None,
+        "daily_interaction_median": None,
+        "fans_35_plus_ratio": 0.56,
+        "topic_point": "学习规划",
+        "raw_payload": {"detail_collection_summary": {"module_count": 3}, "recent_notes": [{"title": "学习"}]},
+    }
+
+    assert detail_completion_actionable_missing_fields(creator) == []
+    assert detail_completion_actionable_needs(creator) == []
+    assert needs_detail_completion(creator) is False
+
+
+def test_needs_detail_completion_skips_creators_without_detail_link():
+    creator = {
+        "creator_id": "pgy:list:no-link:beijing",
+        "nickname": "无链接达人",
+        "pgy_url": "",
+        "total_score": 82,
+        "hard_filter_passed": 1,
+        "detail_collection_priority": "高优先级",
+        "fans_35_plus_ratio": None,
+        "topic_point": "",
+        "raw_payload": {},
+    }
+
+    assert detail_completion_actionable_missing_fields(creator) == [
+        "fans_35_plus_ratio",
+        "education_context",
+        "note_cases",
+        "detail_page_evidence",
+    ]
+    assert needs_detail_completion(creator) is False
+
+
+def test_cleanup_project_creator_duplicates_prefers_api_record():
+    project_id = f"pytest_cleanup_dup_{uuid.uuid4().hex[:8]}"
+    upsert_creator(
+        project_id,
+        {
+            "creator_id": "pgy-api:dup-001",
+            "nickname": "重复达人",
+            "pgy_url": "https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/dup-001",
+            "xiaohongshu_id": "dup-xhs-001",
+            "quote_price": 5000,
+            "followers_count": 30000,
+            "fans_35_plus_ratio": 0.52,
+        },
+        score=False,
+    )
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO creators(
+                creator_id, project_id, source, xiaohongshu_id, pgy_blogger_id, pgy_url, nickname,
+                creator_type, persona_tags, ip_city, profile_url, avatar_url, status, raw_payload, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            """,
+            (
+                "pgy:list:重复达人:北京",
+                project_id,
+                "pgy",
+                "dup-xhs-001",
+                "",
+                "",
+                "重复达人",
+                "",
+                "",
+                "北京",
+                "",
+                "",
+                "待补数据",
+                "{}",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_creators(project_id, creator_id, pool_stage, review_status, created_at, updated_at)
+            VALUES (?, ?, '待建联达人', '待补数据', datetime('now'), datetime('now'))
+            """,
+            (project_id, "pgy:list:重复达人:北京"),
+        )
+
+    result = cleanup_project_creator_duplicates(project_id)
+    rows = [
+        item
+        for item in [
+            get_creator(project_id, "pgy-api:dup-001"),
+            get_creator(project_id, "pgy:list:重复达人:北京"),
+        ]
+        if item
+    ]
+
+    assert result["deleted_count"] == 1
+    assert result["merged_pairs"][0]["canonical_creator_id"] == "pgy-api:dup-001"
+    assert len(rows) == 1
+    assert rows[0]["creator_id"] == "pgy-api:dup-001"
 
 
 def test_hard_filter_threshold_parser_handles_mixed_descriptions():
@@ -143,6 +258,29 @@ def test_scoring_uses_cpm_to_accept_higher_quote_when_exposure_is_good():
     assert "CPM 333.3 偏高" in inefficient["score_reason"]
     assert inefficient["total_score"] <= 84
     assert efficient["total_score"] > inefficient["total_score"]
+
+
+def test_initial_scoring_caps_weak_direction_without_detail_evidence():
+    score = score_values(
+        {
+            "creator_id": "pytest-lifestyle-weak-direction",
+            "nickname": "生活方式谭十七",
+            "pgy_url": "https://pgy.xiaohongshu.com/creator/lifestyle-weak",
+            "followers_count": 80000,
+            "quote_price": 6000,
+            "fans_35_plus_ratio": 0.55,
+            "daily_read_median": 18000,
+            "daily_interaction_median": 900,
+            "image_read_unit_price": 0.8,
+            "image_interaction_unit_price": 6,
+            "creator_type": "家居家装/生活记录",
+            "persona_tags": "极简主义",
+            "raw_payload": {"cooperation_hint": "期待与「3C及电器」行业合作"},
+        }
+    )
+    assert score["total_score"] <= 89
+    assert score["initial_tier"] in {"B", "B+"}
+    assert "方向弱证据：weak" in score["score_reason"]
 
 
 def test_creator_upsert_persists_full_collection_metrics():
@@ -659,3 +797,56 @@ def test_batch_llm_scores_multiple_creators_in_one_request(monkeypatch):
     assert "screening_plan" not in captured["project"]
     assert set(scores) == {creator["creator_id"] for creator in creators}
     assert all(score["cooperation_direction"] == "答疑笔场景种草" for score in scores.values())
+
+
+def test_score_project_runs_llm_chunks_in_parallel(monkeypatch):
+    project_id = f"pytest_parallel_llm_{uuid.uuid4().hex[:8]}"
+    creators = [
+        upsert_creator(
+            project_id,
+            {
+                "creator_id": f"{project_id}-{index}",
+                "nickname": f"并发达人{index}",
+                "pgy_url": f"https://pgy.xiaohongshu.com/creator/parallel-{index}",
+                "quote_price": 8000 + index,
+                "fans_35_plus_ratio": 0.5,
+                "daily_read_median": 5000,
+                "daily_interaction_median": 300,
+            },
+            score=False,
+        )
+        for index in range(8)
+    ]
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+    chunk_sizes: list[int] = []
+
+    def fake_score_values_batch_with_llm(project_id_arg, chunk):
+        nonlocal active, max_active
+        assert project_id_arg == project_id
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            chunk_sizes.append(len(chunk))
+        time.sleep(0.2)
+        try:
+            return {
+                str(creator["creator_id"]): {
+                    **score_values(creator),
+                    "score_reason": f"【大模型分析】{creator['nickname']}并发评分完成",
+                }
+                for creator in chunk
+            }
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr("rpa_mcp_sync.creator_store.score_values_batch_with_llm", fake_score_values_batch_with_llm)
+
+    result = score_project(project_id, use_llm=True, creator_ids=[creator["creator_id"] for creator in creators], trigger_source="manual")
+
+    assert result["sources"]["llm"] == 8
+    assert len(chunk_sizes) >= 2
+    assert any(size > 1 for size in chunk_sizes)
+    assert max_active >= 2

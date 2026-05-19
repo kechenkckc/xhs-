@@ -7,6 +7,9 @@ import re
 import shutil
 import sqlite3
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,21 @@ from .llm_config import chat_json
 DB_PATH = ROOT / "runtime" / "tasks.db"
 PROJECT_ID = "youdao_001"
 PROJECT_NAME = "有道答疑笔5-6月合作"
+_SCORING_BENCHMARK_CACHE: ContextVar[dict[tuple[float, float, int], dict[str, Any] | None] | None] = ContextVar(
+    "_SCORING_BENCHMARK_CACHE",
+    default=None,
+)
+_PROJECT_SCREENING_PLAN_CACHE: ContextVar[dict[str, dict[str, Any]] | None] = ContextVar(
+    "_PROJECT_SCREENING_PLAN_CACHE",
+    default=None,
+)
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def now() -> str:
@@ -1195,11 +1213,11 @@ def normalize_creator(payload: dict[str, Any], project_id: str) -> dict[str, Any
 
 def tier_from_score(score: Any) -> str:
     number = parse_number(score) or 0
-    if number >= 100:
+    if number >= 95:
         return "S"
-    if number >= 90:
-        return "A"
     if number >= 80:
+        return "A"
+    if number >= 75:
         return "B+"
     if number >= 70:
         return "B"
@@ -1333,6 +1351,21 @@ def find_existing(conn: sqlite3.Connection, creator: dict[str, Any]) -> str | No
             WHERE c.project_id=? AND c.nickname=? AND m.followers_count=? AND m.quote_price=?
             """,
             (creator["project_id"], creator["nickname"], creator["followers_count"], creator["quote_price"]),
+        ).fetchone()
+        if row:
+            existing_id = usable_existing_id(row["creator_id"])
+            if existing_id:
+                return existing_id
+    if creator.get("nickname") and (creator.get("pgy_url") or creator.get("pgy_blogger_id") or creator.get("xiaohongshu_id")):
+        row = conn.execute(
+            """
+            SELECT creator_id FROM creators
+            WHERE project_id=? AND nickname=? AND creator_id LIKE 'pgy:list:%'
+            AND COALESCE(pgy_url, '')=''
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (creator["project_id"], creator["nickname"]),
         ).fetchone()
         if row:
             existing_id = usable_existing_id(row["creator_id"])
@@ -1764,6 +1797,82 @@ def list_creators(project_id: str, status: str | None = None, q: str | None = No
         return legacy_rows
 
 
+def creator_quality_summary(project_id: str) -> dict[str, Any]:
+    creators = list_creators(project_id)
+
+    def present(value: Any) -> bool:
+        return bool(str(value or "").strip())
+
+    missing_pgy = [item for item in creators if not present(item.get("pgy_url"))]
+    missing_xhs = [item for item in creators if not present(item.get("xiaohongshu_id"))]
+    missing_pgy_id = [item for item in creators if not present(item.get("pgy_blogger_id"))]
+    fallback_rows = [item for item in creators if str(item.get("creator_id") or "").startswith("pgy:list:")]
+    fallback_without_link = [item for item in fallback_rows if not present(item.get("pgy_url"))]
+    unscored = [item for item in creators if item.get("total_score") in (None, "")]
+    detail_needed = [item for item in creators if needs_detail_completion(item)]
+
+    def sample(items: list[dict[str, Any]], limit: int = 10) -> list[dict[str, Any]]:
+        return [
+            {
+                "creator_id": item.get("creator_id"),
+                "nickname": item.get("nickname"),
+                "pgy_url": item.get("pgy_url") or "",
+                "xiaohongshu_id": item.get("xiaohongshu_id") or "",
+                "pgy_blogger_id": item.get("pgy_blogger_id") or "",
+                "source": item.get("source") or "",
+            }
+            for item in items[:limit]
+        ]
+
+    total = len(creators)
+    return {
+        "project_id": project_id,
+        "total": total,
+        "pgy_url": {
+            "present": total - len(missing_pgy),
+            "missing": len(missing_pgy),
+            "missing_rate": round(len(missing_pgy) / total, 4) if total else 0,
+        },
+        "xiaohongshu_id": {
+            "present": total - len(missing_xhs),
+            "missing": len(missing_xhs),
+            "missing_rate": round(len(missing_xhs) / total, 4) if total else 0,
+        },
+        "pgy_blogger_id": {
+            "present": total - len(missing_pgy_id),
+            "missing": len(missing_pgy_id),
+            "missing_rate": round(len(missing_pgy_id) / total, 4) if total else 0,
+        },
+        "fallback_rows": {
+            "total": len(fallback_rows),
+            "missing_pgy_url": len(fallback_without_link),
+        },
+        "scores": {
+            "unscored": len(unscored),
+            "scored": total - len(unscored),
+        },
+        "detail_completion": {
+            "needed": len(detail_needed),
+            "needed_rate": round(len(detail_needed) / total, 4) if total else 0,
+            "sample": [
+                {
+                    "creator_id": item.get("creator_id"),
+                    "nickname": item.get("nickname"),
+                    "total_score": item.get("total_score"),
+                    "initial_tier": item.get("initial_tier") or item.get("tier") or "",
+                    "needs": detail_completion_actionable_needs(item),
+                    "missing_fields": detail_completion_actionable_missing_fields(item),
+                }
+                for item in sorted(detail_needed, key=lambda c: parse_number(c.get("total_score")) or 0, reverse=True)[:10]
+            ],
+        },
+        "samples": {
+            "missing_pgy_url": sample(missing_pgy),
+            "fallback_without_link": sample(fallback_without_link),
+        },
+    }
+
+
 def get_creator(project_id: str, creator_id: str) -> dict[str, Any] | None:
     items = list_creators(project_id)
     return next((item for item in items if item["creator_id"] == creator_id), None)
@@ -2133,11 +2242,11 @@ def _score_information_completeness(creator: dict[str, Any]) -> float:
 
 def _initial_tier(total_score: Any, hard_pass: bool = True) -> str:
     score = parse_number(total_score) or 0
-    if score >= 100:
+    if score >= 95:
         return "S"
-    if score >= 90:
-        return "A"
     if score >= 80:
+        return "A"
+    if score >= 75:
         return "B+"
     if score >= 70:
         return "B"
@@ -2149,31 +2258,220 @@ def _detail_collection_priority(total_score: Any, bonus_score: Any, hard_pass: b
         return "数据暂缓"
     score = parse_number(total_score) or 0
     bonus = parse_number(bonus_score) or 0
-    if score >= 100:
-        return "必须补采"
-    if score >= 90:
-        return "优先补采"
+    if score >= 95:
+        return "最高优先级"
     if score >= 80:
-        return "高潜补采"
+        return "高优先级"
+    if score >= 75:
+        return "中高优先级"
     if score >= 70:
-        return "暂缓观察"
-    return "不补采"
+        return "中优先级"
+    return "低优先级"
 
 
 def _recommend_level(total_score: Any, hard_pass: bool = True) -> str:
     if not hard_pass:
         return "待复核"
     score = parse_number(total_score) or 0
-    if score >= 100:
+    if score >= 95:
         return "强推荐"
-    if score >= 90:
-        return "推荐"
     if score >= 80:
+        return "推荐"
+    if score >= 70:
         return "备选"
     return "不推荐"
 
 
-DETAIL_PRIORITY_HIGH_VALUES = {"必须完善", "优先完善", "高潜完善", "必须补采", "优先补采", "高潜补采"}
+DETAIL_PRIORITY_HIGH_VALUES = {"必须完善", "优先完善", "高潜完善", "最高优先级", "高优先级", "中高优先级", "中优先级"}
+DETAIL_COMPLETION_PRIORITY_VALUES = {"必须完善", "优先完善", "高潜完善", "最高优先级", "高优先级", "中高优先级"}
+DETAIL_COMPLETION_ACTIONABLE_FIELDS = {"fans_35_plus_ratio", "education_context", "note_cases", "detail_page_evidence"}
+DETAIL_COMPLETION_FIELD_NEED_LABELS = {
+    "fans_35_plus_ratio": "缺35岁以上粉丝占比",
+    "education_context": "缺孩子年龄/年级/教育话题",
+    "note_cases": "缺近期/合作笔记案例",
+    "detail_page_evidence": "缺达人详情页证据",
+}
+
+
+def detail_completion_needs(creator: dict[str, Any]) -> list[str]:
+    needs: list[str] = []
+
+    def positive(*keys: str) -> bool:
+        return any((parse_number(creator.get(key)) or 0) > 0 for key in keys)
+
+    def present(*keys: str) -> bool:
+        return any(str(creator.get(key) or "").strip() for key in keys)
+
+    if ratio(creator.get("fans_35_plus_ratio")) is None:
+        needs.append("缺35岁以上粉丝占比")
+    if not positive(
+        "daily_read_median",
+        "image_daily_read_median",
+        "video_daily_read_median",
+        "cooperation_read_median",
+    ):
+        needs.append("缺有效阅读中位数")
+    if not positive(
+        "daily_interaction_median",
+        "image_daily_interaction_median",
+        "video_daily_interaction_median",
+        "cooperation_interaction_median",
+    ):
+        needs.append("缺有效互动中位数")
+    if not positive("image_cpm", "video_cpm", "image_read_unit_price", "video_read_unit_price", "image_interaction_unit_price", "video_interaction_unit_price"):
+        needs.append("缺有效CPM/CPC/CPE")
+    if not present("child_age", "child_grade", "topic_point"):
+        needs.append("缺孩子年龄/年级/教育话题")
+
+    raw_payload = _parse_payload_json(creator.get("raw_payload"))
+    detail = raw_payload.get("detail") if isinstance(raw_payload, dict) else None
+    summary = raw_payload.get("detail_collection_summary") if isinstance(raw_payload, dict) else None
+    if not isinstance(detail, dict) and not isinstance(summary, dict):
+        needs.append("缺达人详情页证据")
+    if not _collect_note_cases_from_payload(raw_payload):
+        needs.append("缺近期/合作笔记案例")
+    return list(dict.fromkeys(needs))
+
+
+def detail_completion_missing_fields(creator: dict[str, Any]) -> list[str]:
+    fields: list[str] = []
+    if ratio(creator.get("fans_35_plus_ratio")) is None:
+        fields.append("fans_35_plus_ratio")
+    for label, keys in {
+        "read_median": ("daily_read_median", "image_daily_read_median", "video_daily_read_median", "cooperation_read_median"),
+        "interaction_median": ("daily_interaction_median", "image_daily_interaction_median", "video_daily_interaction_median", "cooperation_interaction_median"),
+        "cost_efficiency": ("image_cpm", "video_cpm", "image_read_unit_price", "video_read_unit_price", "image_interaction_unit_price", "video_interaction_unit_price"),
+    }.items():
+        if not any((parse_number(creator.get(key)) or 0) > 0 for key in keys):
+            fields.append(label)
+    if not any(str(creator.get(key) or "").strip() for key in ("child_age", "child_grade", "topic_point")):
+        fields.append("education_context")
+    raw_payload = _parse_payload_json(creator.get("raw_payload"))
+    if not _collect_note_cases_from_payload(raw_payload):
+        fields.append("note_cases")
+    if "缺达人详情页证据" in detail_completion_needs(creator):
+        fields.append("detail_page_evidence")
+    return fields
+
+
+def detail_completion_actionable_missing_fields(creator: dict[str, Any]) -> list[str]:
+    return [field for field in detail_completion_missing_fields(creator) if field in DETAIL_COMPLETION_ACTIONABLE_FIELDS]
+
+
+def detail_completion_actionable_needs(creator: dict[str, Any]) -> list[str]:
+    return [DETAIL_COMPLETION_FIELD_NEED_LABELS[field] for field in detail_completion_actionable_missing_fields(creator)]
+
+
+def _has_detail_completion_link(creator: dict[str, Any]) -> bool:
+    for key in ("pgy_url", "profile_url"):
+        value = str(creator.get(key) or "").strip()
+        if "/blogger-detail/" in value:
+            return True
+    return False
+
+
+def needs_detail_completion(creator: dict[str, Any]) -> bool:
+    actionable_fields = detail_completion_actionable_missing_fields(creator)
+    if not actionable_fields:
+        return False
+    if not _has_detail_completion_link(creator):
+        return False
+    score = parse_number(creator.get("total_score")) or 0
+    hard_pass = creator.get("hard_filter_passed") in {1, True, "1"}
+    high_priority = creator.get("detail_collection_priority") in DETAIL_COMPLETION_PRIORITY_VALUES
+    return hard_pass and (score >= 75 or high_priority)
+
+
+def cleanup_project_creator_duplicates(project_id: str) -> dict[str, Any]:
+    creators = list_creators(project_id)
+    identity_groups: dict[str, list[dict[str, Any]]] = {}
+
+    def add_group(key: str, creator: dict[str, Any]) -> None:
+        identity_groups.setdefault(key, []).append(creator)
+
+    for creator in creators:
+        pgy_url = str(creator.get("pgy_url") or "").strip()
+        xhs_id = str(creator.get("xiaohongshu_id") or "").strip()
+        blogger_id = str(creator.get("pgy_blogger_id") or "").strip()
+        if xhs_id:
+            add_group(f"xiaohongshu_id:{xhs_id}", creator)
+        if blogger_id:
+            add_group(f"pgy_blogger_id:{blogger_id}", creator)
+        if pgy_url and "/blogger-detail/" in pgy_url:
+            add_group(f"pgy_url:{pgy_url}", creator)
+
+    def canonical_rank(creator: dict[str, Any]) -> tuple[float, float, float, float]:
+        creator_id = str(creator.get("creator_id") or "")
+        list_penalty = 0.0 if not creator_id.startswith("pgy:list:") else 1.0
+        info_score = parse_number(creator.get("information_completeness")) or 0
+        total_score = parse_number(creator.get("total_score")) or 0
+        actionable_count = len(detail_completion_actionable_missing_fields(creator))
+        return (list_penalty, -info_score, -total_score, actionable_count)
+
+    merged_pairs: list[dict[str, Any]] = []
+    deleted_ids: list[str] = []
+    touched_groups = 0
+    removed_ids: set[str] = set()
+    init_db()
+    with connect() as conn:
+        for grouped in identity_groups.values():
+            unique_ids = {
+                str(item.get("creator_id") or "")
+                for item in grouped
+                if str(item.get("creator_id") or "") not in removed_ids
+            }
+            if len(unique_ids) <= 1:
+                continue
+            touched_groups += 1
+            ranked = sorted(
+                [item for item in grouped if str(item.get("creator_id") or "") not in removed_ids],
+                key=canonical_rank,
+            )
+            canonical = ranked[0]
+            duplicates = ranked[1:]
+            canonical_id = str(canonical.get("creator_id") or "")
+            for duplicate in duplicates:
+                duplicate_id = str(duplicate.get("creator_id") or "")
+                if not duplicate_id or duplicate_id == canonical_id:
+                    continue
+                if duplicate_id in removed_ids:
+                    continue
+                merged_pairs.append(
+                    {
+                        "canonical_creator_id": canonical_id,
+                        "duplicate_creator_id": duplicate_id,
+                        "canonical_nickname": canonical.get("nickname") or "",
+                        "duplicate_nickname": duplicate.get("nickname") or "",
+                    }
+                )
+                conn.execute("DELETE FROM project_creators WHERE project_id=? AND creator_id=?", (project_id, duplicate_id))
+                conn.execute("DELETE FROM screening_reviews WHERE creator_id=?", (duplicate_id,))
+                conn.execute("DELETE FROM creator_scores WHERE creator_id=?", (duplicate_id,))
+                conn.execute("DELETE FROM creator_metrics WHERE creator_id=?", (duplicate_id,))
+                conn.execute("DELETE FROM creator_metrics_current WHERE creator_id=?", (duplicate_id,))
+                conn.execute("DELETE FROM creator_metrics_history WHERE project_id=? AND creator_id=?", (project_id, duplicate_id))
+                conn.execute("DELETE FROM feishu_sync_state WHERE project_id=? AND creator_id=?", (project_id, duplicate_id))
+                conn.execute("DELETE FROM creators WHERE project_id=? AND creator_id=?", (project_id, duplicate_id))
+                deleted_ids.append(duplicate_id)
+                removed_ids.add(duplicate_id)
+        if deleted_ids:
+            log(
+                conn,
+                project_id,
+                "creator",
+                "清理重复达人",
+                PROJECT_NAME,
+                "系统",
+                f"清理 {len(deleted_ids)} 条项目内重复达人记录，涉及 {touched_groups} 组",
+                "success",
+            )
+    return {
+        "project_id": project_id,
+        "duplicate_groups": touched_groups,
+        "deleted_count": len(deleted_ids),
+        "deleted_creator_ids": deleted_ids,
+        "merged_pairs": merged_pairs,
+    }
 
 
 def _score_bonus(creator: dict[str, Any]) -> tuple[float, list[str]]:
@@ -2256,6 +2554,26 @@ def _market_benchmark_for_followers(followers: Any) -> dict[str, Any]:
     return dict(MARKET_BENCHMARKS[-1])
 
 
+@contextmanager
+def _scoring_benchmark_cache() -> Any:
+    token = _SCORING_BENCHMARK_CACHE.set({})
+    try:
+        yield
+    finally:
+        _SCORING_BENCHMARK_CACHE.reset(token)
+
+
+@contextmanager
+def _scoring_batch_context() -> Any:
+    benchmark_token = _SCORING_BENCHMARK_CACHE.set({})
+    project_token = _PROJECT_SCREENING_PLAN_CACHE.set({})
+    try:
+        yield
+    finally:
+        _PROJECT_SCREENING_PLAN_CACHE.reset(project_token)
+        _SCORING_BENCHMARK_CACHE.reset(benchmark_token)
+
+
 def _read_reference_from_creator(creator: dict[str, Any]) -> float | None:
     values = [
         parse_number(creator.get("cooperation_read_median")),
@@ -2263,7 +2581,7 @@ def _read_reference_from_creator(creator: dict[str, Any]) -> float | None:
         parse_number(creator.get("image_daily_read_median")),
         parse_number(creator.get("video_daily_read_median")),
     ]
-    values = [value for value in values if value is not None]
+    values = [value for value in values if value is not None and value > 0]
     return max(values) if values else None
 
 
@@ -2274,14 +2592,14 @@ def _exposure_reference_from_creator(creator: dict[str, Any]) -> float | None:
         parse_number(creator.get("image_daily_exposure_median")),
         parse_number(creator.get("video_daily_exposure_median")),
     ]
-    values = [value for value in values if value is not None]
+    values = [value for value in values if value is not None and value > 0]
     return max(values) if values else None
 
 
-def _first_number(*values: Any) -> float | None:
+def _first_number(*values: Any, positive: bool = False) -> float | None:
     for value in values:
         number = parse_number(value)
-        if number is not None:
+        if number is not None and (not positive or number > 0):
             return number
     return None
 
@@ -2290,9 +2608,9 @@ def _efficiency_metrics(creator: dict[str, Any], read_reference: Any | None = No
     quote = parse_number(creator.get("quote_price"))
     read = parse_number(read_reference) if read_reference is not None else _read_reference_from_creator(creator)
     exposure = _exposure_reference_from_creator(creator)
-    cpm = _first_number(creator.get("image_cpm"), creator.get("video_cpm"))
-    cpc = _first_number(creator.get("natural_cpc"), creator.get("image_read_unit_price"), creator.get("video_read_unit_price"))
-    cpe = _first_number(creator.get("natural_cpe"), creator.get("image_interaction_unit_price"), creator.get("video_interaction_unit_price"))
+    cpm = _first_number(creator.get("image_cpm"), creator.get("video_cpm"), positive=True)
+    cpc = _first_number(creator.get("natural_cpc"), creator.get("image_read_unit_price"), creator.get("video_read_unit_price"), positive=True)
+    cpe = _first_number(creator.get("natural_cpe"), creator.get("image_interaction_unit_price"), creator.get("video_interaction_unit_price"), positive=True)
     estimated_cpm = quote / exposure * 1000 if quote is not None and exposure else None
     estimated_cpc = quote / read if quote is not None and read else None
     return {
@@ -2309,6 +2627,11 @@ def _efficiency_metrics(creator: dict[str, Any], read_reference: Any | None = No
 
 def _db_benchmark_for_followers(followers: Any, min_samples: int = 8) -> dict[str, Any] | None:
     market = _market_benchmark_for_followers(followers)
+    cache = _SCORING_BENCHMARK_CACHE.get()
+    cache_key = (float(market["min"]), float(market["max"]), int(min_samples))
+    if cache is not None and cache_key in cache:
+        cached = cache[cache_key]
+        return dict(cached) if cached else None
     try:
         with connect() as conn:
             rows = rows_dict(
@@ -2324,6 +2647,8 @@ def _db_benchmark_for_followers(followers: Any, min_samples: int = 8) -> dict[st
                 ).fetchall()
             )
     except Exception:
+        if cache is not None:
+            cache[cache_key] = None
         return None
     reads: list[float] = []
     quotes: list[float] = []
@@ -2347,6 +2672,8 @@ def _db_benchmark_for_followers(followers: Any, min_samples: int = 8) -> dict[st
         if efficiency["cpe"] is not None:
             cpes.append(efficiency["cpe"])
     if len(reads) < min_samples and len(quotes) < min_samples:
+        if cache is not None:
+            cache[cache_key] = None
         return None
     benchmark = dict(market)
     benchmark["source"] = "database"
@@ -2365,6 +2692,8 @@ def _db_benchmark_for_followers(followers: Any, min_samples: int = 8) -> dict[st
         benchmark["cpc_good_max"] = round(min(benchmark["cpc_good_max"], _percentile(cpcs, 0.5) or benchmark["cpc_good_max"]), 2)
     if len(cpes) >= min_samples:
         benchmark["cpe_good_max"] = round(min(benchmark["cpe_good_max"], _percentile(cpes, 0.5) or benchmark["cpe_good_max"]), 2)
+    if cache is not None:
+        cache[cache_key] = dict(benchmark)
     return benchmark
 
 
@@ -2556,6 +2885,78 @@ def _verticality_fit(creator: dict[str, Any]) -> tuple[float, float, bool]:
     return persona, content, persona >= 24 and content >= 17
 
 
+def _tag_direction_fit(creator: dict[str, Any]) -> dict[str, Any]:
+    text = _text_blob(creator)
+    raw_payload = _parse_payload_json(creator.get("raw_payload"))
+    hint = ""
+    if isinstance(raw_payload, dict):
+        hint = str(raw_payload.get("cooperation_hint") or "")
+    combined = f"{text} {hint}"
+    strong_keywords = ["教育", "学习", "K12", "k12", "家庭教育", "小升初", "初中", "高中", "升学", "教辅", "答疑", "作业", "亲子大孩"]
+    medium_keywords = ["亲子", "母婴", "家长", "妈妈", "爸爸", "孩子", "学生", "学习工具", "教育工具", "答疑工具", "测评", "好物"]
+    weak_keywords = ["3C", "电器", "数码", "智能", "工具", "家居", "家装", "生活记录", "生活方式", "极简", "收纳", "日常", "中产", "家庭"]
+    negative_keywords = ["美妆", "护肤", "穿搭", "娱乐", "八卦", "宠物", "美甲", "低幼", "孕期", "辅食"]
+    matched: list[str] = []
+    score = 6.0
+    level = "weak"
+    if _contains_any(combined, strong_keywords):
+        matched.extend([keyword for keyword in strong_keywords if keyword in combined][:4])
+        score = 15.0
+        level = "strong"
+    elif _contains_any(combined, medium_keywords):
+        matched.extend([keyword for keyword in medium_keywords if keyword in combined][:4])
+        score = 11.0
+        level = "medium"
+    elif _contains_any(combined, weak_keywords):
+        matched.extend([keyword for keyword in weak_keywords if keyword in combined][:4])
+        score = 8.0
+        level = "weak"
+    if _contains_any(combined, negative_keywords) and not _contains_any(combined, strong_keywords):
+        matched.extend([keyword for keyword in negative_keywords if keyword in combined][:3])
+        score = min(score, 4.0)
+        level = "off"
+    return {
+        "score": round(max(0, min(15, score)), 2),
+        "level": level,
+        "matched": list(dict.fromkeys(matched)),
+        "cooperation_hint": hint,
+    }
+
+
+def _execution_fit(creator: dict[str, Any]) -> tuple[float, list[str]]:
+    score = 0.0
+    reasons: list[str] = []
+    if creator.get("pgy_url"):
+        score += 2
+    else:
+        reasons.append("缺蒲公英链接")
+    if parse_number(creator.get("quote_price")) is not None:
+        score += 1.5
+    else:
+        reasons.append("报价缺失")
+    reply = ratio(creator.get("reply_rate_48h"))
+    if reply is not None:
+        if reply >= 0.8:
+            score += 2
+            reasons.append("48h回复率优秀")
+        elif reply >= 0.6:
+            score += 1.5
+            reasons.append("48h回复率达标")
+        elif reply >= 0.4:
+            score += 0.8
+            reasons.append("48h回复率一般")
+        else:
+            reasons.append("48h回复率偏低")
+    else:
+        score += 1
+        reasons.append("48h回复率未进入本轮数据")
+    if parse_number(creator.get("followers_count")) is not None:
+        score += 0.8
+    if creator.get("avatar_url") or creator.get("xiaohongshu_id"):
+        score += 0.7
+    return round(max(0, min(5, score)), 2), reasons
+
+
 def _recent_note_data_profile(creator: dict[str, Any]) -> dict[str, Any]:
     raw_payload = _parse_payload_json(creator.get("raw_payload"))
     note_cases = _collect_note_cases_from_payload(raw_payload)
@@ -2563,7 +2964,7 @@ def _recent_note_data_profile(creator: dict[str, Any]) -> dict[str, Any]:
     interactions: list[float] = []
     for item in note_cases:
         read = parse_number(item.get("read_count") or item.get("readCount") or item.get("read"))
-        if read is not None:
+        if read is not None and read > 0:
             reads.append(read)
         interaction_values = [
             parse_number(item.get("like_count") or item.get("likeCount") or item.get("likes")),
@@ -2580,13 +2981,13 @@ def _recent_note_data_profile(creator: dict[str, Any]) -> dict[str, Any]:
     if not reads:
         for key in ("cooperation_read_median", "daily_read_median", "image_daily_read_median", "video_daily_read_median"):
             read = parse_number(creator.get(key))
-            if read is not None:
+            if read is not None and read > 0:
                 reads.append(read)
         source = "median_metrics" if reads else ""
     if not interactions:
         for key in ("cooperation_interaction_median", "daily_interaction_median", "image_daily_interaction_median", "video_daily_interaction_median"):
             interaction = parse_number(creator.get(key))
-            if interaction is not None:
+            if interaction is not None and interaction > 0:
                 interactions.append(interaction)
 
     followers = parse_number(creator.get("followers_count"))
@@ -2635,17 +3036,32 @@ def _recent_note_data_profile(creator: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _apply_quality_gate(total: float, profile: dict[str, Any], reasons: list[str]) -> float:
+def _apply_quality_gate(total: float, profile: dict[str, Any], reasons: list[str], creator: dict[str, Any] | None = None, direction_profile: dict[str, Any] | None = None) -> float:
     efficiency = profile.get("efficiency") if isinstance(profile.get("efficiency"), dict) else {}
+    if creator is not None:
+        fans35 = ratio(creator.get("fans_35_plus_ratio"))
+        if fans35 is not None and fans35 < 0.4 and total > 69:
+            reasons.append("35岁以上粉丝占比低于40%，初评最高C档")
+            return 69.0
+        if fans35 is None and total > 94:
+            reasons.append("缺少35岁以上粉丝占比，初评暂不进入S档")
+            total = 94.0
     if efficiency.get("poor_efficiency") and total > 84:
-        reasons.append("CPM/CPC/CPE效率偏差，高分封顶到B+档")
-        return 84.0
-    if profile["weak_recent_data"] and total > 79:
+        reasons.append("CPM/CPC/CPE效率偏差，高分封顶到A档观察")
+        total = 84.0
+    if profile["weak_recent_data"]:
         reasons.append("近期笔记阅读未达较好数据，高分封顶到B档")
-        return 79.0
-    if profile.get("source") and not profile["good_data"] and total > 89:
-        reasons.append("缺少较好阅读数据支撑，暂不进入A档")
-        return 89.0
+        if total > 79:
+            total = 79.0
+    if profile.get("source") and not profile["good_data"] and total > 79:
+        reasons.append("缺少较好阅读数据支撑，初筛最高B+档")
+        total = 79.0
+    if not profile.get("source") and total > 79:
+        reasons.append("缺少阅读/互动核心数据，初筛最高B+档")
+        total = 79.0
+    if direction_profile and direction_profile.get("level") in {"weak", "off"} and total > 79:
+        reasons.append("类目/标签仅弱相关，初筛最高B+档")
+        total = 79.0
     return total
 
 
@@ -2671,41 +3087,45 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
         hard_issues.append("存在明确高风险信号")
     hard_pass = not hard_issues
 
-    persona_raw, content_raw, vertical_fit = _verticality_fit(creator)
     precision_fans, precise_fans = _precision_fans_fit(creator)
-    scale_fit = _follower_scale_fit(creator.get("followers_count"))
-    fans = round(((precision_fans * 0.7) + (scale_fit * 0.3)) / 15 * 5, 2)
+    audience_score = round(precision_fans / 15 * 25, 2)
 
-    traffic = 18 if search is None else 30 if search >= 0.55 else 26 if search >= 0.45 else 22 if search >= 0.4 else 12
-    traffic = max(traffic, round(data_profile["data_score"], 2))
+    traffic = round(min(25, data_profile["data_score"] / 30 * 25), 2)
+    if search is not None:
+        traffic += 3 if search >= 0.55 else 2 if search >= 0.45 else 1 if search >= 0.4 else -4
     if _contains_any(stability, ["稳定", "良好"]):
-        traffic += 2
+        traffic += 1.5
     if _contains_any(stability, ["波动", "下滑", "异常"]) or _contains_any(risk, ["中风险", "限流"]):
-        traffic -= 8
-    traffic = max(0, min(30, traffic))
+        traffic -= 5
+    traffic = max(0, min(25, traffic))
 
-    efficiency = round(float(efficiency_profile["score"] or 0) / 12 * 20, 2)
+    efficiency = round(float(efficiency_profile["score"] or 0) / 12 * 25, 2)
     if cpc is not None:
-        efficiency -= 4 if cpc >= 2 else 0
+        efficiency -= 5 if cpc >= 2 else 0
         efficiency += 2 if cpc < 1.5 else 0
     if cpe is not None:
         efficiency -= 6 if cpe >= 20 else 2 if cpe >= 10 else 0
         efficiency += 2 if cpe < 10 else 0
-    cpe_efficiency = max(0, min(20, efficiency))
+    cpe_efficiency = max(0, min(25, efficiency))
 
-    budget = round(float(efficiency_profile["score"] or 0) / 12 * 15, 2)
-    if quote is None or quote <= 20000:
-        budget = min(15, budget + 2)
-    if _contains_any(text, ["种草", "测评", "好物", "工具", "合作", "开箱", "体验"]):
-        budget = min(15, budget + 1)
-    budget = max(0, min(15, budget))
+    direction_profile = _tag_direction_fit(creator)
+    direction_score = float(direction_profile["score"])
+    execution_score, execution_reasons = _execution_fit(creator)
 
-    persona = round(persona_raw / 30 * 20, 2)
-    content = round(content_raw / 20 * 10, 2)
+    base = round(audience_score + traffic + cpe_efficiency + direction_score + execution_score, 2)
 
-    base = round(budget + fans + cpe_efficiency + traffic + persona + content, 2)
-    bonus, bonus_reasons = _score_bonus(creator)
-    total = round(min(120, base + bonus), 2)
+    bonus = 0.0
+    bonus_reasons: list[str] = []
+    if data_profile["good_data"] and precise_fans:
+        bonus += 2
+        bonus_reasons.append("人群画像与阅读数据同时达标")
+    if efficiency_profile.get("good_efficiency") and data_profile["good_data"]:
+        bonus += 2
+        bonus_reasons.append("成本效率和流量质量同时较好")
+    if direction_profile["level"] == "strong" and data_profile["good_data"]:
+        bonus += 1
+        bonus_reasons.append("强相关方向且数据有支撑")
+    total = round(min(100, base + bonus), 2)
     completeness = _score_information_completeness(creator)
     tier = _initial_tier(total, hard_pass)
     priority = _detail_collection_priority(total, bonus, hard_pass)
@@ -2733,16 +3153,16 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
     else:
         reasons.append("近30天阅读数据未进入本轮数据判断")
 
-    combination_match = any(
-        [
-            data_profile["has_recent_notes"] and data_profile["good_data"] and scale_fit >= 12,
-            vertical_fit and data_profile["good_data"],
-            data_profile["good_data"] and precise_fans,
-        ]
-    )
-    if combination_match:
-        reasons.append("高分依据：最近笔记数据+粉丝量/内容垂直度/粉丝精准至少一组匹配")
-    total = round(_apply_quality_gate(total, data_profile, reasons), 2)
+    matched_tags = direction_profile.get("matched") or []
+    if matched_tags:
+        reasons.append(f"方向弱证据：{direction_profile['level']}，命中{'、'.join(matched_tags[:4])}")
+    elif direction_profile.get("cooperation_hint"):
+        reasons.append(f"期待合作行业：{direction_profile['cooperation_hint']}")
+    if execution_reasons:
+        reasons.append(f"执行确定性：{'、'.join(execution_reasons[:3])}")
+    if data_profile["good_data"] and precise_fans and direction_profile["level"] in {"strong", "medium"}:
+        reasons.append("A档候选依据：人群达标、阅读/互动有支撑、方向相关")
+    total = round(_apply_quality_gate(total, data_profile, reasons, creator, direction_profile), 2)
     if hard_pass and total < 70 and not data_profile["weak_recent_data"] and not efficiency_profile["poor_efficiency"]:
         total = 70.0
         reasons.append("未发现已确认硬伤，数据证据不足时按B档观察，不因缺字段直接低分")
@@ -2761,12 +3181,12 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
         "information_completeness": completeness,
         "initial_tier": tier,
         "detail_collection_priority": priority,
-        "budget_score": budget,
-        "fans_score": fans,
-        "cpe_score": cpe_efficiency,
-        "traffic_score": traffic,
-        "persona_score": persona,
-        "content_score": content,
+        "budget_score": round(execution_score / 5 * 15, 2),
+        "fans_score": round(audience_score / 25 * 5, 2),
+        "cpe_score": round(cpe_efficiency / 25 * 20, 2),
+        "traffic_score": round(traffic / 25 * 30, 2),
+        "persona_score": round(direction_score / 15 * 20, 2),
+        "content_score": round(bonus / 5 * 10, 2),
         "hard_filter_passed": 1 if hard_pass else 0,
         "recommend_level": level,
         "score_reason": "；".join(reasons),
@@ -2775,6 +3195,9 @@ def score_values(creator: dict[str, Any]) -> dict[str, Any]:
 
 
 def _project_screening_plan(project_id: str) -> dict[str, Any]:
+    cache = _PROJECT_SCREENING_PLAN_CACHE.get()
+    if cache is not None and project_id in cache:
+        return cache[project_id]
     project = get_project(project_id) or {}
     screening_plan = project.get("screening_plan")
     if isinstance(screening_plan, str):
@@ -2782,14 +3205,17 @@ def _project_screening_plan(project_id: str) -> dict[str, Any]:
             screening_plan = json.loads(screening_plan)
         except json.JSONDecodeError:
             screening_plan = {}
-    return screening_plan if isinstance(screening_plan, dict) else {}
+    plan = screening_plan if isinstance(screening_plan, dict) else {}
+    if cache is not None:
+        cache[project_id] = plan
+    return plan
 
 
 def _project_hard_filter_issues(project_id: str, creator: dict[str, Any]) -> list[str]:
     raw_payload = _parse_payload_json(creator.get("raw_payload"))
     collection_issues = raw_payload.get("collection_hard_filter_issues")
     if isinstance(collection_issues, list) and collection_issues:
-        return [str(item) for item in collection_issues if item]
+        return list(dict.fromkeys(str(item) for item in collection_issues if item))
     screening_plan = _project_screening_plan(project_id)
     scoring_criteria = screening_plan.get("scoringCriteria") if isinstance(screening_plan.get("scoringCriteria"), dict) else {}
     hard_filters = (
@@ -2802,6 +3228,7 @@ def _project_hard_filter_issues(project_id: str, creator: dict[str, Any]) -> lis
         return []
     issues: list[str] = []
     text_blob = _text_blob(creator)
+    category_items: list[dict[str, Any]] = []
     for item in hard_filters:
         if not isinstance(item, dict) or item.get("required") is False:
             continue
@@ -2811,6 +3238,9 @@ def _project_hard_filter_issues(project_id: str, creator: dict[str, Any]) -> lis
         rule_text = f"{field} {condition} {value}".lower()
         label = " ".join(part for part in [field, condition, value] if part)
         if "蒲公英" in rule_text and not creator.get("pgy_url"):
+            continue
+        if field == "博主类目":
+            category_items.append(item)
             continue
         if any(keyword in rule_text for keyword in ["报价", "预算", "合作价格", "平台价格"]):
             threshold = _threshold_from_text(value, "quote")
@@ -2849,7 +3279,55 @@ def _project_hard_filter_issues(project_id: str, creator: dict[str, Any]) -> lis
             values = _split_rule_values(value)
             if values and any(part in text_blob for part in values):
                 issues.append(f"{label}：命中规避项")
-    return issues
+    if category_items:
+        if not any(_project_blogger_category_match(text_blob, item) for item in category_items):
+            category_labels = " / ".join(dict.fromkeys(_project_blogger_category_label(item) for item in category_items))
+            issues.append(f"博主类目：未命中 {category_labels}")
+    return list(dict.fromkeys(issues))
+
+
+def _project_blogger_category_label(item: dict[str, Any]) -> str:
+    value = str(item.get("value") or item.get("standard") or "").strip()
+    sub_value = str(item.get("sub_value") or item.get("subValue") or "").strip()
+    return f"{value}-{sub_value}" if sub_value else value
+
+
+def _project_blogger_category_match_terms(item: dict[str, Any]) -> list[str]:
+    value = str(item.get("value") or item.get("standard") or "").strip()
+    sub_value = str(item.get("sub_value") or item.get("subValue") or "").strip()
+    terms: list[str] = [value, sub_value]
+    if value == "教育":
+        if sub_value == "家庭教育":
+            terms.extend(["家庭教育", "家庭", "家长", "亲子", "父母", "妈妈", "陪伴", "规划"])
+        elif sub_value == "k12教育":
+            terms.extend(["k12教育", "k12", "小学", "初中", "高中", "教辅", "答疑", "作业", "升学"])
+        elif sub_value == "学习日常":
+            terms.extend(["学习日常", "学习效率", "学习工具", "学习博主", "学霸", "学习"])
+        elif sub_value == "留学教育":
+            terms.extend(["留学教育", "留学", "国际学校", "海外教育"])
+        elif sub_value == "大学教育":
+            terms.extend(["大学教育", "大学", "高校"])
+        elif sub_value == "语言教育":
+            terms.extend(["语言教育", "英语", "外语", "语文"])
+        else:
+            terms.extend(["教育", "学习", "升学", "教辅", "答疑", "家长", "亲子"])
+    elif value == "母婴":
+        if sub_value == "育儿经验":
+            terms.extend(["育儿经验", "育儿", "亲子", "家长", "父母", "妈妈", "爸爸", "宝宝", "孩子", "大孩", "小升初", "初中", "高中"])
+        elif sub_value == "早教":
+            terms.extend(["早教", "启蒙", "幼儿", "低龄", "学龄前"])
+        elif sub_value == "母婴日常":
+            terms.extend(["母婴日常", "日常", "家庭"])
+        elif sub_value == "婴童用品":
+            terms.extend(["婴童用品", "母婴用品", "宝宝用品"])
+        else:
+            terms.extend(["母婴", "育儿", "亲子", "妈妈", "宝宝"])
+    return list(dict.fromkeys(term for term in terms if term))
+
+
+def _project_blogger_category_match(text_blob: str, item: dict[str, Any]) -> bool:
+    lowered = text_blob.lower()
+    return any(keyword.lower() in lowered for keyword in _project_blogger_category_match_terms(item))
 
 
 def generate_test_stage_score(project_id: str, creator: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -2933,19 +3411,17 @@ def _normalize_llm_score(result: dict[str, Any], fallback: dict[str, Any], creat
         result.get("baseScore") or result.get("base_score"),
         fallback.get("base_score") or component_total,
     )
-    bonus_score = max(
-        0,
-        min(
-            20,
-            parse_number(result.get("bonusScore") or result.get("bonus_score"))
-            if result.get("bonusScore") is not None or result.get("bonus_score") is not None
-            else (fallback.get("bonus_score") or 0),
-        ),
+    raw_bonus = (
+        parse_number(result.get("bonusScore") or result.get("bonus_score"))
+        if result.get("bonusScore") is not None or result.get("bonus_score") is not None
+        else (fallback.get("bonus_score") or 0)
     )
+    bonus_score = max(0, min(5, raw_bonus if raw_bonus is not None else 0))
     total = _clamp_total_score(
         result.get("totalScore") or result.get("total_score"),
         fallback.get("total_score") or (base_score + bonus_score),
     )
+    total = min(total, 100)
     hard_filter_passed = result.get("hardFilterPassed")
     if hard_filter_passed is None:
         hard_filter_passed = fallback["hard_filter_passed"]
@@ -2970,7 +3446,9 @@ def _normalize_llm_score(result: dict[str, Any], fallback: dict[str, Any], creat
     )
     gate_reasons: list[str] = []
     if creator:
-        total = _apply_quality_gate(total, _recent_note_data_profile(creator), gate_reasons)
+        data_profile = _recent_note_data_profile(creator)
+        data_profile["efficiency"] = _efficiency_profile(creator, data_profile["benchmark"], data_profile.get("median_read") or data_profile.get("avg_read"))
+        total = _apply_quality_gate(total, data_profile, gate_reasons, creator, _tag_direction_fit(creator))
         if gate_reasons:
             reasons = "；".join([str(reasons).strip(), *gate_reasons])
         initial_tier = _initial_tier(total, hard_pass_bool)
@@ -2993,7 +3471,8 @@ def _normalize_llm_score(result: dict[str, Any], fallback: dict[str, Any], creat
 
 
 LLM_BATCH_CONTEXT_LIMIT_CHARS = 850_000
-LLM_BATCH_MAX_CREATORS = 80
+LLM_BATCH_MAX_CREATORS = 6
+LLM_SCORE_MAX_WORKERS = max(1, _int_env("LLM_SCORE_MAX_WORKERS", 8))
 
 
 def _creator_score_payload(creator: dict[str, Any]) -> dict[str, Any]:
@@ -3071,11 +3550,13 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
             "hardFilters": screening_plan.get("scoringHardFilters") or (screening_plan.get("scoringCriteria") or {}).get("hard_rules") or screening_plan.get("hardFilters") or [],
             "scoringWeights": screening_plan.get("scoringWeights") or {},
             "scoringProtocol": [
-                "先读取 machine_data_profile 与近30天曝光/阅读/互动、CPM/CPC/CPE，判断数据层级；粉丝量只作为T级比较坐标，不作为高权重加分项。",
-                "报价不是越低越好，必须结合报价能换来的曝光/阅读/互动总量、CPM/CPC/CPE效率、单达人参考预算和硬上限判断。",
+                "初评分只使用稳定入库字段，主公式抓5类：35岁以上粉丝占比、阅读/互动中位数、报价与阅读/互动单价、类目/标签/期待合作行业、执行确定性。",
+                "粉丝量只作为T级比较坐标，不作为高权重加分项；阅读/互动必须按同T级基准判断。",
+                "报价不是越低越好，必须结合报价能换来的阅读/互动总量、CPM/CPC/CPE效率、单达人参考预算和硬上限判断。",
+                "类目、个人标签、期待合作行业只是弱方向证据；没有主页简介、详情页、笔记标题/正文时，不得直接判定高知/教师/大孩家长等强人设。",
                 "缺蒲公英链接、缺字段、缺近期笔记正文是采集/证据状态，不是达人质量问题，不得作为硬性淘汰原因。",
                 "只有已确认的报价超硬上限、同T级近30天数据明显低于基准、已确认异常/违规/限流，才能作为明确风险。",
-                "人设、内容调性、主页简介、笔记标题/文案只在原始详情中有证据时分析；不要用关键词一句话认定真实命中。",
+                "封顶规则必须执行：35岁以上粉丝占比低于40%最高C；缺35岁以上粉丝占比、缺阅读/互动核心数据、成本效率差或标签弱相关，暂不进入A档。",
             ],
             "collectionSchemeSummary": [
                 {
@@ -3092,24 +3573,24 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
             "results": [
                 {
                     "creator_id": "必须原样返回",
-                    "dataLayer": "S|A|B|C；基于报价、近30天曝光/阅读/互动、CPM/CPC/CPE、T级基准和预算效果核算得到的数据层级",
-                    "baseScore": "0-100 基础分；先按数据层级和预算效果判断，再结合有证据的人设/内容质量，不因采集缺字段直接低分",
-                    "bonusScore": "0-20 加成分；只奖励同T级明显超预期、预算效果强、内容证据扎实或稀缺人设，低价本身不能单独加高分",
-                    "totalScore": "0-120 初筛总分，等于 baseScore + bonusScore",
+                    "dataLayer": "S|A|B|C；基于35岁以上粉丝占比、阅读/互动中位数、报价与CPC/CPE、T级基准得到的数据层级",
+                    "baseScore": "0-100 初筛基础分；只使用稳定入库字段，优先人群、流量、成本效率、标签方向、执行确定性",
+                    "bonusScore": "0-5 微加分；只奖励人群画像、数据表现、成本效率和方向匹配同时成立，不因低价或标签单独加高分",
+                    "totalScore": "0-100 初筛总分，等于 baseScore + bonusScore 后封顶",
                     "informationCompleteness": "0-1，当前可用证据完整度；低完整度只影响置信度和后续详情完善优先级，不等于达人质量差",
-                    "initialTier": "S|A|B+|B|C；S≥100，A=90-99，B+=80-89，B=70-79，C<70；硬性不符也必须保留分数档位，不要输出Pass",
-                    "detailCollectionPriority": "必须补采|优先补采|高潜补采|暂缓观察|不补采|数据暂缓；只让数据层级高或高潜达人进入详情页补采内容/人设信息，硬性不符用数据暂缓",
+                    "initialTier": "S|A|B+|B|C；S=95-100证据充分标杆，A=80-94初筛高潜，B+=75-79次高潜，B=70-74备选观察，C<70低优先级；硬性不符也必须保留分数档位，不要输出Pass",
+                    "detailCollectionPriority": "最高优先级|高优先级|中高优先级|中优先级|低优先级|数据暂缓；只让数据层级高或高潜达人进入详情页完善内容/人设信息，硬性不符用数据暂缓",
                     "dimensionScores": {
-                        "budget": "0-100 预算效果核算：报价、单达人参考预算、硬上限、报价能换来的曝光/阅读/互动容量",
-                        "fans": "0-100 粉丝T级坐标与画像辅助判断，低权重；不要因为粉丝多直接高分",
-                        "cpe": "0-100 CPM/CPC/CPE效率综合判断",
-                        "engagement": "0-100 近30天曝光、阅读、互动及稳定性，需与同T级基准比较",
-                        "persona": "0-100 基于主页简介、详情页、笔记标题/文案证据的人设匹配；无证据不要臆测",
-                        "content": "0-100 基于长期内容调性、笔记标题/文案、合作笔记案例的内容质量与Brief匹配",
+                        "budget": "0-100 执行确定性：蒲公英链接、报价完整、48h回复率、基础身份完整度",
+                        "fans": "0-100 目标人群匹配：核心看35岁以上粉丝占比，粉丝量只作T级坐标",
+                        "cpe": "0-100 成本效率：报价、阅读单价/CPC、互动单价/CPE，CPM只作辅助",
+                        "engagement": "0-100 真实流量质量：阅读中位数、互动中位数，需与同T级基准比较",
+                        "persona": "0-100 内容方向弱匹配：博主类目、内容标签、个人标签、期待合作行业；不得当成强人设",
+                        "content": "0-100 微加分：人群、数据、效率、方向同时成立才给高分",
                     },
                     "hardFilterPassed": "boolean，只基于已确认事实判断；未知项、缺蒲公英链接、缺字段不得当成硬性不符",
                     "recommendLevel": "强推荐|推荐|备选|不推荐|继续观察",
-                    "reason": "260字以内，按【数据层级】【预算效果】【人设内容证据】【风险/置信度】四段输出。必须写明报价、近30天曝光/阅读/互动、CPM/CPC/CPE、T级比较结论；人设内容必须引用主页简介/详情/笔记标题/文案等证据，不能只写真实命中。",
+                    "reason": "260字以内，按【人群画像】【阅读互动】【成本效率】【产品内容场景/风险】四段输出。必须先识别项目里的具体产品，再判断笔记内容和呈现方式是否能自然承接该产品；例如有道点读笔要看亲子阅读、英语跟读、查词发音、孩子自主阅读等场景，有道答疑笔要看作业答疑、错题讲解、孩子自主学习、家长辅导减负等场景。必须写明报价、阅读/互动中位数、CPC/CPE或阅读/互动单价、T级比较结论；标签和期待合作只能写弱证据。",
                     "cooperationDirection": "80字以内，非评分依据；只说明后续详情完善或审核重点，不要用曝光/测评/转化角色影响分数",
                 }
             ]
@@ -3135,13 +3616,18 @@ def _chunk_creators_for_llm(project_id: str, creators: list[dict[str, Any]]) -> 
 
 def score_values_batch_with_llm(project_id: str, creators: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     system_prompt = (
-        "你是广告投放达人质量评估专家。请严格按两阶段机制评分：第一阶段是数据层级，第二阶段才是详情内容与人设分析。"
-        "数据层级必须基于报价、近30天曝光/阅读/互动、CPM/CPC/CPE、预算效果核算和T级基准；粉丝量只作为T级坐标，不是高权重得分项。"
-        "报价不是越低越好：必须判断这笔预算能换来的曝光/阅读/互动总量，以及该价格层级是否符合项目对单个达人质量的预期。"
-        "所有项目使用基础分 baseScore 100、加成分 bonusScore 20、总分 totalScore 120；加成只给同T级明显超预期、预算效果强、内容证据扎实或稀缺人设。"
+        "你是广告投放达人初筛评分专家。请按少字段核心初评分机制评分，不要做大而全加权。"
+        "主公式只看五类稳定入库数据：目标人群匹配、真实流量质量、成本效率、内容方向弱匹配、执行确定性。"
+        "目标人群核心看35岁以上粉丝占比；真实流量核心看阅读中位数和互动中位数；成本效率核心看报价、阅读单价/CPC、互动单价/CPE。"
+        "粉丝量只作为T级比较坐标，不是高权重得分项；报价不是越低越好，必须判断这笔预算能换来的阅读/互动总量。"
+        "所有项目使用 baseScore 100、bonusScore 5、totalScore 100；加成只给人群、数据、效率、方向同时成立。"
         "缺蒲公英链接、缺字段、缺近期笔记正文属于证据/采集状态，不是达人质量问题，不得作为硬性淘汰或低分原因。"
         "只有已确认的报价超硬上限、同T级近30天数据明显低于基准、已确认异常/违规/限流，才能作为明确风险。"
-        "人设和内容匹配必须来自主页简介、详情页、笔记标题、笔记正文/文案、整体内容调性等证据；不要用关键词一句话判断'真实命中'。"
+        "类目、个人标签、期待合作行业只是弱方向证据；没有主页简介、详情页、笔记标题/正文时，不得直接判定高知/教师/大孩家长等强人设。"
+        "必须先从项目名称、brief和scoringCriteria识别具体产品，再围绕产品本身判断内容适配，不要只按教育/母婴大类下结论。"
+        "例如有道点读笔重点看亲子阅读、英语跟读、查词发音、孩子自主阅读和家长陪伴呈现；有道答疑笔重点看作业答疑、错题讲解、孩子自主学习和家长辅导减负呈现。"
+        "短板必须分析笔记内容主题和呈现方式，指出是否缺少产品使用过程、孩子反馈、家长视角或使用前后对比。"
+        "必须执行封顶：35岁以上粉丝占比低于40%最高C；缺阅读/互动核心数据、阅读表现不佳或标签弱相关，初筛最高B+；缺35岁以上粉丝占比不得进入S。"
         "不要把达人是否适合曝光、测评、转化种草作为评分依据；达人质量好才值得推进，怎么推是后续执行策略。"
         "请输出 initialTier 和 detailCollectionPriority，用于决定哪些数据层级高或高潜达人进入详情页完善信息。"
         "不要把当前项目 Brief 写死成有道答疑笔；不同项目必须按传入 Brief 和 scoringCriteria 适配。"
@@ -3178,6 +3664,33 @@ def score_values_with_llm(project_id: str, creator: dict[str, Any]) -> tuple[dic
     return result[str(creator["creator_id"])], "llm"
 
 
+def _score_llm_chunks_parallel(
+    project_id: str,
+    chunks: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    if not chunks:
+        return []
+    max_workers = max(1, min(LLM_SCORE_MAX_WORKERS, len(chunks)))
+    results: list[dict[str, Any] | None] = [None] * len(chunks)
+
+    def run_chunk(chunk: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        with _scoring_batch_context():
+            return score_values_batch_with_llm(project_id, chunk)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(run_chunk, chunk): (index, chunk)
+            for index, chunk in enumerate(chunks)
+        }
+        for future in as_completed(futures):
+            index, chunk = futures[future]
+            try:
+                results[index] = {"ok": True, "chunk": chunk, "scores": future.result()}
+            except Exception as error:
+                results[index] = {"ok": False, "chunk": chunk, "error": error}
+    return [result for result in results if result is not None]
+
+
 def _persist_creator_score(
     project_id: str,
     creator: dict[str, Any],
@@ -3185,12 +3698,14 @@ def _persist_creator_score(
     source: str,
     batch_id: str,
     trigger_source: str,
+    fetch_scored: bool = True,
+    conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     creator_id = str(creator["creator_id"])
     ts = now()
     cooperation_direction = score.get("cooperation_direction") or _default_cooperation_direction(creator, score.get("recommend_level"))
-    with connect() as conn:
-        conn.execute(
+    def write(handle: sqlite3.Connection) -> None:
+        handle.execute(
             """
             INSERT INTO creator_scores(creator_id, total_score, base_score, bonus_score, information_completeness,
             initial_tier, detail_collection_priority, budget_score, fans_score, cpe_score, traffic_score,
@@ -3227,7 +3742,7 @@ def _persist_creator_score(
                 ts,
             ),
         )
-        conn.execute(
+        handle.execute(
             """
             INSERT INTO score_runs(run_id, batch_id, project_id, creator_id, trigger_source, score_version, rule_score, llm_score, total_score, llm_result, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -3246,7 +3761,7 @@ def _persist_creator_score(
                 ts,
             ),
         )
-        conn.execute(
+        handle.execute(
             """
             UPDATE project_creators SET total_score=?, tier=?, pool_stage=?, portfolio_role=?, updated_at=?
             WHERE project_id=? AND creator_id=?
@@ -3262,14 +3777,23 @@ def _persist_creator_score(
             ),
         )
         if creator["status"] == "待补数据":
-            conn.execute("UPDATE creators SET status='待审核', updated_at=? WHERE creator_id=?", (ts, creator_id))
-            conn.execute(
+            handle.execute("UPDATE creators SET status='待审核', updated_at=? WHERE creator_id=?", (ts, creator_id))
+            handle.execute(
                 "UPDATE project_creators SET review_status='待审核', pool_stage=?, updated_at=? WHERE project_id=? AND creator_id=?",
                 (stage_from_status("待审核"), ts, project_id, creator_id),
             )
-    scored = get_creator(project_id, creator_id) or {}
+    if conn is None:
+        with connect() as write_conn:
+            write(write_conn)
+    else:
+        write(conn)
+    if fetch_scored:
+        scored = get_creator(project_id, creator_id) or {}
+    else:
+        scored = dict(creator)
     scored["score_source"] = source
     scored["batch_id"] = batch_id
+    scored["total_score"] = score.get("total_score")
     return scored
 
 
@@ -3284,10 +3808,11 @@ def score_creator(
     if not creator:
         raise KeyError(creator_id)
     source = "generated"
-    try:
-        score, source = score_values_with_llm(project_id, creator) if use_llm else (generate_test_stage_score(project_id, creator)[0], "rule")
-    except Exception:
-        score, source = generate_test_stage_score(project_id, creator)
+    with _scoring_batch_context():
+        try:
+            score, source = score_values_with_llm(project_id, creator) if use_llm else (generate_test_stage_score(project_id, creator)[0], "rule")
+        except Exception:
+            score, source = generate_test_stage_score(project_id, creator)
     return _persist_creator_score(project_id, creator, score, source, batch_id or str(uuid.uuid4()), trigger_source)
 
 
@@ -3303,25 +3828,32 @@ def score_project(
     batch_id = str(uuid.uuid4())
     sources = {"llm": 0, "generated": 0, "rule": 0}
     llm_errors: list[str] = []
-    if use_llm and creators:
-        for chunk in _chunk_creators_for_llm(project_id, creators):
-            try:
-                batch_scores = score_values_batch_with_llm(project_id, chunk)
-                for creator in chunk:
-                    score = batch_scores[str(creator["creator_id"])]
-                    scored = _persist_creator_score(project_id, creator, score, "llm", batch_id, trigger_source)
-                    sources[scored.get("score_source") or "fallback"] = sources.get(scored.get("score_source") or "fallback", 0) + 1
-            except Exception as error:
-                llm_errors.append(str(error)[:300])
-                for creator in chunk:
-                    score, source = generate_test_stage_score(project_id, creator)
-                    scored = _persist_creator_score(project_id, creator, score, source, batch_id, trigger_source)
-                    sources[scored.get("score_source") or "fallback"] = sources.get(scored.get("score_source") or "fallback", 0) + 1
-    else:
-        for creator in creators:
-            score, _ = generate_test_stage_score(project_id, creator)
-            scored = _persist_creator_score(project_id, creator, score, "rule", batch_id, trigger_source)
-            sources[scored.get("score_source") or "fallback"] = sources.get(scored.get("score_source") or "fallback", 0) + 1
+    llm_chunk_results: list[dict[str, Any]] = []
+    chunks = _chunk_creators_for_llm(project_id, creators) if use_llm and creators else []
+    if chunks:
+        llm_chunk_results = _score_llm_chunks_parallel(project_id, chunks)
+    with _scoring_batch_context(), connect() as conn:
+        if use_llm and creators:
+            for chunk_result in llm_chunk_results:
+                chunk = chunk_result["chunk"]
+                if chunk_result.get("ok"):
+                    batch_scores = chunk_result["scores"]
+                    for creator in chunk:
+                        score = batch_scores[str(creator["creator_id"])]
+                        scored = _persist_creator_score(project_id, creator, score, "llm", batch_id, trigger_source, fetch_scored=False, conn=conn)
+                        sources[scored.get("score_source") or "fallback"] = sources.get(scored.get("score_source") or "fallback", 0) + 1
+                else:
+                    error = chunk_result.get("error")
+                    llm_errors.append(str(error)[:300])
+                    for creator in chunk:
+                        score, source = generate_test_stage_score(project_id, creator)
+                        scored = _persist_creator_score(project_id, creator, score, source, batch_id, trigger_source, fetch_scored=False, conn=conn)
+                        sources[scored.get("score_source") or "fallback"] = sources.get(scored.get("score_source") or "fallback", 0) + 1
+        else:
+            for creator in creators:
+                score, _ = generate_test_stage_score(project_id, creator)
+                scored = _persist_creator_score(project_id, creator, score, "rule", batch_id, trigger_source, fetch_scored=False, conn=conn)
+                sources[scored.get("score_source") or "fallback"] = sources.get(scored.get("score_source") or "fallback", 0) + 1
     with connect() as conn:
         if sources.get("llm"):
             detail = f"批次 {batch_id} 完成 {len(creators)} 位达人评分，其中 {sources['llm']} 位由大模型分析生成"
@@ -4353,7 +4885,7 @@ def standard_feishu_rows(
 def quality_feishu_rows(
     project_id: str,
     limit: int | None = None,
-    min_score: float = 90,
+    min_score: float = 70,
     creator_ids: list[str] | None = None,
     include_test_creators: bool = False,
     rescore: bool = True,

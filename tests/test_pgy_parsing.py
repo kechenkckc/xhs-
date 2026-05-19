@@ -15,6 +15,9 @@ from rpa_mcp_sync.pgy_browser import (
     _collect_note_case_pages,
     _collect_overview_note_states,
     _collect_performance_states,
+    _install_kol_response_capture,
+    _prime_kol_api_capture,
+    _should_reload_for_api_prime,
 )
 
 
@@ -69,6 +72,50 @@ def test_normalize_creator_keeps_correct_table_follower_count():
 
     assert creator["followers_count"] == 23000
     assert creator["quote_price"] == 3500
+
+
+def test_creator_from_api_kol_maps_current_list_metric_fields():
+    from rpa_mcp_sync.pgy_browser import _creator_from_api_kol
+
+    creator = _creator_from_api_kol(
+        {
+            "userId": "api-001",
+            "name": "接口指标达人",
+            "fansNum": 79917,
+            "fansCount": 0,
+            "picturePrice": 12500,
+            "videoPrice": 14000,
+            "clickMidNum": 18987,
+            "mCpuvNum30d": 191,
+            "mEngagementNum": 3057,
+            "videoClickMidNum": 8888,
+            "videoInterMidNum": 777,
+            "accumCoopImpMedinNum30d": 241459,
+            "readMidCoop30": 32654,
+            "interMidCoop30": 2420,
+            "estimatePictureCpm": 75.45,
+            "estimateVideoCpm": 0,
+            "pictureReadCost": "0.68",
+            "estimatePictureEngageCost": 4.62,
+            "inviteReply48hNumRatio": 96.2,
+            "fansActiveIn28dLv": 87.7,
+            "fansEngageNum30dLv": 3.4,
+        }
+    )
+
+    assert creator["followers_count"] == 79917
+    assert creator["daily_read_median"] == 18987
+    assert creator["overflow_store_median"] == 191
+    assert creator["video_daily_read_median"] == 8888
+    assert creator["video_daily_interaction_median"] == 777
+    assert creator["cooperation_read_median"] == 32654
+    assert creator["cooperation_interaction_median"] == 2420
+    assert creator["image_cpm"] == 75.45
+    assert creator["image_read_unit_price"] == 0.68
+    assert creator["image_interaction_unit_price"] == 4.62
+    assert round(creator["reply_rate_48h"], 3) == 0.962
+    assert creator["active_fans_ratio"] == 0.877
+    assert creator["interaction_fans_ratio"] == 0.034
 
 
 def test_parse_row_text_ignores_shifted_percent_quote_from_table():
@@ -178,6 +225,47 @@ def test_api_kol_link_fields_reads_nested_user_id_without_clicking():
     assert fields["pgy_url_source"] == "list_api"
     assert fields["xiaohongshu_id"] == "red-9"
     assert fields["avatar_url"].endswith("avatar.jpg")
+
+
+def test_install_kol_response_capture_does_not_clear_existing_preflight_cache():
+    class FakePage:
+        _pgy_kol_response_capture_installed = True
+        _pgy_latest_api_kols = [{"name": "预检方案达人"}]
+        _pgy_api_kol_pool = [{"name": "预检方案达人"}]
+        _pgy_api_kol_keys = {"预检方案达人"}
+        _pgy_latest_kol_request = {"url": "https://pgy.xiaohongshu.com/api/solar/cooperator/blogger/v2"}
+
+    page = FakePage()
+    _install_kol_response_capture(page)
+
+    assert page._pgy_latest_api_kols == [{"name": "预检方案达人"}]
+    assert page._pgy_api_kol_pool == [{"name": "预检方案达人"}]
+    assert page._pgy_api_kol_keys == {"预检方案达人"}
+    assert page._pgy_latest_kol_request["url"].endswith("/blogger/v2")
+
+
+def test_prime_kol_api_capture_does_not_reload_when_disabled():
+    class FakePage:
+        _pgy_latest_api_kols = []
+        reload_called = False
+
+        def wait_for_timeout(self, _timeout):
+            return None
+
+        def reload(self, **_kwargs):
+            self.reload_called = True
+            raise AssertionError("should not reload filtered PGY list")
+
+    page = FakePage()
+
+    assert _prime_kol_api_capture(page, reload_if_empty=False) is False
+    assert page.reload_called is False
+
+
+def test_api_prime_reload_policy_preserves_preflight_and_filtered_collect():
+    assert _should_reload_for_api_prime(apply_filters=True, preserve_existing_filters=False, preflight_only=True) is False
+    assert _should_reload_for_api_prime(apply_filters=False, preserve_existing_filters=True, preflight_only=False) is False
+    assert _should_reload_for_api_prime(apply_filters=False, preserve_existing_filters=False, preflight_only=False) is True
 
 
 def test_recent_note_comments_from_payload_flattens_top_level_and_replies():

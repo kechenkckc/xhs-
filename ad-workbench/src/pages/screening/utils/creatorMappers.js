@@ -66,33 +66,119 @@ export function getCreatorCategoryType(item) {
   return '';
 }
 
+const SCORING_RISK_STANDARDS = {
+  audience: '目标人群匹配',
+  traffic: '真实流量质量',
+  efficiency: '成本效率',
+  direction: '内容方向弱匹配',
+  execution: '执行确定性',
+};
+
+const SCORING_STANDARD_SCORE_KEYS = {
+  [SCORING_RISK_STANDARDS.audience]: ['fans'],
+  [SCORING_RISK_STANDARDS.traffic]: ['engagement'],
+  [SCORING_RISK_STANDARDS.efficiency]: ['cpe'],
+  [SCORING_RISK_STANDARDS.direction]: ['persona', 'content'],
+  [SCORING_RISK_STANDARDS.execution]: ['budget'],
+};
+
+const DEFAULT_PRODUCT_PROFILE = {
+  name: '学习工具产品',
+  keywords: ['学习', '工具', '作业', '阅读', '孩子', '家长'],
+  scenarios: ['真实学习场景', '家长陪伴决策', '工具使用过程'],
+  presentation: ['使用过程', '问题解决前后', '孩子反馈', '家长口吻'],
+};
+
+function getProjectProductProfile(project = {}) {
+  const text = `${project.projectName || project.project_name || project.name || ''} ${project.brief || ''} ${project.summary || ''}`;
+  if (/点读笔|词典笔|听力宝|绘本|阅读笔/.test(text)) {
+    return {
+      name: text.match(/有道[^，。；;\s]{0,8}(?:点读笔|词典笔|听力宝|阅读笔)/)?.[0] || '有道点读笔',
+      keywords: ['点读', '阅读', '绘本', '英语', '发音', '跟读', '查词', '单词', '听力', '孩子自主学'],
+      scenarios: ['亲子阅读', '英语启蒙/跟读', '孩子自主阅读', '查词发音'],
+      presentation: ['点读演示', '孩子使用过程', '发音/跟读反馈', '家长陪伴视角'],
+    };
+  }
+  if (/答疑笔|学习笔|错题|作业答疑|拍照答疑/.test(text)) {
+    return {
+      name: text.match(/有道[^，。；;\s]{0,8}(?:答疑笔|学习笔)/)?.[0] || '有道答疑笔',
+      keywords: ['答疑', '作业', '错题', '解题', '学习规划', '自主学习', '家长辅导', '小初高'],
+      scenarios: ['家庭作业答疑', '错题讲解', '孩子自主学习', '家长辅导减负'],
+      presentation: ['解题过程', '使用前后对比', '孩子独立使用', '家长真实反馈'],
+    };
+  }
+  return DEFAULT_PRODUCT_PROFILE;
+}
+
 function normalizeRiskLabel(text) {
   const value = String(text || '').replace(/^【(?:通用初筛|大模型分析)】/, '').trim();
   if (!value) return '';
-  if (/报价.*(?:超过|偏高|高于)/.test(value)) return '报价超预算';
-  if (/35岁以上粉丝占比.*(?:低于|不足)|粉丝年龄画像/.test(value)) return '35+占比不足/待核';
-  if (/CPC.*(?:未低于|偏高|未进入)/i.test(value)) return 'CPC效率待核';
-  if (/CPE.*(?:未低于|偏高|未进入)/i.test(value)) return 'CPE效率待核';
-  if (/CPM.*偏高/i.test(value)) return 'CPM偏高';
-  if (/搜索\+推荐|搜索推荐|搜推/.test(value)) return '搜推占比待核';
-  if (/限流|违规|异常流量|高风险|流量风险/.test(value)) return '限流/异常风险';
-  if (/近期笔记阅读未达|阅读数据未进入|缺少较好阅读数据/.test(value)) return '阅读数据不足';
-  if (/未识别到匹配信息|人设|内容垂直|场景/.test(value)) return '人设内容待核';
-  return value.length > 18 ? `${value.slice(0, 18)}...` : value;
+  if (/35岁以上|34岁以上|粉丝年龄|粉丝画像|目标人群|人群画像|家长决策|宝妈|妈妈|父母/.test(value)) {
+    return SCORING_RISK_STANDARDS.audience;
+  }
+  if (/阅读|互动|曝光|近30天|流量|T级|P25|P50|P75|搜索\+推荐|搜索推荐|搜推|限流|违规|异常/.test(value)) {
+    return SCORING_RISK_STANDARDS.traffic;
+  }
+  if (/报价|预算|CPC|CPE|CPM|成本|效率|阅读单价|互动单价|超硬上限|偏高/i.test(value)) {
+    return SCORING_RISK_STANDARDS.efficiency;
+  }
+  if (/人设|内容|类目|标签|场景|方向|Brief|教育|母婴|亲子|家庭|孩子|笔记|主页|简介|垂直|硬广/.test(value)) {
+    return SCORING_RISK_STANDARDS.direction;
+  }
+  if (/蒲公英|链接|资料|完整度|执行|回复|身份|邀约|联系|待补|缺字段|采集/.test(value)) {
+    return SCORING_RISK_STANDARDS.execution;
+  }
+  return '';
+}
+
+function isRiskReasonClause(text) {
+  const value = String(text || '').replace(/^【(?:通用初筛|大模型分析)】/, '').trim();
+  if (!value) return false;
+  if (/高分依据|加成|基础信息匹配/.test(value)) return false;
+  return /未|不足|偏高|风险|异常|限流|违规|超过|高于|低于|弱|缺少|待核|暂缓|不匹配|封顶|规避|硬性|明显低/.test(value);
 }
 
 function collectScoreReasonRisks(scoreReason) {
   return String(scoreReason || '')
     .split(/[；;]/)
+    .filter(isRiskReasonClause)
     .map(normalizeRiskLabel)
-    .filter(Boolean)
-    .filter(label => !/高分依据|加成|基础信息匹配|效率判断：报价.*(?:低于|达标)|近期\/合作数据/.test(label));
+    .filter(Boolean);
+}
+
+function deriveScoringRiskLabels(item, scores) {
+  const risks = [];
+  const scoreValue = (key) => Number(scores?.[key]);
+  if (Number.isFinite(scoreValue('fans')) && scoreValue('fans') > 0 && scoreValue('fans') < 75) {
+    risks.push(SCORING_RISK_STANDARDS.audience);
+  }
+  if (Number.isFinite(scoreValue('engagement')) && scoreValue('engagement') > 0 && scoreValue('engagement') < 75) {
+    risks.push(SCORING_RISK_STANDARDS.traffic);
+  }
+  if (Number.isFinite(scoreValue('cpe')) && scoreValue('cpe') > 0 && scoreValue('cpe') < 75) {
+    risks.push(SCORING_RISK_STANDARDS.efficiency);
+  }
+  if (
+    (Number.isFinite(scoreValue('persona')) && scoreValue('persona') > 0 && scoreValue('persona') < 75)
+    || (Number.isFinite(scoreValue('content')) && scoreValue('content') > 0 && scoreValue('content') < 75)
+  ) {
+    risks.push(SCORING_RISK_STANDARDS.direction);
+  }
+  if (Number.isFinite(scoreValue('budget')) && scoreValue('budget') > 0 && scoreValue('budget') < 75) {
+    risks.push(SCORING_RISK_STANDARDS.execution);
+  }
+  if (!item.pgy_url && !item.pgyUrl && !item['蒲公英链接']) {
+    risks.push(SCORING_RISK_STANDARDS.execution);
+  }
+  return risks;
 }
 
 export function mapBackendCreator(item) {
-  const score = Math.round(Number(item.total_score || 0));
+  const hasScore = item.total_score !== null && item.total_score !== undefined && item.total_score !== '';
+  const score = hasScore ? Math.round(Number(item.total_score || 0)) : null;
   const type = getCreatorDisplayType(item);
   const categoryType = getCreatorCategoryType(item);
+  const scores = deriveDimensionScores(item);
   const risks = [];
   const rawPayload = getCreatorRawPayload({ raw: item });
   const collectionIssues = Array.isArray(rawPayload.collection_hard_filter_issues) ? rawPayload.collection_hard_filter_issues : [];
@@ -101,12 +187,13 @@ export function mapBackendCreator(item) {
   });
   if (item.hard_filter_passed === 0 || item.hard_filter_passed === false) {
     risks.push(...collectScoreReasonRisks(item.score_reason).slice(0, 4));
-    if (!risks.length) risks.push('硬性条件待核');
+    if (!risks.length) risks.push(SCORING_RISK_STANDARDS.execution);
   }
-  if (!item.pgy_url || item.pgy_url === '待填') risks.push('无蒲公英');
-  if (Number(item.quote_price || 0) >= 20000) risks.push('报价偏高');
+  const pgyUrl = getPgyUrl({ raw: item });
+  if (!pgyUrl) risks.push(SCORING_RISK_STANDARDS.execution);
+  if (Number(item.quote_price || 0) >= 20000) risks.push(SCORING_RISK_STANDARDS.efficiency);
   if (item.rate_limit_risk && !['无', '无明显'].includes(item.rate_limit_risk)) risks.push(normalizeRiskLabel(item.rate_limit_risk));
-  if (!risks.length && item.persona_tags) risks.push(item.persona_tags.split(/[\/,，]/)[0]);
+  risks.push(...deriveScoringRiskLabels({ ...item, pgy_url: pgyUrl }, scores));
   const uniqueRisks = uniqueCompactItems(risks, 4);
   return {
     id: item.creator_id,
@@ -117,7 +204,8 @@ export function mapBackendCreator(item) {
     followersNum: Number(item.followers_count || 0),
     quote: formatCurrency(item.quote_price),
     quoteNum: Number(item.quote_price || 0),
-    baseScore: score || 0,
+    baseScore: score,
+    scorePending: !hasScore,
     baseOnlyScore: Math.round(Number(item.base_score || 0)),
     bonusScore: Math.round(Number(item.bonus_score || 0)),
     informationCompleteness: item.information_completeness,
@@ -125,12 +213,12 @@ export function mapBackendCreator(item) {
     initialTier: item.initial_tier || item.tier || '',
     detailCollectionPriority: item.detail_collection_priority || '',
     risk: uniqueRisks,
-    scores: deriveDimensionScores(item),
+    scores,
     aiReason: item.score_reason || '待补充蒲公英详情数据后生成完整评分说明。',
     review: item.status || '待补数据',
     reviewVariant: reviewVariantFromStatus(item.status),
     poolStage: item.pool_stage || null,
-    finalScore: score || null,
+    finalScore: hasScore ? score : null,
     reason: item.review_reason || item.score_reason || '',
     reviewer: item.reviewer,
     reviewedAt: item.reviewed_at,
@@ -151,6 +239,7 @@ export function mapBackendCreator(item) {
 }
 
 export function getScoreColor(score) {
+  if (score === null || score === undefined || score === '') return '#64748B';
   if (score >= 100) return '#10B981';
   if (score >= 90) return '#3B82F6';
   if (score >= 80) return '#F59E0B';
@@ -159,11 +248,12 @@ export function getScoreColor(score) {
 }
 
 export function getScoreTier(score) {
-  if (score >= 100) return { key: 'S', label: 'S档', variant: 'green', text: '必须补采', color: '#10B981' };
-  if (score >= 90) return { key: 'A', label: 'A档', variant: 'blue', text: '优先补采', color: '#3B82F6' };
-  if (score >= 80) return { key: 'B+', label: 'B+档', variant: 'amber', text: '高潜补采', color: '#F59E0B' };
-  if (score >= 70) return { key: 'B', label: 'B档', variant: 'amber', text: '暂缓观察', color: '#D97706' };
-  return { key: 'C', label: 'C档', variant: 'red', text: '不补采', color: '#EF4444' };
+  if (score === null || score === undefined || score === '') return { key: '未评分', label: '未评分', variant: 'default', text: '待评分', color: '#64748B' };
+  if (score >= 100) return { key: 'S', label: 'S档', variant: 'green', text: '最高优先级', color: '#10B981' };
+  if (score >= 90) return { key: 'A', label: 'A档', variant: 'blue', text: '高优先级', color: '#3B82F6' };
+  if (score >= 80) return { key: 'B+', label: 'B+档', variant: 'amber', text: '中高优先级', color: '#F59E0B' };
+  if (score >= 70) return { key: 'B', label: 'B档', variant: 'amber', text: '中优先级', color: '#D97706' };
+  return { key: 'C', label: 'C档', variant: 'red', text: '低优先级', color: '#EF4444' };
 }
 
 export function getCreatorDetailStatus(creator) {
@@ -180,7 +270,8 @@ export function isValidPgyDetailUrl(value) {
   if (!value || value === '待填') return false;
   try {
     const url = new URL(value);
-    return url.hostname === 'pgy.xiaohongshu.com' && url.pathname.includes('/solar/pre-trade/blogger-detail/');
+    if (url.hostname !== 'pgy.xiaohongshu.com') return false;
+    return url.pathname.includes('/solar/pre-trade/blogger-detail/') || url.pathname.includes('/creator/');
   } catch {
     return false;
   }
@@ -756,6 +847,48 @@ function formatCountMetric(value) {
   return compactNumber(parseCountValue(value) || value);
 }
 
+function metricNumber(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const number = parseCountValue(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function medianValue(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function averageValue(values) {
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function getCreatorMetricNumber(creator, keys) {
+  return metricNumber(pickCreatorValue(creator, keys));
+}
+
+function summarizeNoteAverages(creator, noteCases = []) {
+  const readValues = noteCases.map(note => metricNumber(note.readCount)).filter(value => value !== null);
+  const interactionValues = noteCases
+    .map(note => metricNumber(note.likeCount) + metricNumber(note.saveCount) + metricNumber(note.commentCount))
+    .filter(value => Number.isFinite(value) && value > 0);
+  const readMedian = medianValue(readValues) ?? getCreatorMetricNumber(creator, ['cooperation_read_median', 'daily_read_median', 'image_daily_read_median', 'video_daily_read_median', '合作阅读中位数', '阅读中位数（合作）']);
+  const interactionMedian = medianValue(interactionValues) ?? getCreatorMetricNumber(creator, ['cooperation_interaction_median', 'daily_interaction_median', 'image_daily_interaction_median', 'video_daily_interaction_median', '合作互动中位数', '互动中位数（合作）']);
+  const readAverage = averageValue(readValues) ?? readMedian;
+  const interactionAverage = averageValue(interactionValues) ?? interactionMedian;
+  return {
+    sampleCount: noteCases.length,
+    metrics: [
+      { label: '平均阅读', value: formatCountMetric(readAverage), rawValue: readAverage },
+      { label: '阅读中位', value: formatCountMetric(readMedian), rawValue: readMedian },
+      { label: '平均互动', value: formatCountMetric(interactionAverage), rawValue: interactionAverage },
+      { label: '互动中位', value: formatCountMetric(interactionMedian), rawValue: interactionMedian },
+    ],
+  };
+}
+
 function getCostTone(label, value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return 'muted';
@@ -808,8 +941,77 @@ function buildMetricWeaknesses(creator) {
   return items;
 }
 
-export function getCreatorAdRecommendation(creator, noteCases = []) {
+function standardScore(creator, standard) {
+  const scores = creator.scores || {};
+  const values = (SCORING_STANDARD_SCORE_KEYS[standard] || [])
+    .map(key => Number(scores[key]))
+    .filter(value => Number.isFinite(value) && value > 0);
+  if (!values.length) return null;
+  return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
+}
+
+function getPrimaryScoringStandard(creator) {
+  const riskStandard = (creator.risk || []).find(item => Object.values(SCORING_RISK_STANDARDS).includes(item));
+  if (riskStandard) return riskStandard;
+  const standards = Object.values(SCORING_RISK_STANDARDS)
+    .map(standard => ({ standard, score: standardScore(creator, standard) }))
+    .filter(item => item.score !== null);
+  if (!standards.length) return SCORING_RISK_STANDARDS.direction;
+  const weak = standards.filter(item => item.score < 85).sort((a, b) => a.score - b.score)[0];
+  if (weak) return weak.standard;
+  return standards.sort((a, b) => b.score - a.score)[0].standard;
+}
+
+function scoringStandardEvidence(creator, standard, clauses = []) {
+  const score = standardScore(creator, standard);
+  const clause = clauses.find(item => {
+    if (standard === SCORING_RISK_STANDARDS.audience) return /人群|粉丝|35|画像|家长|妈妈|父母/.test(item);
+    if (standard === SCORING_RISK_STANDARDS.traffic) return /阅读|互动|曝光|流量|T级|搜推/.test(item);
+    if (standard === SCORING_RISK_STANDARDS.efficiency) return /成本|报价|预算|CPC|CPE|CPM|单价/.test(item);
+    if (standard === SCORING_RISK_STANDARDS.direction) return /内容|人设|标签|类目|场景|笔记|Brief/.test(item);
+    return /执行|蒲公英|链接|完整|回复|采集|资料/.test(item);
+  });
+  if (clause) return clause;
+  if (score !== null) {
+    if (score >= 85) return `${standard}得分 ${score}，可作为当前主要通过依据。`;
+    if (score >= 75) return `${standard}得分 ${score}，建议结合详情页证据复核。`;
+    return `${standard}得分 ${score}，是当前优先处理的短板。`;
+  }
+  return `${standard}证据不足，需补充详情页和笔记样本后复核。`;
+}
+
+function buildNoteContentWeaknesses(noteCases = [], productProfile = DEFAULT_PRODUCT_PROFILE) {
+  if (!noteCases.length) return [`缺少可核验笔记标题/正文，暂不能判断是否适合${productProfile.name}呈现`];
+  const text = noteCases.map(note => noteTextBlob(note)).join(' ');
+  const types = uniqueCompactItems(noteCases.map(note => note.noteType || ''), 4);
+  const items = [];
+  if (!productProfile.keywords.some(keyword => text.includes(keyword))) {
+    items.push(`笔记主题未明显承接${productProfile.name}的${productProfile.scenarios.slice(0, 2).join('、')}`);
+  }
+  if (!/学习|作业|答疑|教辅|方法|规划|考试|升学|阅读|绘本|英语|单词|发音|听力/.test(text)) {
+    items.push('笔记主题与学习工具使用场景关联不足');
+  }
+  if (!/孩子|家长|妈妈|爸爸|家庭|陪读|亲子|学生/.test(text)) {
+    items.push('呈现视角缺少真实家庭/家长使用场景');
+  }
+  if (!productProfile.presentation.some(keyword => text.includes(keyword.replace(/视角|过程|反馈|演示|对比/g, '')))) {
+    items.push(`呈现方式需补看是否有${productProfile.presentation.slice(0, 3).join('、')}`);
+  }
+  if (/福利|秒杀|低价|冲|必买|闭眼入|全网/.test(text)) {
+    items.push('部分标题或表达偏促销，需控制硬广感');
+  }
+  if (noteCases.every(note => String(note.content || note.summary || note.description || '').trim().length < 24)) {
+    items.push('笔记正文信息偏少，卖点承接和使用过程待确认');
+  }
+  if (types.length === 1 && noteCases.length >= 3) {
+    items.push(`呈现形式集中在${types[0]}，可补看是否有过程型/测评型内容`);
+  }
+  return uniqueCompactItems(items, 3);
+}
+
+export function getCreatorAdRecommendation(creator, noteCases = [], project = {}) {
   const rawReason = String(creator.aiReason || creator.reason || '').replace(/^【(?:大模型分析|通用初筛)】/, '').trim();
+  const productProfile = getProjectProductProfile(project);
   const cpe = getNumericMetric(creator, ['naturalCpe', 'natural_cpe', '合作笔记自然CPE', 'image_interaction_unit_price', 'video_interaction_unit_price'], 'CPE');
   const cpc = getNumericMetric(creator, ['natural_cpc', '合作笔记自然CPC', 'image_read_unit_price', 'video_read_unit_price'], 'CPC');
   const cpm = getNumericMetric(creator, ['image_cpm', 'video_cpm', '预估CPM', '图文预估CPM价格', '视频预估CPM价格'], 'CPM');
@@ -819,25 +1021,16 @@ export function getCreatorAdRecommendation(creator, noteCases = []) {
     { label: 'CPC', value: formatCostMetric(cpc), tone: getCostTone('CPC', cpc) },
   ];
   const knownTones = costMetrics.map(item => item.tone).filter(tone => tone !== 'muted');
-  const verdict = knownTones.includes('bad') ? '成本偏高' : knownTones.includes('good') ? '成本优秀' : knownTones.includes('ok') ? '成本达标' : '成本待补';
-
-  const noteMetrics = [
-    { label: '合作曝光', value: formatCountMetric(pickCreatorValue(creator, ['cooperation_exposure_median', '合作曝光中位数', '曝光中位数（合作）'])) },
-    { label: '合作阅读', value: formatCountMetric(pickCreatorValue(creator, ['cooperation_read_median', '合作阅读中位数', '阅读中位数（合作）'])) },
-    { label: '合作互动', value: formatCountMetric(pickCreatorValue(creator, ['cooperation_interaction_median', '合作互动中位数', '互动中位数（合作）'])) },
-    { label: '搜推占比', value: formatPercentValue(pickCreatorValue(creator, ['search_recommend_ratio', '搜索+推荐占比'])) || '待补' },
-  ];
-  if (noteMetrics.every(item => item.value === '待补')) {
-    noteMetrics.splice(0, 3,
-      { label: '近30天曝光', value: formatCountMetric(pickCreatorValue(creator, ['image_daily_exposure_median', 'video_daily_exposure_median'])) },
-      { label: '近30天阅读', value: formatCountMetric(pickCreatorValue(creator, ['daily_read_median', 'image_daily_read_median', 'video_daily_read_median'])) },
-      { label: '近30天互动', value: formatCountMetric(pickCreatorValue(creator, ['daily_interaction_median', 'image_daily_interaction_median', 'video_daily_interaction_median'])) },
-    );
-  }
+  const costVerdict = knownTones.includes('bad') ? '成本偏高' : knownTones.includes('good') ? '成本优秀' : knownTones.includes('ok') ? '成本达标' : '成本待补';
+  const noteMetricProfile = summarizeNoteAverages(creator, noteCases);
+  const noteMetrics = noteMetricProfile.metrics;
 
   const clauses = reasonClauses(rawReason);
   const positiveClauses = clauses.filter(item => /达标|低于|匹配|高分|加成|专业|垂直|强|优质|精准|讨论度|真实|性价比|优势/.test(item) && !/未|不足|偏高|风险|缺少|待核/.test(item));
   const negativeClauses = clauses.filter(item => /未|不足|偏高|风险|缺少|待核|不匹配|暂缓|弱|下降/.test(item));
+  const primaryStandard = getPrimaryScoringStandard(creator);
+  const standardEvidence = scoringStandardEvidence(creator, primaryStandard, clauses);
+  const noteContentWeaknesses = buildNoteContentWeaknesses(noteCases, productProfile);
   const tagGroups = getCreatorTagGroups(creator);
   const tagAdvantage = uniqueCompactItems([...tagGroups.persona, ...tagGroups.content], 4);
   const strengths = uniqueCompactItems([
@@ -846,6 +1039,7 @@ export function getCreatorAdRecommendation(creator, noteCases = []) {
     ...positiveClauses,
   ], 4);
   const weaknesses = uniqueCompactItems([
+    ...noteContentWeaknesses,
     ...(creator.risk || []),
     ...buildMetricWeaknesses(creator),
     ...negativeClauses,
@@ -855,18 +1049,22 @@ export function getCreatorAdRecommendation(creator, noteCases = []) {
     : '';
   const action = getCreatorRecommendation(creator, getPoolStage(creator));
   const noteSummary = noteTitles
-    ? `可参考 ${noteTitles} 等 ${noteCases.length} 条笔记样本。`
-    : '合作笔记标题/正文样本待补，先按中位数和成本指标判断。';
+    ? `基于 ${noteCases.length} 条笔记样本计算平均数/中位数；重点复核 ${noteTitles} 是否能自然呈现${productProfile.name}。`
+    : `缺少可核验合作笔记样本，需补看是否能自然呈现${productProfile.name}。`;
 
   return {
-    verdict,
+    verdict: primaryStandard,
+    standard: primaryStandard,
+    standardEvidence,
+    productName: productProfile.name,
+    costVerdict,
     costMetrics: costMetrics.map(item => ({ ...item, status: costToneText(item.tone) })),
     noteMetrics,
     noteSummary,
     strengths: strengths.length ? strengths : ['暂未提取到明确优势，建议完善详情页和笔记证据。'],
     weaknesses: weaknesses.length ? weaknesses : ['暂无明显硬风险，仍需结合内容样本复核。'],
     action,
-    summary: rawReason || `${verdict}；${noteSummary}；建议：${action}`,
+    summary: `${primaryStandard}：${standardEvidence} 重点看${productProfile.name}场景。`,
   };
 }
 

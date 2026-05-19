@@ -18,7 +18,7 @@ DEFAULT_CONFIG = {
     "api_key_env": "OPENAI_API_KEY",
     "temperature": 0.2,
     "max_tokens": None,
-    "timeout_seconds": None,
+    "timeout_seconds": 180,
 }
 
 
@@ -82,7 +82,7 @@ def test_ai_config(payload: dict[str, Any]) -> dict[str, Any]:
     if not api_key:
         return {"ok": False, "error": "未配置 API Key 或环境变量"}
     base_url = str(config["base_url"]).rstrip("/")
-    timeout = int(config.get("timeout_seconds") or 60)
+    timeout = int(config.get("timeout_seconds") or 180)
     if config.get("protocol") == "gemini":
         url = f"{base_url}/models?key={api_key}"
         response = requests.get(url, timeout=timeout)
@@ -126,7 +126,7 @@ def chat_json(messages: list[dict[str, str]], config: dict[str, Any] | None = No
     if not api_key:
         raise RuntimeError("未配置 API Key 或环境变量，无法调用大模型")
     base_url = str(config["base_url"]).rstrip("/")
-    timeout = int(config.get("timeout_seconds") or 90)
+    timeout = int(config.get("timeout_seconds") or 180)
     max_tokens = config.get("max_tokens") or 4096
     temperature = float(config.get("temperature") if config.get("temperature") is not None else 0.2)
 

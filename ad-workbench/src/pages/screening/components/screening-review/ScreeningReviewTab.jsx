@@ -96,11 +96,12 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
 
   const tierStats = useMemo(() => {
     const tiers = {
-      S: { label: 'S档', desc: '100分以上，必须补采', count: 0, variant: 'green', color: '#10B981' },
-      A: { label: 'A档', desc: '90-99分，优先补采', count: 0, variant: 'blue', color: '#3B82F6' },
-      'B+': { label: 'B+档', desc: '80-89分，高潜补采', count: 0, variant: 'amber', color: '#F59E0B' },
-      B: { label: 'B档', desc: '70-79分，暂缓观察', count: 0, variant: 'amber', color: '#D97706' },
-      C: { label: 'C档', desc: '70分以下，不补采', count: 0, variant: 'red', color: '#EF4444' },
+      S: { label: 'S档', desc: '100分以上，最高优先级', count: 0, variant: 'green', color: '#10B981' },
+      A: { label: 'A档', desc: '90-99分，高优先级', count: 0, variant: 'blue', color: '#3B82F6' },
+      'B+': { label: 'B+档', desc: '80-89分，中高优先级', count: 0, variant: 'amber', color: '#F59E0B' },
+      B: { label: 'B档', desc: '70-79分，中优先级', count: 0, variant: 'amber', color: '#D97706' },
+      C: { label: 'C档', desc: '70分以下，低优先级', count: 0, variant: 'red', color: '#EF4444' },
+      未评分: { label: '未评分', desc: '待完成评分，不计入低优先级', count: 0, variant: 'default', color: '#64748B' },
     };
     screeningCandidates.forEach(creator => {
       const tier = getScoreTier(creator.baseScore).key;
@@ -365,15 +366,16 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   };
 
   const renderAdRecommendation = (creator) => {
-    const recommendation = getCreatorAdRecommendation(creator, getCreatorRealNoteCases(creator));
+    const recommendation = getCreatorAdRecommendation(creator, getCreatorRealNoteCases(creator), project);
     return (
       <div className="screening-ai-reason-card">
         <div className="screening-ai-reason-head">
           <div>
-            <span>AI 推荐理由</span>
+            <span>大模型意见 · {recommendation.productName}</span>
             <strong>{recommendation.verdict}</strong>
+            <small>{recommendation.standardEvidence}</small>
           </div>
-          <Badge variant={recommendation.verdict.includes('偏高') ? 'amber' : recommendation.verdict.includes('待补') ? 'default' : 'green'}>
+          <Badge variant={(creator.risk || []).includes(recommendation.verdict) ? 'amber' : 'green'}>
             {recommendation.action}
           </Badge>
         </div>
@@ -408,6 +410,17 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
             {recommendation.weaknesses.map(item => <p key={item}>{item}</p>)}
           </div>
         </div>
+      </div>
+    );
+  };
+
+  const renderReviewComment = (creator) => {
+    const recommendation = getCreatorAdRecommendation(creator, getCreatorRealNoteCases(creator), project);
+    return (
+      <div className="screening-review-comment-card">
+        <strong>{recommendation.verdict}</strong>
+        <span>{recommendation.standardEvidence}</span>
+        <small>{recommendation.productName} · {recommendation.action}</small>
       </div>
     );
   };
@@ -507,13 +520,13 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
       </div>
 
       {/* 工具栏 */}
-      <div className="card" style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-          <div className="search-box" style={{ position: 'relative' }}>
+      <div className="card screening-review-toolbar" style={{ marginBottom: 16 }}>
+        <div className="screening-review-toolbar-group">
+          <div className="search-box screening-review-search">
             <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-            <input className="search-input" placeholder="搜索达人..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} style={{ paddingLeft: 30, width: 160 }} />
+            <input className="search-input" placeholder="搜索达人..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} />
           </div>
-          <select className="select-field" style={{ width: 120 }} value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
+          <select className="select-field screening-review-select" style={{ width: 120 }} value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
             <option value="全部">全部状态</option>
             <option value="待审核">待审核</option>
             <option value="已通过">已通过</option>
@@ -521,21 +534,22 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
             <option value="备选">备选</option>
             <option value="人工复核">人工复核</option>
           </select>
-          <select className="select-field" style={{ width: 110 }} value={tierFilter} onChange={e => setTierFilter(e.target.value)}>
+          <select className="select-field screening-review-select" style={{ width: 110 }} value={tierFilter} onChange={e => setTierFilter(e.target.value)}>
             <option value="全部">全部档位</option>
             <option value="S">S档</option>
             <option value="A">A档</option>
             <option value="B+">B+档</option>
             <option value="B">B档</option>
             <option value="C">C档</option>
+            <option value="未评分">未评分</option>
           </select>
-          <select className="select-field" style={{ width: 100 }} value={typeFilter} onChange={e => setTypeFilter(e.target.value)}>
+          <select className="select-field screening-review-select" style={{ width: 100 }} value={typeFilter} onChange={e => setTypeFilter(e.target.value)}>
             <option value="全部">全部类型</option>
             <option value="KOL">KOL</option>
             <option value="KOC">KOC</option>
           </select>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div className="screening-review-toolbar-actions">
           <button className="btn btn-sm btn-secondary" onClick={onImport}><Upload size={14} style={{ marginRight: 4 }} />导入模板</button>
           <button className="btn btn-sm btn-secondary" onClick={() => onCollect?.()}><Bot size={14} style={{ marginRight: 4 }} />蒲公英采集</button>
           <button
@@ -570,166 +584,168 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
       </div>
 
       {/* 达人列表 */}
-      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-          <thead>
-            <tr style={{ borderBottom: '1px solid var(--border-primary)' }}>
-              <th style={{ padding: '12px 8px 12px 16px', width: 42, textAlign: 'center' }}>
-                <input
-                  type="checkbox"
-                  checked={allFilteredSelected}
-                  disabled={!filtered.length}
-                  onChange={toggleSelectFiltered}
-                  aria-label="选择当前列表达人"
-                />
-              </th>
-              <th style={{ padding: '12px 16px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>达人</th>
-              <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>类型</th>
-              <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }} onClick={() => toggleSort('followersNum')}>粉丝数 <SortIcon field="followersNum" /></th>
-              <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }} onClick={() => toggleSort('quoteNum')}>报价 <SortIcon field="quoteNum" /></th>
-              <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }} onClick={() => toggleSort('baseScore')}>初筛总分 <SortIcon field="baseScore" /></th>
-              <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>内容建模</th>
-              <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>档位</th>
-              <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>风险</th>
-              <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>审核状态</th>
-              <th style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>审核意见</th>
-              <th style={{ padding: '12px 16px', textAlign: 'center', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map(creator => (
-              <React.Fragment key={creator.id}>
-                <tr style={{ borderBottom: '1px solid var(--border-primary)', cursor: 'pointer', transition: 'background 0.15s' }}
-                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                  <td style={{ padding: '12px 8px 12px 16px', textAlign: 'center' }}>
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.includes(creator.id)}
-                      onChange={() => toggleSelectCreator(creator.id)}
-                      onClick={e => e.stopPropagation()}
-                      aria-label={`选择${creator.name}`}
-                    />
-                  </td>
-                  <td style={{ padding: '12px 16px' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                      {renderCreatorAvatar(creator)}
-                      <div>
-                        {renderCreatorName(creator, { color: 'var(--text-primary)', fontWeight: 600 })}
-                        <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{getCreatorDisplayId(creator)}</div>
-                      </div>
-                    </div>
-                  </td>
-                  <td style={{ padding: '12px' }}><Badge variant={creator.typeVariant}>{creator.type}</Badge></td>
-                  <td style={{ padding: '12px', color: 'var(--text-secondary)', fontWeight: 500 }}>{creator.followers}</td>
-                  <td style={{ padding: '12px', color: 'var(--text-secondary)', fontWeight: 500 }}>{creator.quote}</td>
-                  <td style={{ padding: '12px' }}>
-                    <span style={{ fontWeight: 700, fontSize: 15, color: getScoreColor(creator.baseScore) }}>{creator.baseScore}</span>
-                    <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
-                      基础 {creator.baseOnlyScore || 0} + 加成 {creator.bonusScore || 0} · 完整度 {creator.informationCompletenessLabel}
-                    </span>
-                  </td>
-                  <td style={{ padding: '12px', minWidth: 210 }}>
-                    {renderLightProfileSummary(creator)}
-                  </td>
-                  <td style={{ padding: '12px' }}>
-                    {(() => {
-                      const tier = getScoreTier(creator.baseScore);
-                      return <Badge variant={tier.variant}>{tier.label} · {tier.text}</Badge>;
-                    })()}
-                    {creator.detailCollectionPriority && <Badge variant="default">{creator.detailCollectionPriority}</Badge>}
-                  </td>
-                  <td style={{ padding: '12px' }}>
-                    <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                      {(creator.risk || []).map((t, i) => <span key={i} className="tag" style={{ fontSize: 10, color: t.includes('无') || t.includes('低') || t.includes('过多') || t.includes('低') ? '#EF4444' : '#F59E0B' }}>{t}</span>)}
-                    </div>
-                  </td>
-                  <td style={{ padding: '12px' }}><Badge variant={getReviewVariant(creator.review)}>{creator.review}</Badge></td>
-                  <td style={{ padding: '12px', maxWidth: 140 }}>
-                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{creator.reason || '-'}</div>
-                    {creator.reviewer && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{creator.reviewer} · {creator.reviewedAt}</div>}
-                  </td>
-                  <td style={{ padding: '12px 16px', textAlign: 'center' }}>
-                    <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
-                      {creator.review === '待审核' ? (
-                        <>
-                          <button className="btn btn-sm btn-ghost" style={{ color: '#10B981' }} onClick={(e) => { e.stopPropagation(); setReviewModal({ creator, action: 'pass' }); }} title="通过"><UserCheck size={15} /></button>
-                          <button className="btn btn-sm btn-ghost" style={{ color: '#EF4444' }} onClick={(e) => { e.stopPropagation(); setReviewModal({ creator, action: 'reject' }); }} title="驳回"><UserX size={15} /></button>
-                          <button className="btn btn-sm btn-ghost" style={{ color: '#F59E0B' }} onClick={(e) => { e.stopPropagation(); setReviewModal({ creator, action: 'backup' }); }} title="备选"><Bookmark size={15} /></button>
-                        </>
-                      ) : (
-                        <button className="btn btn-sm btn-ghost" style={{ color: 'var(--text-secondary)' }} onClick={(e) => { e.stopPropagation(); setReviewModal({ creator, action: 'reset' }); }} title="重置"><RotateCcw size={15} /></button>
-                      )}
-                      <button
-                        className="btn btn-sm btn-secondary"
-                        onClick={(e) => { e.stopPropagation(); setDetailModalCreator(creator); }}
-                        title="查看详情"
-                      >
-                        详情
-                      </button>
-                      <button
-                        className="btn btn-sm btn-secondary"
-                        onClick={(e) => { e.stopPropagation(); openInviteModal([creator], '初筛找博主单个邀约'); }}
-                        disabled={!onPgyInvite}
-                        title="通过蒲公英邀约该达人"
-                      >
-                        邀约
-                      </button>
-                      <button className="btn btn-sm btn-ghost" onClick={(e) => { e.stopPropagation(); setExpandedId(expandedId === creator.id ? null : creator.id); }} title="展开评分">
-                        <ChevronDown size={15} style={{ transform: expandedId === creator.id ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }} />
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-                {expandedId === creator.id && (
-                  <tr style={{ background: 'var(--bg-raised)' }}>
-                    <td colSpan={12} style={{ padding: '16px 24px', borderBottom: '1px solid var(--border-primary)' }}>
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
-                        {/* 评分维度 */}
+      <div className="card screening-review-table-card">
+        <div className="screening-review-table-scroll">
+          <table className="screening-review-table">
+            <thead>
+              <tr style={{ borderBottom: '1px solid var(--border-primary)' }}>
+                <th className="screening-review-col-checkbox" style={{ padding: '12px 8px 12px 16px', textAlign: 'center' }}>
+                  <input
+                    type="checkbox"
+                    checked={allFilteredSelected}
+                    disabled={!filtered.length}
+                    onChange={toggleSelectFiltered}
+                    aria-label="选择当前列表达人"
+                  />
+                </th>
+                <th className="screening-review-col-creator" style={{ padding: '12px 16px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>达人</th>
+                <th className="screening-review-col-type" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>类型</th>
+                <th className="screening-review-col-followers" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }} onClick={() => toggleSort('followersNum')}>粉丝数 <SortIcon field="followersNum" /></th>
+                <th className="screening-review-col-quote" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }} onClick={() => toggleSort('quoteNum')}>报价 <SortIcon field="quoteNum" /></th>
+                <th className="screening-review-col-score" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }} onClick={() => toggleSort('baseScore')}>初筛总分 <SortIcon field="baseScore" /></th>
+                <th className="screening-review-col-model" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>内容建模</th>
+                <th className="screening-review-col-tier" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>档位</th>
+                <th className="screening-review-col-risk" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>风险</th>
+                <th className="screening-review-col-status" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>审核状态</th>
+                <th className="screening-review-col-comment" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>审核意见</th>
+                <th className="screening-review-col-actions" style={{ padding: '12px 16px', textAlign: 'center', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map(creator => (
+                <React.Fragment key={creator.id}>
+                  <tr style={{ borderBottom: '1px solid var(--border-primary)', cursor: 'pointer', transition: 'background 0.15s' }}
+                    onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
+                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                    <td className="screening-review-col-checkbox" style={{ padding: '12px 8px 12px 16px', textAlign: 'center' }}>
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.includes(creator.id)}
+                        onChange={() => toggleSelectCreator(creator.id)}
+                        onClick={e => e.stopPropagation()}
+                        aria-label={`选择${creator.name}`}
+                      />
+                    </td>
+                    <td className="screening-review-col-creator" style={{ padding: '12px 16px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        {renderCreatorAvatar(creator)}
                         <div>
-                          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12, fontWeight: 600 }}>评分维度明细</div>
-                          {creator.scores && Object.entries(creator.scores).map(([key, val]) => (
-                            <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
-                              <span style={{ fontSize: 12, color: 'var(--text-secondary)', width: 70, flexShrink: 0 }}>{scoreDimLabels[key] || key}</span>
-                              <div style={{ flex: 1, height: 6, background: 'var(--bg-elevated)', borderRadius: 3, overflow: 'hidden' }}>
-                                <div style={{ width: `${val}%`, height: '100%', background: getScoreColor(val), borderRadius: 3, transition: 'width 0.3s' }} />
-                              </div>
-                              <span style={{ fontSize: 12, fontWeight: 600, color: getScoreColor(val), width: 28, textAlign: 'right' }}>{val}</span>
-                            </div>
-                          ))}
-                        </div>
-                        {/* AI 推荐理由 */}
-                        <div>
-                          {renderAdRecommendation(creator)}
-                          {(creator.risk || []).length > 0 && (
-                            <div className="screening-ai-risk-list">
-                              <div>风险提示</div>
-                              {(creator.risk || []).map((r, i) => (
-                                <div key={i}>
-                                  <AlertTriangle size={12} />
-                                  <span>{r}</span>
-                                </div>
-                              ))}
-                            </div>
-                          )}
+                          {renderCreatorName(creator, { color: 'var(--text-primary)', fontWeight: 600 })}
+                          <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{getCreatorDisplayId(creator)}</div>
                         </div>
                       </div>
                     </td>
+                    <td className="screening-review-col-type" style={{ padding: '12px' }}><Badge variant={creator.typeVariant}>{creator.type}</Badge></td>
+                    <td className="screening-review-col-followers" style={{ padding: '12px', color: 'var(--text-secondary)', fontWeight: 500 }}>{creator.followers}</td>
+                    <td className="screening-review-col-quote" style={{ padding: '12px', color: 'var(--text-secondary)', fontWeight: 500 }}>{creator.quote}</td>
+                    <td className="screening-review-col-score screening-review-cell-score" style={{ padding: '12px' }}>
+                      <span style={{ fontWeight: 700, fontSize: 15, color: getScoreColor(creator.baseScore) }}>{creator.scorePending ? '待评分' : creator.baseScore}</span>
+                      <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
+                        基础 {creator.baseOnlyScore || 0} + 加成 {creator.bonusScore || 0} · 完整度 {creator.informationCompletenessLabel}
+                      </span>
+                    </td>
+                    <td className="screening-review-col-model screening-review-cell-model" style={{ padding: '12px' }}>
+                      {renderLightProfileSummary(creator)}
+                    </td>
+                    <td className="screening-review-col-tier" style={{ padding: '12px' }}>
+                      {(() => {
+                        const tier = getScoreTier(creator.baseScore);
+                        return <Badge variant={tier.variant}>{tier.label} · {tier.text}</Badge>;
+                      })()}
+                      {creator.detailCollectionPriority && <Badge variant="default">{creator.detailCollectionPriority}</Badge>}
+                    </td>
+                    <td className="screening-review-col-risk screening-review-cell-risk" style={{ padding: '12px' }}>
+                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                        {(creator.risk || []).map((t, i) => <span key={i} className="tag" style={{ fontSize: 10, color: t.includes('无') || t.includes('低') || t.includes('过多') || t.includes('低') ? '#EF4444' : '#F59E0B' }}>{t}</span>)}
+                      </div>
+                    </td>
+                    <td className="screening-review-col-status" style={{ padding: '12px' }}><Badge variant={getReviewVariant(creator.review)}>{creator.review}</Badge></td>
+                    <td className="screening-review-col-comment screening-review-cell-comment" style={{ padding: '12px' }}>
+                      {renderReviewComment(creator)}
+                      {creator.reviewer && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{creator.reviewer} · {creator.reviewedAt}</div>}
+                    </td>
+                    <td className="screening-review-col-actions" style={{ padding: '12px 16px', textAlign: 'center' }}>
+                      <div className="screening-review-action-row">
+                        {creator.review === '待审核' ? (
+                          <>
+                            <button className="btn btn-sm btn-ghost" style={{ color: '#10B981' }} onClick={(e) => { e.stopPropagation(); setReviewModal({ creator, action: 'pass' }); }} title="通过"><UserCheck size={15} /></button>
+                            <button className="btn btn-sm btn-ghost" style={{ color: '#EF4444' }} onClick={(e) => { e.stopPropagation(); setReviewModal({ creator, action: 'reject' }); }} title="驳回"><UserX size={15} /></button>
+                            <button className="btn btn-sm btn-ghost" style={{ color: '#F59E0B' }} onClick={(e) => { e.stopPropagation(); setReviewModal({ creator, action: 'backup' }); }} title="备选"><Bookmark size={15} /></button>
+                          </>
+                        ) : (
+                          <button className="btn btn-sm btn-ghost" style={{ color: 'var(--text-secondary)' }} onClick={(e) => { e.stopPropagation(); setReviewModal({ creator, action: 'reset' }); }} title="重置"><RotateCcw size={15} /></button>
+                        )}
+                        <button
+                          className="btn btn-sm btn-secondary"
+                          onClick={(e) => { e.stopPropagation(); setDetailModalCreator(creator); }}
+                          title="查看详情"
+                        >
+                          详情
+                        </button>
+                        <button
+                          className="btn btn-sm btn-secondary"
+                          onClick={(e) => { e.stopPropagation(); openInviteModal([creator], '初筛找博主单个邀约'); }}
+                          disabled={!onPgyInvite}
+                          title="通过蒲公英邀约该达人"
+                        >
+                          邀约
+                        </button>
+                        <button className="btn btn-sm btn-ghost" onClick={(e) => { e.stopPropagation(); setExpandedId(expandedId === creator.id ? null : creator.id); }} title="展开评分">
+                          <ChevronDown size={15} style={{ transform: expandedId === creator.id ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }} />
+                        </button>
+                      </div>
+                    </td>
                   </tr>
-                )}
-              </React.Fragment>
-            ))}
-          </tbody>
-        </table>
-        {filtered.length === 0 && (
-          <div style={{ textAlign: 'center', padding: 48, color: 'var(--text-secondary)' }}>
-            <Users size={32} style={{ marginBottom: 8 }} />
-            <div>暂无匹配达人</div>
+                  {expandedId === creator.id && (
+                    <tr className="screening-review-expanded-row" style={{ background: 'var(--bg-raised)' }}>
+                      <td colSpan={12} style={{ padding: '16px 24px', borderBottom: '1px solid var(--border-primary)' }}>
+                        <div className="screening-review-expanded-grid">
+                          {/* 评分维度 */}
+                          <div>
+                            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12, fontWeight: 600 }}>评分维度明细</div>
+                            {creator.scores && Object.entries(creator.scores).map(([key, val]) => (
+                              <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+                                <span style={{ fontSize: 12, color: 'var(--text-secondary)', width: 70, flexShrink: 0 }}>{scoreDimLabels[key] || key}</span>
+                                <div style={{ flex: 1, height: 6, background: 'var(--bg-elevated)', borderRadius: 3, overflow: 'hidden' }}>
+                                  <div style={{ width: `${val}%`, height: '100%', background: getScoreColor(val), borderRadius: 3, transition: 'width 0.3s' }} />
+                                </div>
+                                <span style={{ fontSize: 12, fontWeight: 600, color: getScoreColor(val), width: 28, textAlign: 'right' }}>{val}</span>
+                              </div>
+                            ))}
+                          </div>
+                          {/* AI 推荐理由 */}
+                          <div>
+                            {renderAdRecommendation(creator)}
+                            {(creator.risk || []).length > 0 && (
+                              <div className="screening-ai-risk-list">
+                                <div>风险提示</div>
+                                {(creator.risk || []).map((r, i) => (
+                                  <div key={i}>
+                                    <AlertTriangle size={12} />
+                                    <span>{r}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              ))}
+            </tbody>
+          </table>
+          {filtered.length === 0 && (
+            <div style={{ textAlign: 'center', padding: 48, color: 'var(--text-secondary)' }}>
+              <Users size={32} style={{ marginBottom: 8 }} />
+              <div>暂无匹配达人</div>
+            </div>
+          )}
+          <div style={{ padding: '12px 16px', borderTop: '1px solid var(--border-primary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, color: 'var(--text-secondary)' }}>
+            <span>共 {filtered.length} 位达人，已勾选 {selectedIds.length} 位</span>
+            <span>筛选自 {screeningCandidates.length} 位待筛候选，已入池 {stats.passed} 位</span>
           </div>
-        )}
-        <div style={{ padding: '12px 16px', borderTop: '1px solid var(--border-primary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, color: 'var(--text-secondary)' }}>
-          <span>共 {filtered.length} 位达人，已勾选 {selectedIds.length} 位</span>
-          <span>筛选自 {screeningCandidates.length} 位待筛候选，已入池 {stats.passed} 位</span>
         </div>
       </div>
 

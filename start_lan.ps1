@@ -1,4 +1,11 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
+
+try {
+  chcp 65001 | Out-Null
+} catch {
+}
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
 
 Set-Location -LiteralPath $PSScriptRoot
 
@@ -161,6 +168,39 @@ function Start-PgyChrome {
   Write-Host "Chrome was opened, but the debug port is not ready yet. Wait a moment, then refresh the app or click start browser in the app." -ForegroundColor Yellow
 }
 
+function Start-DetachedServer {
+  param(
+    [string]$PythonExe,
+    [int]$Port
+  )
+
+  $runtimeDir = Join-Path $PSScriptRoot "runtime"
+  New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+
+  $stdoutLog = Join-Path $runtimeDir "lan-server.out.log"
+  $stderrLog = Join-Path $runtimeDir "lan-server.err.log"
+  $pidFile = Join-Path $runtimeDir "lan-server.pid"
+
+  foreach ($path in @($stdoutLog, $stderrLog)) {
+    if (Test-Path -LiteralPath $path) {
+      Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  $process = Start-Process -FilePath $PythonExe -ArgumentList @(
+    "-m",
+    "uvicorn",
+    "rpa_mcp_sync.web:app",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    $Port
+  ) -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+
+  Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ASCII
+  return $process
+}
+
 Write-Host "Checking port $port ..."
 Ensure-PortFree -Port $port
 
@@ -187,32 +227,35 @@ Start-PgyChrome
 $lanIp = Get-LanIPv4
 Write-Host ""
 Write-Host "LAN mode is starting."
-Write-Host "Local:   http://127.0.0.1:$port/workbench"
+Write-Host "本机访问:   http://127.0.0.1:$port/workbench"
 if ($lanIp) {
-  Write-Host "LAN:     http://$lanIp`:$port/workbench" -ForegroundColor Green
-  Write-Host "Devices on the same network can open the LAN address above."
+  Write-Host "局域网访问: http://$lanIp`:$port/workbench" -ForegroundColor Green
+  Write-Host "同一局域网内的其他电脑可直接访问上面的地址。" -ForegroundColor Green
 } else {
-  Write-Host "LAN IP was not detected. Run ipconfig and use your IPv4 address with port $port." -ForegroundColor Yellow
+  Write-Host "未检测到局域网 IP，请运行 ipconfig 后使用你的 IPv4 地址访问端口 $port。" -ForegroundColor Yellow
 }
 Write-Host ""
 Write-Host "Keep this window open while others are using the app."
 Write-Host "Keep the Chrome window open and log in to Pgy if prompted."
+Write-Host "Server will keep running after this window is closed." -ForegroundColor Green
 
-Ensure-PortFree -Port $port
+Start-DetachedServer -PythonExe $python -Port $port | Out-Null
 
-Start-Job -ScriptBlock {
-  param($url)
-  for ($i = 0; $i -lt 30; $i++) {
-    try {
-      $response = Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 2
-      if ($response.StatusCode -eq 200) {
-        Start-Process $url
-        return
-      }
-    } catch {
-      Start-Sleep -Seconds 1
+$serverUrl = "http://127.0.0.1:$port/workbench"
+$serverReady = $false
+for ($i = 0; $i -lt 30; $i++) {
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $serverUrl -TimeoutSec 2
+    if ($response.StatusCode -eq 200) {
+      Start-Process $serverUrl | Out-Null
+      $serverReady = $true
+      break
     }
+  } catch {
+    Start-Sleep -Seconds 1
   }
-} -ArgumentList "http://127.0.0.1:$port/workbench" | Out-Null
+}
 
-& $python -m uvicorn rpa_mcp_sync.web:app --host 0.0.0.0 --port $port
+if (-not $serverReady) {
+  throw "后台服务启动失败，请查看 runtime\\lan-server.err.log 和 runtime\\lan-server.out.log。"
+}
