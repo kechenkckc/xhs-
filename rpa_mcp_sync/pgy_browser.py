@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ PGY_KOL_URL = "https://pgy.xiaohongshu.com/solar/pre-trade/note/kol"
 PGY_ALL_NON_LIVE_METRICS = "全部非直播指标"
 PGY_DETAIL_SCREENSHOT_DIR = ROOT / "runtime" / "pgy_detail_screenshots"
 PGY_BLOGGER_CATEGORY_TAXONOMY_PATH = ROOT / "config" / "pgy_blogger_category_taxonomy.json"
+PGY_KOL_API_TEMPLATE_PATH = ROOT / "runtime" / "pgy_kol_api_template.json"
+PGY_DETAIL_COLLECT_CONCURRENCY = 3
 
 PGY_DISPLAY_METRICS = [
     PGY_ALL_NON_LIVE_METRICS,
@@ -2358,8 +2361,8 @@ def _normalize_pgy_filter_item(item: dict[str, Any]) -> dict[str, Any]:
     if field == "博主人设":
         mapping = {
             "家庭身份": {"field": "家庭身份", "value": "妈妈", "control_type": "checkbox_popover"},
-            "职业身份": {"field": "职业身份", "value": "教育科研", "control_type": "checkbox_popover"},
-            "特色背景": {"field": "特色背景", "value": "备考经验", "control_type": "checkbox_popover"},
+            "职业身份": {"field": "职业身份", "value": "学生", "control_type": "checkbox_popover"},
+            "特色背景": {"field": "特色背景", "value": "留学背景", "control_type": "checkbox_popover"},
         }
         return {**normalized, **mapping.get(value, {})}
     if field == "数据表现" and value in {"预估阅读/互动单价", "CPC<2/CPE<20"}:
@@ -2531,7 +2534,12 @@ def _normalize_pgy_filters(filters: list[dict[str, Any]]) -> list[dict[str, Any]
 def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None = None) -> dict[str, Any]:
     if isinstance(screening_plan, dict) and isinstance(screening_plan.get("pgyCollectionPlan"), dict):
         plan = screening_plan["pgyCollectionPlan"]
-        hard_filters = screening_plan.get("collectionHardFilters") or plan.get("hard_filters") or screening_plan.get("hardFilters") or []
+        if "collectionHardFilters" in screening_plan:
+            hard_filters = screening_plan.get("collectionHardFilters") or []
+        elif "hard_filters" in plan or "hardFilters" in plan:
+            hard_filters = plan.get("hard_filters") or plan.get("hardFilters") or []
+        else:
+            hard_filters = screening_plan.get("hardFilters") or []
         schemes = plan.get("schemes") or []
         default_filters = plan.get("filters") or []
         if not default_filters and schemes and isinstance(schemes[0], dict):
@@ -2606,9 +2614,11 @@ def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None
             add("博主人设", field, f"Brief 命中 {field} 画像")
     if any(keyword in text for keyword in ["妈妈", "宝妈", "母亲", "亲子", "萌娃", "爸爸", "父母"]):
         add("家庭身份", "妈妈", "Brief 命中家庭/亲子身份", control_type="checkbox_popover")
-    if any(keyword in text for keyword in ["老师", "教师", "专家", "医生", "博士", "教育科研"]):
-        add("职业身份", "教育科研", "Brief 命中教育科研/专家职业身份", control_type="checkbox_popover")
-    if any(keyword in text for keyword in ["高知", "升学", "备考", "留学", "考研"]):
+    if any(keyword in text for keyword in ["学生", "大学生", "留学生", "校园", "高校"]):
+        add("职业身份", "学生", "Brief 命中学生身份", control_type="checkbox_popover")
+    if any(keyword in text for keyword in ["留学", "海外留学", "留学生", "出国", "雅思", "托福"]):
+        add("特色背景", "留学背景", "Brief 命中留学/海外背景", control_type="checkbox_popover")
+    elif any(keyword in text for keyword in ["高知", "升学", "备考", "考研"]):
         add("特色背景", "备考经验", "Brief 命中特色背景", control_type="checkbox_popover")
 
     if _brief_emphasizes_region(brief):
@@ -2647,9 +2657,15 @@ def build_collection_plan(brief: str = "", screening_plan: dict[str, Any] | None
     if any(keyword in text for keyword in ["行业推荐", "推荐博主", "意向行业"]):
         add("行业推荐博主", "我的行业", "Brief 提到行业推荐/行业匹配", control_type="nested_select_popover", pending_detail="打开后继续选择我的行业")
 
+    source_plan = screening_plan or {}
+    hard_filters = (
+        source_plan.get("collectionHardFilters") or []
+        if "collectionHardFilters" in source_plan
+        else source_plan.get("hardFilters") or []
+    )
     return {
-        "filters": _normalize_pgy_filters(_merge_filters(_hard_filters_to_pgy_filters((screening_plan or {}).get("collectionHardFilters") or (screening_plan or {}).get("hardFilters") or []), filters)),
-        "hard_filters": (screening_plan or {}).get("collectionHardFilters") or (screening_plan or {}).get("hardFilters") or [],
+        "filters": _normalize_pgy_filters(_merge_filters(_hard_filters_to_pgy_filters(hard_filters), filters)),
+        "hard_filters": hard_filters,
         "display_metrics": PGY_DISPLAY_METRICS,
         "detail_fields": ["基础画像", "粉丝画像", "报价", "合作表现", "内容表现"],
         "filter_catalog": PGY_FILTER_CATALOG,
@@ -2670,6 +2686,14 @@ PGY_EMPTY_RESULT_HINTS = [
 
 PGY_BROAD_KEEP_FIELDS = {"营销目标", "博主类目"}
 PGY_INVALID_ROW_NAMES = {"暂无数据", "暂无相关博主", "暂未找到相关博主", "暂未发现相关博主", "没有找到相关博主"}
+PGY_NO_ORDER_PERMISSION_HINTS = (
+    "无接单权限",
+    "暂无接单权限",
+    "不可接单",
+    "不能接单",
+    "暂不接单",
+    "未开通接单",
+)
 
 
 def _visible_text_lines(text: str) -> list[str]:
@@ -2678,6 +2702,20 @@ def _visible_text_lines(text: str) -> list[str]:
 
 def _clean_text(value: str) -> str:
     return re.sub(r"\s+", "", value or "")
+
+
+def _pgy_no_order_permission_hint(*values: Any) -> str:
+    for value in values:
+        if value in (None, ""):
+            continue
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False)
+        else:
+            text = str(value)
+        cleaned = _clean_text(text)
+        if any(hint in cleaned for hint in PGY_NO_ORDER_PERMISSION_HINTS):
+            return "无接单权限"
+    return ""
 
 
 def _page_empty_result_hint(page: Any) -> str:
@@ -2802,11 +2840,40 @@ def _click_locator(page: Any, locator: Any, timeout: int = 1500) -> bool:
 
 
 def _selected_filter_text(page: Any) -> str:
-    selected = page.locator(".selected-box").first
-    if not selected.count():
-        return ""
+    for selector in [
+        ".selected-box",
+        ".filter-selected",
+        ".selected-filter",
+        "[class*='selected'][class*='box']",
+        "[class*='filter'][class*='selected']",
+    ]:
+        try:
+            selected = page.locator(selector).first
+            if selected.count():
+                text = selected.inner_text(timeout=1200)
+                if text:
+                    return text
+        except Exception:
+            continue
     try:
-        return selected.inner_text(timeout=1200)
+        text = page.evaluate(
+            """
+            () => {
+              const visible = el => {
+                const style = window.getComputedStyle(el);
+                const box = el.getBoundingClientRect();
+                return style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0;
+              };
+              const nodes = Array.from(document.querySelectorAll('*'))
+                .filter(el => visible(el))
+                .map(el => ({ el, text: (el.innerText || el.textContent || '').trim() }))
+                .filter(item => item.text.includes('重置') && (item.text.includes('存为常用筛选') || item.text.includes('不限') || item.text.includes('已选')));
+              nodes.sort((a, b) => a.text.length - b.text.length);
+              return nodes[0]?.text || '';
+            }
+            """
+        )
+        return str(text or "")
     except Exception:
         return ""
 
@@ -2826,6 +2893,17 @@ def _filter_value_candidates(item: dict[str, Any]) -> list[str]:
     raw_value = str(item.get("value") or "").strip()
     selection_value = _item_selection_value(item)
     candidates = [selection_value, raw_value]
+    sub_fields = item.get("sub_fields") or item.get("subFields") or []
+    if not isinstance(sub_fields, list):
+        sub_fields = [sub_fields] if sub_fields else []
+    max_value = item.get("max")
+    min_value = item.get("min")
+    for sub_field in [str(part).strip() for part in sub_fields if str(part).strip()]:
+        candidates.append(sub_field)
+        if max_value not in (None, ""):
+            candidates.extend([f"{sub_field}≤{max_value:g}" if isinstance(max_value, (int, float)) else f"{sub_field}≤{max_value}", f"{sub_field}{max_value}以下"])
+        if min_value not in (None, ""):
+            candidates.extend([f"{sub_field}≥{min_value:g}" if isinstance(min_value, (int, float)) else f"{sub_field}≥{min_value}", f"{sub_field}{min_value}以上"])
     sub_value = str(item.get("sub_value") or item.get("subValue") or "").strip()
     if str(item.get("field") or "") == "博主类目" and sub_value:
         candidates = [sub_value, f"{selection_value}-{sub_value}", f"{selection_value}/{sub_value}", f"{selection_value}：{sub_value}", selection_value, raw_value]
@@ -2838,6 +2916,36 @@ def _filter_value_candidates(item: dict[str, Any]) -> list[str]:
     for value in [selection_value, raw_value]:
         candidates.extend(PGY_FILTER_ALIASES.get(value) or [])
     return list(dict.fromkeys([candidate for candidate in candidates if candidate]))
+
+
+def _filter_threshold_candidates(item: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for key, suffixes in [("max", ["以下", "以内"]), ("min", ["以上", "不低于"])]:
+        value = item.get(key)
+        if value in (None, ""):
+            continue
+        number = _number_from_text(str(value))
+        if number is None:
+            text = str(value)
+        else:
+            text = f"{number:g}"
+        candidates.append(text)
+        if key == "max":
+            candidates.extend([f"≤{text}", f"<={text}", f"不限-{text}", f"不限～{text}"])
+        else:
+            candidates.extend([f"≥{text}", f">={text}", f"{text}-不限", f"{text}～不限"])
+        candidates.extend([f"{text}{suffix}" for suffix in suffixes])
+    return list(dict.fromkeys([_clean_text(candidate) for candidate in candidates if candidate]))
+
+
+def _subfield_selected_in_text(selected_text: str, field: str, sub_field: str) -> bool:
+    aliases = []
+    try:
+        aliases = _subfield_aliases(field, sub_field)
+    except Exception:
+        aliases = [sub_field]
+    aliases = [_clean_text(item) for item in aliases if item]
+    return any(alias and alias in selected_text for alias in aliases)
 
 
 def _catalog_option_groups(field: str) -> list[dict[str, Any]]:
@@ -2862,6 +2970,16 @@ def _filter_already_selected(page: Any, item: dict[str, str]) -> bool:
     sub_value = _clean_text(str(item.get("sub_value") or item.get("subValue") or ""))
     if field == "博主类目" and sub_value:
         return bool(selected_text and sub_value in selected_text)
+    sub_fields = item.get("sub_fields") or item.get("subFields") or []
+    if isinstance(sub_fields, list) and len(sub_fields) > 1:
+        normalized_sub_fields = [_clean_text(str(part)) for part in sub_fields if str(part)]
+        has_all_subfields = all(_subfield_selected_in_text(selected_text, field, part) for part in normalized_sub_fields)
+        threshold_candidates = _filter_threshold_candidates(item)
+        has_threshold = not threshold_candidates or any(candidate in selected_text for candidate in threshold_candidates)
+        return bool(selected_text and field in selected_text and has_all_subfields and has_threshold)
+    threshold_candidates = _filter_threshold_candidates(item)
+    if selected_text and field in selected_text and threshold_candidates and any(candidate in selected_text for candidate in threshold_candidates):
+        return True
     values = [_clean_text(candidate) for candidate in _filter_value_candidates(item)]
     values = [value for value in values if value]
     if not selected_text or not values:
@@ -2972,6 +3090,9 @@ def _parse_row_text(text: str, page_url: str, table_payload: dict[str, Any] | No
     }
     if table_payload.get("raw_table"):
         raw_payload["raw_table"] = table_payload["raw_table"]
+    no_order_permission = _pgy_no_order_permission_hint(text, table_payload)
+    if no_order_permission:
+        raw_payload["order_permission_status"] = no_order_permission
     creator_id_seed = f"pgy:list:{nickname}:{location}"
     creator = {
         **row_metrics,
@@ -2986,6 +3107,8 @@ def _parse_row_text(text: str, page_url: str, table_payload: dict[str, Any] | No
         "persona_tags": "/".join(tags),
         "raw_payload": raw_payload,
     }
+    if no_order_permission:
+        creator["order_permission_status"] = no_order_permission
     for key, value in table_payload.items():
         if key == "raw_table":
             continue
@@ -3068,6 +3191,8 @@ def _extract_detail_fields(text: str, url: str) -> dict[str, Any]:
     if "笔记主页" in lines:
         index = lines.index("笔记主页")
         nickname = lines[index + 2] if index + 2 < len(lines) and lines[index + 1] == "直播主页" else ""
+        if nickname in {"", "小红书号：", "小红书号", "数据概览", "笔记数据", "粉丝分析"}:
+            nickname = ""
     xhs_id = after("小红书号：")
     pgy_blogger_id = ""
     blogger_match = re.search(r"/blogger-detail/([^?/#]+)", url)
@@ -3175,13 +3300,18 @@ def _extract_detail_fields(text: str, url: str) -> dict[str, Any]:
         "read_fans_ratio": after("阅读粉丝占比"),
         "interaction_fans_ratio": after("互动粉丝占比"),
     }
+    no_order_permission = _pgy_no_order_permission_hint(text)
+    if no_order_permission:
+        raw_detail["order_permission_status"] = no_order_permission
     result = {
         "pgy_url": url,
-        "profile_url": url,
+        "profile_url": f"https://www.xiaohongshu.com/user/profile/{pgy_blogger_id}" if pgy_blogger_id else "",
         "xiaohongshu_id": xhs_id,
         "pgy_blogger_id": pgy_blogger_id,
         "raw_payload": raw_detail,
     }
+    if no_order_permission:
+        result["order_permission_status"] = no_order_permission
     if nickname:
         result["nickname"] = nickname
     if followers is not None:
@@ -3257,7 +3387,7 @@ def _extract_row_link_fields(row: Any) -> dict[str, Any]:
         pgy_url = next((url for url in urls if "/blogger-detail/" in url), "")
     if not pgy_url:
         return {}
-    return _detail_url_fields(pgy_url, source="row_dom") or {"pgy_url": pgy_url, "profile_url": pgy_url}
+    return _detail_url_fields(pgy_url, source="row_dom") or {"pgy_url": pgy_url}
 
 
 def _detail_url_fields(url: str, source: str = "") -> dict[str, Any]:
@@ -3270,7 +3400,7 @@ def _detail_url_fields(url: str, source: str = "") -> dict[str, Any]:
     canonical_url = f"https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/{blogger_id}"
     return {
         "pgy_url": canonical_url,
-        "profile_url": canonical_url,
+        "profile_url": f"https://www.xiaohongshu.com/user/profile/{blogger_id}",
         "pgy_blogger_id": blogger_id,
         "pgy_url_source": source,
     }
@@ -3326,18 +3456,27 @@ def _creator_from_api_kol(kol: dict[str, Any], page_number: int = 0, row_index: 
     user_id = str(_kol_nested_value(kol, "userId", "user_id", "bloggerId", "blogger_id", "kolId", "kol_id") or "").strip()
     nickname = str(_kol_nested_value(kol, "name", "nickName", "nickname") or "").strip()
     creator_id = f"pgy-api:{user_id}" if user_id else f"pgy-api:{_kol_api_key(kol)}"
+    raw_payload = {
+        "list_api_kol": kol,
+        "collection_source": "list_api",
+        "collection_page": page_number,
+        "collection_row_index": row_index,
+    }
+    no_order_permission = _pgy_no_order_permission_hint(kol)
+    if no_order_permission:
+        raw_payload["order_permission_status"] = no_order_permission
+    recent_note_briefs = _recent_note_briefs_from_kol(kol, max_notes=2)
+    if recent_note_briefs:
+        raw_payload["recent_note_briefs"] = recent_note_briefs
     creator: dict[str, Any] = {
         "creator_id": creator_id,
         "source": "pgy",
         "nickname": nickname,
         "ip_city": str(_kol_nested_value(kol, "location", "city") or "").strip(),
-        "raw_payload": {
-            "list_api_kol": kol,
-            "collection_source": "list_api",
-            "collection_page": page_number,
-            "collection_row_index": row_index,
-        },
+        "raw_payload": raw_payload,
     }
+    if no_order_permission:
+        creator["order_permission_status"] = no_order_permission
     if user_id:
         creator.update(_detail_url_fields(f"https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/{user_id}", source="list_api"))
     red_id = _kol_nested_value(kol, "redId", "red_id", "xiaohongshuId", "xiaohongshu_id")
@@ -3449,8 +3588,151 @@ def _reset_kol_response_capture_state(page: Any) -> None:
     setattr(page, "_pgy_latest_kol_request", {})
 
 
+def _kol_request_from_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {}
+    request = snapshot.get("request") if isinstance(snapshot.get("request"), dict) else snapshot
+    url = str(request.get("url") or "").strip()
+    if not url or "/api/solar/cooperator/blogger/v2" not in url:
+        return {}
+    return {
+        "url": url,
+        "method": str(request.get("method") or "GET").upper(),
+        "post_data": str(request.get("post_data") or request.get("body") or ""),
+    }
+
+
+def _current_kol_request_snapshot(page: Any) -> dict[str, Any]:
+    request = _kol_request_from_snapshot(getattr(page, "_pgy_latest_kol_request", {}) or {})
+    latest = getattr(page, "_pgy_latest_api_kols", []) or []
+    pool = getattr(page, "_pgy_api_kol_pool", []) or []
+    if not request:
+        return {}
+    return {
+        "request": request,
+        "latest_count": len(latest) if isinstance(latest, list) else 0,
+        "pool_count": len(pool) if isinstance(pool, list) else 0,
+        "captured_at": _now_text(),
+    }
+
+
+def _restore_kol_request_snapshot(page: Any, snapshot: dict[str, Any] | None, *, clear_pool: bool = True) -> bool:
+    request = _kol_request_from_snapshot(snapshot)
+    if not request:
+        return False
+    if clear_pool:
+        setattr(page, "_pgy_latest_api_kols", [])
+        setattr(page, "_pgy_api_kol_pool", [])
+        setattr(page, "_pgy_api_kol_keys", set())
+    setattr(page, "_pgy_latest_kol_request", request)
+    return True
+
+
+def _read_kol_api_template() -> dict[str, Any]:
+    try:
+        if not PGY_KOL_API_TEMPLATE_PATH.exists():
+            return {}
+        with PGY_KOL_API_TEMPLATE_PATH.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    request = _kol_request_from_snapshot(payload)
+    if not request:
+        return {}
+    return {
+        "request": request,
+        "saved_at": payload.get("saved_at") or "",
+        "source": payload.get("source") or "template",
+    }
+
+
+def _write_kol_api_template(snapshot: dict[str, Any] | None, *, source: str = "capture") -> None:
+    request = _kol_request_from_snapshot(snapshot)
+    if not request:
+        return
+    try:
+        PGY_KOL_API_TEMPLATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with PGY_KOL_API_TEMPLATE_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "request": request,
+                    "source": source,
+                    "saved_at": _now_text(),
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except Exception:
+        pass
+
+
+def _apply_kol_request_source(page: Any, request: dict[str, Any], *, clear_pool: bool = True) -> bool:
+    return _restore_kol_request_snapshot(page, {"request": request}, clear_pool=clear_pool)
+
+
+def _validate_current_kol_request(page: Any, *, page_size: int = 20) -> bool:
+    request = _kol_request_from_snapshot(getattr(page, "_pgy_latest_kol_request", {}) or {})
+    if not request:
+        return False
+    if _fetch_kol_api_page(page, request, 1, page_size):
+        _write_kol_api_template({"request": request}, source="validated")
+        return True
+    return False
+
+
+def _capture_kol_api_from_browser(page: Any, *, timeout_ms: int = 8000) -> bool:
+    try:
+        with page.expect_response(
+            lambda response: "/api/solar/cooperator/blogger/v2" in getattr(response, "url", ""),
+            timeout=timeout_ms,
+        ) as response_info:
+            try:
+                refresh = page.locator("button").filter(has_text=re.compile("查询|搜索|刷新")).first
+                if refresh.count():
+                    refresh.click(timeout=1500)
+                else:
+                    page.evaluate("window.dispatchEvent(new Event('scroll'))")
+            except Exception:
+                page.evaluate("window.dispatchEvent(new Event('scroll'))")
+        response = response_info.value
+        try:
+            request = response.request
+            captured = {
+                "url": getattr(response, "url", ""),
+                "method": getattr(request, "method", "GET"),
+                "post_data": getattr(request, "post_data", "") or "",
+            }
+        except Exception:
+            captured = {}
+        if not _apply_kol_request_source(page, captured, clear_pool=True):
+            return False
+        return _validate_current_kol_request(page)
+    except Exception:
+        return False
+
+
+def _restore_kol_request_from_template(page: Any) -> bool:
+    template = _read_kol_api_template()
+    request = _kol_request_from_snapshot(template)
+    if not request:
+        return False
+    if not _apply_kol_request_source(page, request, clear_pool=True):
+        return False
+    return _validate_current_kol_request(page)
+
+
+def _emit_collection_progress(callback: Any, payload: dict[str, Any]) -> None:
+    if not callable(callback):
+        return
+    try:
+        callback(payload)
+    except Exception:
+        pass
+
+
 def _prime_kol_api_capture(page: Any, reload_if_empty: bool = True) -> bool:
-    for _ in range(6):
+    for _ in range(10):
         kols = getattr(page, "_pgy_latest_api_kols", []) or []
         if isinstance(kols, list) and kols:
             return True
@@ -3458,10 +3740,22 @@ def _prime_kol_api_capture(page: Any, reload_if_empty: bool = True) -> bool:
     if not reload_if_empty:
         return False
     try:
-        page.reload(wait_until="domcontentloaded", timeout=30000)
+        try:
+            with page.expect_response(
+                lambda response: "/api/solar/cooperator/blogger/v2" in getattr(response, "url", ""),
+                timeout=12000,
+            ):
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            page.reload(wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(2500)
     except Exception:
         return False
+    for _ in range(10):
+        kols = getattr(page, "_pgy_latest_api_kols", []) or []
+        if isinstance(kols, list) and kols:
+            return True
+        page.wait_for_timeout(400)
     kols = getattr(page, "_pgy_latest_api_kols", []) or []
     return isinstance(kols, list) and bool(kols)
 
@@ -3558,7 +3852,7 @@ def _append_expanded_api_creators(page: Any, creators: list[dict[str, Any]], see
     return _append_api_creators(page, creators, seen, limit)
 
 
-def _expand_kol_api_pool(page: Any, limit: int) -> int:
+def _expand_kol_api_pool(page: Any, limit: int, progress_callback: Any = None, mode: str = "api") -> int:
     request_info = getattr(page, "_pgy_latest_kol_request", {}) or {}
     if not isinstance(request_info, dict) or not request_info.get("url"):
         return 0
@@ -3568,7 +3862,8 @@ def _expand_kol_api_pool(page: Any, limit: int) -> int:
     max_pages = max(2, min(80, int((max(limit, before) / page_size) + 6)))
     idle_rounds = 0
     for page_number in range(2, max_pages + 1):
-        if len(getattr(page, "_pgy_api_kol_pool", []) or []) >= limit:
+        current_count = len(getattr(page, "_pgy_api_kol_pool", []) or [])
+        if current_count >= limit:
             break
         pool_before = len(getattr(page, "_pgy_api_kol_pool", []) or [])
         kols = _fetch_kol_api_page(page, request_info, page_number, page_size)
@@ -3577,6 +3872,18 @@ def _expand_kol_api_pool(page: Any, limit: int) -> int:
             idle_rounds += 1
         else:
             idle_rounds = 0
+        if page_number == 2 or pool_after >= limit or page_number % 5 == 0 or idle_rounds:
+            _emit_collection_progress(
+                progress_callback,
+                {
+                    "mode": mode,
+                    "page_number": page_number,
+                    "collected_count": min(pool_after, limit),
+                    "limit": limit,
+                    "page_size": page_size,
+                    "idle_rounds": idle_rounds,
+                },
+            )
         if idle_rounds >= 2:
             break
         page.wait_for_timeout(250)
@@ -3608,6 +3915,39 @@ def _append_api_creators(
         creators.append(creator)
         added += 1
     return added
+
+
+def _collect_creators_from_api_pool(
+    page: Any,
+    limit: int,
+    *,
+    progress_callback: Any = None,
+    mode: str = "api",
+) -> list[dict[str, Any]]:
+    request_info = getattr(page, "_pgy_latest_kol_request", {}) or {}
+    if not isinstance(request_info, dict) or not request_info.get("url"):
+        return []
+    creators: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    before = len(getattr(page, "_pgy_api_kol_pool", []) or [])
+    if before == 0:
+        first_page = _fetch_kol_api_page(page, request_info, 1, 20)
+        before = len(getattr(page, "_pgy_api_kol_pool", []) or [])
+        if first_page:
+            _emit_collection_progress(
+                progress_callback,
+                {"mode": mode, "page_number": 1, "collected_count": min(before, limit), "limit": limit, "page_size": len(first_page)},
+            )
+    _append_api_creators(page, creators, seen, limit)
+    _expand_kol_api_pool(page, limit, progress_callback=progress_callback, mode=mode)
+    _append_api_creators(page, creators, seen, limit)
+    if creators:
+        _write_kol_api_template({"request": request_info}, source=mode)
+        _emit_collection_progress(
+            progress_callback,
+            {"mode": f"{mode}_done", "collected_count": len(creators), "limit": limit},
+        )
+    return creators
 
 
 def _match_api_kol(page: Any, row_index: int, creator: dict[str, Any]) -> dict[str, Any]:
@@ -3656,6 +3996,34 @@ def _api_kol_link_fields(page: Any, row_index: int, creator: dict[str, Any]) -> 
     if avatar not in (None, ""):
         fields["avatar_url"] = str(avatar).strip()
     return fields
+
+
+def _api_pool_matches_current_rows(page: Any) -> bool:
+    kols = getattr(page, "_pgy_latest_api_kols", []) or []
+    if not isinstance(kols, list) or not kols:
+        return False
+    rows = _creator_list_rows(page)
+    try:
+        count = min(rows.count(), len(kols), 5)
+    except Exception:
+        return False
+    if count <= 0:
+        return False
+    checked = 0
+    matched = 0
+    for index in range(count):
+        try:
+            creator = _parse_row_text(rows.nth(index).inner_text(timeout=1200), page.url)
+        except Exception:
+            continue
+        nickname = _clean_text(str((creator or {}).get("nickname") or ""))
+        kol_name = _clean_text(str(_kol_nested_value(kols[index], "name", "nickName", "nickname") or ""))
+        if not nickname or not kol_name:
+            continue
+        checked += 1
+        if nickname == kol_name:
+            matched += 1
+    return bool(checked and matched == checked)
 
 
 def _recent_note_type_label(value: Any) -> str:
@@ -4933,7 +5301,7 @@ def _collect_first_detail_for_creator(context: Any, row: Any, detail_url: str = 
         _install_detail_api_capture(detail_page)
         _install_detail_notes_capture(detail_page)
         detail_page.wait_for_load_state("domcontentloaded", timeout=10000)
-        detail_page.wait_for_timeout(3500)
+        _wait_for_detail_ready(detail_page)
         text = detail_page.locator("body").inner_text(timeout=5000)
         detail = _extract_detail_fields(text, detail_page.url)
         detail = {**_detail_url_fields(detail_page.url, source="detail_page"), **detail}
@@ -4960,9 +5328,10 @@ def _collect_detail_by_url(context: Any, url: str) -> dict[str, Any]:
         _install_detail_api_capture(detail_page)
         _install_detail_notes_capture(detail_page)
         detail_page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        detail_page.wait_for_timeout(3500)
+        _wait_for_detail_ready(detail_page)
         text = detail_page.locator("body").inner_text(timeout=5000)
         detail = _extract_detail_fields(text, detail_page.url)
+        detail = {**_detail_url_fields(detail_page.url, source="detail_url"), **detail}
         detail = _detail_from_api_cache(detail_page, detail)
         detail = _merge_recent_notes_into_detail(detail, detail_page)
         detail = _merge_detail_payload(detail, _collect_audience_profile_chart_metrics(detail_page))
@@ -4976,6 +5345,142 @@ def _collect_detail_by_url(context: Any, url: str) -> dict[str, Any]:
             detail_page.close()
         except Exception:
             pass
+
+
+def _detail_ready_from_cache(page: Any) -> bool:
+    cache = _detail_api_cache(page)
+    if not cache:
+        return False
+    has_profile = isinstance(cache.get("blogger_profile"), dict) and bool(cache.get("blogger_profile"))
+    has_fans = isinstance(cache.get("fans_summary"), dict) and bool(cache.get("fans_summary"))
+    has_notes = False
+    notes_detail = cache.get("notes_detail")
+    if isinstance(notes_detail, dict):
+        has_notes = any(
+            isinstance(page_map, dict) and any(isinstance(payload, dict) and payload for payload in page_map.values())
+            for page_map in notes_detail.values()
+        )
+    data_summary = cache.get("data_summary")
+    has_summary = isinstance(data_summary, dict) and any(isinstance(item, dict) and item for item in data_summary.values())
+    if has_profile and (has_notes or has_summary or has_fans):
+        return True
+    return False
+
+
+def _detail_ready_from_dom(page: Any) -> bool:
+    try:
+        return bool(
+            page.locator("body").evaluate(
+                """
+                body => {
+                  const text = body?.innerText || '';
+                  const lines = text.split('\\n').map(item => item.trim()).filter(Boolean);
+                  const index = lines.indexOf('笔记主页');
+                  const nickname = index >= 0 && lines[index + 1] === '直播主页' ? lines[index + 2] : '';
+                  const hasNickname = Boolean(nickname)
+                    && !['小红书号：', '小红书号', '数据概览', '笔记数据', '粉丝分析'].includes(nickname);
+                  return hasNickname
+                    && text.includes('小红书号：')
+                    && text.includes('粉丝数')
+                    && (text.includes('数据概览') || text.includes('笔记数据') || text.includes('粉丝分析'));
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _wait_for_detail_ready(page: Any, timeout_ms: int = 4500) -> None:
+    deadline = time.perf_counter() + max(0.5, timeout_ms / 1000)
+    while time.perf_counter() < deadline:
+        has_notes = bool(getattr(page, "_pgy_latest_detail_notes", []) or [])
+        cache = _detail_api_cache(page)
+        notes_cache = cache.get("notes_detail") if isinstance(cache.get("notes_detail"), dict) else {}
+        if isinstance(notes_cache, dict) and notes_cache:
+            has_notes = True
+        if (_detail_ready_from_cache(page) or _detail_ready_from_dom(page)) and has_notes:
+            page.wait_for_timeout(350)
+            return
+        page.wait_for_timeout(250)
+    page.wait_for_timeout(500)
+
+
+def _target_detail_url(target: dict[str, Any]) -> str:
+    url = str(target.get("pgy_url") or target.get("profile_url") or "").strip()
+    return url if "/blogger-detail/" in url else ""
+
+
+def _blogger_id_from_detail_url(url: str) -> str:
+    match = re.search(r"/blogger-detail/([^?/#]+)", str(url or ""))
+    return match.group(1) if match else ""
+
+
+def _detail_payload_matches_target(target: dict[str, Any], detail: dict[str, Any], url: str) -> bool:
+    expected = str(target.get("pgy_blogger_id") or _blogger_id_from_detail_url(url) or "").strip()
+    actual = str(detail.get("pgy_blogger_id") or "").strip()
+    if expected and actual and expected != actual:
+        return False
+    summary = detail.get("detail_collection_summary") if isinstance(detail.get("detail_collection_summary"), dict) else {}
+    if summary and int(summary.get("module_count") or 0) <= 1:
+        return False
+    return bool(
+        detail.get("nickname")
+        or detail.get("followers_count") is not None
+        or int(summary.get("module_count") or 0) >= 3
+    )
+
+
+def _collect_detail_target_by_url(target: dict[str, Any]) -> dict[str, Any]:
+    creator_id = str(target.get("creator_id") or "")
+    url = _target_detail_url(target)
+    item_started_at = _now_text()
+    item_started_perf = time.perf_counter()
+    if not url:
+        return {
+            "ok": False,
+            "creator_id": creator_id,
+            "nickname": target.get("nickname"),
+            "message": "本地没有可打开的详情页链接",
+            "detail_collection_timing": _elapsed_timing(item_started_at, item_started_perf),
+        }
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {
+            "ok": False,
+            "creator_id": creator_id,
+            "nickname": target.get("nickname"),
+            "message": "当前环境未安装 Playwright，无法执行真实页面采集",
+            "detail_collection_timing": _elapsed_timing(item_started_at, item_started_perf),
+        }
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            detail = _collect_detail_by_url(context, url)
+        item_timing = _elapsed_timing(item_started_at, item_started_perf)
+        if detail and _detail_payload_matches_target(target, detail, url):
+            return {
+                "ok": True,
+                "creator": {**target, **detail, "creator_id": creator_id},
+                "detail_collection_timing": item_timing,
+            }
+        return {
+            "ok": False,
+            "creator_id": creator_id,
+            "nickname": target.get("nickname"),
+            "message": "详情页解析失败",
+            "detail_collection_timing": item_timing,
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "creator_id": creator_id,
+            "nickname": target.get("nickname"),
+            "message": f"详情页解析失败：{str(error)[:180]}",
+            "detail_collection_timing": _elapsed_timing(item_started_at, item_started_perf),
+        }
 
 
 def _creator_list_rows(page: Any) -> Any:
@@ -5286,13 +5791,44 @@ def _extract_visible_creators(
     include_details: bool = False,
     collect_profile_urls: bool = True,
     detail_limit: int | None = None,
+    api_first: bool = True,
+    progress_callback: Any = None,
 ) -> list[dict[str, Any]]:
+    if api_first:
+        for mode, prepare in [
+            ("api_snapshot", lambda: bool(_kol_request_from_snapshot(getattr(page, "_pgy_latest_kol_request", {}) or {}))),
+            ("api_browser_capture", lambda: _capture_kol_api_from_browser(page)),
+            ("api_template", lambda: _restore_kol_request_from_template(page)),
+        ]:
+            _emit_collection_progress(
+                progress_callback,
+                {"mode": f"{mode}_start", "collected_count": 0, "limit": limit},
+            )
+            if not prepare():
+                _emit_collection_progress(
+                    progress_callback,
+                    {"mode": f"{mode}_failed", "collected_count": 0, "limit": limit},
+                )
+                continue
+            api_creators = _collect_creators_from_api_pool(page, limit, progress_callback=progress_callback, mode=mode)
+            if api_creators:
+                return api_creators
+            _emit_collection_progress(
+                progress_callback,
+                {"mode": f"{mode}_failed", "collected_count": 0, "limit": limit},
+            )
+        _emit_collection_progress(
+            progress_callback,
+            {"mode": "dom_fallback", "collected_count": 0, "limit": limit},
+        )
     creators: list[dict[str, Any]] = []
     seen: set[str] = set()
     page_number = 1
     idle_rounds = 0
     max_rounds = max(4, min(120, (limit // 20) + 8))
-    _append_api_creators(page, creators, seen, limit)
+    api_matches_rows = _api_pool_matches_current_rows(page)
+    if api_matches_rows:
+        _append_api_creators(page, creators, seen, limit)
     for _ in range(max_rounds):
         before_count = len(creators)
         _extract_current_creator_page(
@@ -5305,11 +5841,12 @@ def _extract_visible_creators(
             detail_limit=detail_limit,
             page_number=page_number,
         )
-        _append_api_creators(page, creators, seen, limit)
+        if api_matches_rows:
+            _append_api_creators(page, creators, seen, limit)
         if len(creators) >= limit:
             break
         added = len(creators) - before_count
-        api_appended = _append_expanded_api_creators(page, creators, seen, limit)
+        api_appended = _append_expanded_api_creators(page, creators, seen, limit) if api_matches_rows else 0
         if api_appended:
             idle_rounds = 0
             if len(creators) >= limit:
@@ -5321,24 +5858,40 @@ def _extract_visible_creators(
             if _wait_for_creator_table_change(page, before_signature, timeout_ms=12000):
                 page_number += 1
                 idle_rounds = 0
-                _append_api_creators(page, creators, seen, limit)
+                _emit_collection_progress(
+                    progress_callback,
+                    {"mode": "dom", "page_number": page_number, "collected_count": len(creators), "limit": limit},
+                )
+                api_matches_rows = _api_pool_matches_current_rows(page)
+                if api_matches_rows:
+                    _append_api_creators(page, creators, seen, limit)
                 continue
             page.wait_for_timeout(2500)
             if _has_valid_creator_rows(page) and _creator_table_signature(page) != before_signature:
                 page_number += 1
                 idle_rounds = 0
-                _append_api_creators(page, creators, seen, limit)
+                _emit_collection_progress(
+                    progress_callback,
+                    {"mode": "dom", "page_number": page_number, "collected_count": len(creators), "limit": limit},
+                )
+                api_matches_rows = _api_pool_matches_current_rows(page)
+                if api_matches_rows:
+                    _append_api_creators(page, creators, seen, limit)
                 continue
             if added > 0:
                 page_number += 1
                 idle_rounds = 0
+                _emit_collection_progress(
+                    progress_callback,
+                    {"mode": "dom_no_change", "page_number": page_number, "collected_count": len(creators), "limit": limit},
+                )
                 continue
         if _scroll_creator_list(page):
             page.wait_for_timeout(1000)
             if _creator_table_signature(page) != before_signature:
                 idle_rounds = 0
                 continue
-        api_added = _append_expanded_api_creators(page, creators, seen, limit)
+        api_added = _append_expanded_api_creators(page, creators, seen, limit) if api_matches_rows else 0
         if api_added:
             idle_rounds = 0
             if len(creators) >= limit:
@@ -5347,6 +5900,11 @@ def _extract_visible_creators(
         idle_rounds = idle_rounds + 1 if added == 0 else 0
         if idle_rounds >= 2 or added == 0:
             break
+    if creators:
+        _emit_collection_progress(
+            progress_callback,
+            {"mode": "dom_done", "page_number": page_number, "collected_count": len(creators), "limit": limit},
+        )
     return creators
 
 
@@ -6733,7 +7291,14 @@ def start_browser() -> dict[str, Any]:
 
 
 def _select_pgy_list_page(context: Any, *, require_existing: bool = False) -> Any:
-    pages = context.pages
+    pages = []
+    for page in context.pages:
+        try:
+            if page.is_closed():
+                continue
+        except Exception:
+            continue
+        pages.append(page)
     list_page = next((item for item in pages if "/solar/pre-trade/note/kol" in (item.url or "")), None)
     if list_page is not None:
         try:
@@ -6752,6 +7317,37 @@ def _select_pgy_list_page(context: Any, *, require_existing: bool = False) -> An
     return page
 
 
+def _is_recoverable_page_error(error: Any) -> bool:
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in [
+            "target closed",
+            "page closed",
+            "browser closed",
+            "context closed",
+            "crash",
+            "crashed",
+            "net::err_aborted",
+            "execution context was destroyed",
+        ]
+    )
+
+
+def _ensure_pgy_page_alive(context: Any, page: Any, *, preserve_existing_filters: bool = False) -> Any:
+    try:
+        if page is not None and not page.is_closed():
+            return page
+    except Exception:
+        pass
+    if preserve_existing_filters:
+        return None
+    page = context.new_page()
+    page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(1500)
+    return page
+
+
 def collect_visible_list(
     brief: str = "",
     screening_plan: dict[str, Any] | None = None,
@@ -6762,6 +7358,9 @@ def collect_visible_list(
     export_metrics: bool = True,
     reset_filters: bool = False,
     preflight_only: bool = False,
+    kol_request_snapshot: dict[str, Any] | None = None,
+    progress_callback: Any = None,
+    _recovery_attempt: int = 0,
 ) -> dict[str, Any]:
     if not browser_status()["connected"]:
         return {"ok": False, "message": "未连接 Chrome 调试端口"}
@@ -6776,6 +7375,7 @@ def collect_visible_list(
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             preserve_existing_filters = bool(not apply_filters and not reset_filters)
             page = _select_pgy_list_page(context, require_existing=preserve_existing_filters)
+            page = _ensure_pgy_page_alive(context, page, preserve_existing_filters=preserve_existing_filters)
             if page is None:
                 return {
                     "ok": False,
@@ -6785,6 +7385,11 @@ def collect_visible_list(
             _install_kol_response_capture(page)
             if not preserve_existing_filters:
                 _reset_kol_response_capture_state(page)
+            restored_kol_snapshot = _restore_kol_request_snapshot(
+                page,
+                kol_request_snapshot,
+                clear_pool=True,
+            )
             if (
                 "pgy.xiaohongshu.com" not in page.url
                 or "/solar/pre-trade/note/kol" not in page.url
@@ -6815,19 +7420,21 @@ def collect_visible_list(
                 preserve_existing_filters=preserve_existing_filters,
                 preflight_only=preflight_only,
             )
-            _prime_kol_api_capture(page, reload_if_empty=allow_api_reload)
+            _prime_kol_api_capture(page, reload_if_empty=allow_api_reload and not restored_kol_snapshot)
             if (collect_profile_urls or include_details) and not getattr(page, "_pgy_latest_api_kols", []):
-                _prime_kol_api_capture(page, reload_if_empty=allow_api_reload)
+                _prime_kol_api_capture(page, reload_if_empty=allow_api_reload and not restored_kol_snapshot)
             active_plan = plan
             collection_state = _read_visible_collection_state(page)
             if apply_filters and collection_state["count"] == 0 and collection_state["empty_hint"]:
                 active_plan, plan_result, collection_state = _apply_relaxed_plan_after_empty_result(page, plan, plan_result)
             recommendation_count = _extract_recommendation_count(page)
+            request_snapshot = _current_kol_request_snapshot(page)
             if preflight_only:
                 return {
                     "ok": True,
                     "current_url": page.url,
                     "collection_plan": active_plan,
+                    "kol_request_snapshot": request_snapshot,
                     **plan_result,
                     **recommendation_count,
                     "detail_collection": "preflight_only",
@@ -6850,6 +7457,7 @@ def collect_visible_list(
                     "current_url": page.url,
                     "collection_plan": active_plan,
                     "export_result": export_result,
+                    "kol_request_snapshot": request_snapshot,
                     **plan_result,
                     **recommendation_count,
                 }
@@ -6860,6 +7468,8 @@ def collect_visible_list(
                 include_details=include_details,
                 collect_profile_urls=collect_profile_urls,
                 detail_limit=collect_limit if include_details else 0,
+                api_first=not include_details,
+                progress_callback=progress_callback,
             )
             if not creators:
                 return {
@@ -6868,6 +7478,7 @@ def collect_visible_list(
                     "current_url": page.url,
                     "collection_plan": active_plan,
                     "export_result": export_result,
+                    "kol_request_snapshot": request_snapshot,
                     **plan_result,
                     **recommendation_count,
                 }
@@ -6878,14 +7489,30 @@ def collect_visible_list(
                 "collection_plan": active_plan,
                 "detail_collection": "planned" if include_details else "skipped",
                 "export_result": export_result,
+                "kol_request_snapshot": request_snapshot,
                 **recommendation_count,
                 **plan_result,
             }
     except Exception as error:
+        if _is_recoverable_page_error(error) and _recovery_attempt < 1 and not (not apply_filters and not reset_filters):
+            return collect_visible_list(
+                brief=brief,
+                screening_plan=screening_plan,
+                apply_filters=apply_filters,
+                limit=limit,
+                include_details=include_details,
+                collect_profile_urls=collect_profile_urls,
+                export_metrics=export_metrics,
+                reset_filters=True,
+                preflight_only=preflight_only,
+                kol_request_snapshot=kol_request_snapshot,
+                progress_callback=progress_callback,
+                _recovery_attempt=_recovery_attempt + 1,
+            )
         return {"ok": False, "message": f"蒲公英采集失败：{error}"}
 
 
-def collect_details_for_targets(targets: list[dict[str, Any]], limit: int = 20) -> dict[str, Any]:
+def collect_details_for_targets(targets: list[dict[str, Any]], limit: int = 500, progress_callback: Any = None) -> dict[str, Any]:
     if not targets:
         return {"ok": False, "message": "没有可补全详情页的初筛通过达人", "creators": []}
     if not browser_status()["connected"]:
@@ -6895,7 +7522,7 @@ def collect_details_for_targets(targets: list[dict[str, Any]], limit: int = 20) 
     except ImportError:
         return {"ok": False, "message": "当前环境未安装 Playwright，无法执行真实页面采集"}
 
-    target_limit = max(1, min(limit, 100))
+    target_limit = max(1, min(limit, 500))
     pending = targets[:target_limit]
     by_nickname = {str(item.get("nickname") or "").strip(): item for item in pending if item.get("nickname")}
     completed: list[dict[str, Any]] = []
@@ -6925,88 +7552,127 @@ def collect_details_for_targets(targets: list[dict[str, Any]], limit: int = 20) 
             "average_duration_text": _duration_text(average_seconds) if average_seconds else "",
         }
 
+    def emit_progress(stage: str, current: dict[str, Any] | None = None) -> None:
+        if not progress_callback:
+            return
+        try:
+            progress_callback(
+                {
+                    "stage": stage,
+                    "total_count": len(pending),
+                    "completed_count": len(completed),
+                    "failed_count": len(failed),
+                    "current_creator_id": (current or {}).get("creator_id") or "",
+                    "current_nickname": (current or {}).get("nickname") or "",
+                }
+            )
+        except Exception:
+            pass
+
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
-            context = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = _select_pgy_list_page(context)
-            if "pgy.xiaohongshu.com" not in page.url:
-                page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
-            _install_kol_response_capture(page)
-            _reset_kol_response_capture_state(page)
-            page.wait_for_timeout(1000)
-            _prime_kol_api_capture(page, reload_if_empty=True)
-            rows = page.locator(".blogger-list_list .d-new-table tbody tr").filter(has_not=page.locator(".skeleton-block"))
-            try:
-                row_count = min(rows.count(), 300)
-            except Exception:
-                row_count = 0
-            matched_ids: set[str] = set()
-            for index in range(row_count):
-                row = rows.nth(index)
-                creator = _parse_row_text(row.inner_text(timeout=2500), page.url)
-                if not creator:
-                    continue
-                target = by_nickname.get(str(creator.get("nickname") or "").strip())
-                if not target:
-                    continue
-                api_kol = _match_api_kol(page, index, creator)
-                api_recent_note_briefs = _recent_note_briefs_from_kol(api_kol, max_notes=2) if api_kol else []
-                api_recent_notes = _collect_recent_note_details_from_api(page, api_kol, max_notes=2) if api_kol else []
-                link_fields = _extract_row_link_fields(row) or _api_kol_link_fields(page, index, creator)
-                detail_url = str(
-                    target.get("pgy_url")
-                    or target.get("profile_url")
-                    or link_fields.get("pgy_url")
-                    or link_fields.get("profile_url")
-                    or ""
-                )
-                item_started_at = _now_text()
-                item_started_perf = time.perf_counter()
-                detail = _collect_first_detail_for_creator(context, row, detail_url)
-                item_timing = _elapsed_timing(item_started_at, item_started_perf)
-                if detail:
-                    merged = {**target, **link_fields, **detail, "creator_id": target.get("creator_id")}
-                    raw_payload = merged.get("raw_payload") if isinstance(merged.get("raw_payload"), dict) else {}
-                    if api_recent_note_briefs:
-                        raw_payload["recent_note_briefs"] = api_recent_note_briefs
-                    if api_recent_notes:
-                        raw_payload["recent_notes"] = api_recent_notes
-                    if raw_payload:
-                        merged["raw_payload"] = raw_payload
-                    attach_timing(merged, item_timing)
-                    completed.append(merged)
-                    matched_ids.add(str(target.get("creator_id")))
+        emit_progress("starting")
+        url_targets = [target for target in pending if _target_detail_url(target)]
+        fallback_targets = [target for target in pending if not _target_detail_url(target)]
+        matched_ids: set[str] = set()
+
+        if url_targets:
+            max_workers = min(PGY_DETAIL_COLLECT_CONCURRENCY, len(url_targets))
+            indexed_results: dict[int, dict[str, Any]] = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(_collect_detail_target_by_url, target): index
+                    for index, target in enumerate(url_targets)
+                }
+                for future in as_completed(future_map):
+                    indexed_results[future_map[future]] = future.result()
+            for index in sorted(indexed_results):
+                result = indexed_results[index]
+                if result.get("ok") and isinstance(result.get("creator"), dict):
+                    creator = attach_timing(result["creator"], result.get("detail_collection_timing") or {})
+                    completed.append(creator)
+                    matched_ids.add(str(creator.get("creator_id") or ""))
+                    emit_progress("collecting", creator)
                 else:
                     failed.append({
-                        "creator_id": target.get("creator_id"),
-                        "nickname": target.get("nickname"),
-                        "message": "详情页打开失败",
-                        "detail_collection_timing": item_timing,
+                        "creator_id": result.get("creator_id"),
+                        "nickname": result.get("nickname"),
+                        "message": result.get("message") or "详情页解析失败",
+                        "detail_collection_timing": result.get("detail_collection_timing"),
                     })
-            for target in pending:
+                    emit_progress("collecting", result)
+
+        if fallback_targets:
+            by_nickname = {
+                str(item.get("nickname") or "").strip(): item
+                for item in fallback_targets
+                if item.get("nickname")
+            }
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = _select_pgy_list_page(context)
+                if "pgy.xiaohongshu.com" not in page.url:
+                    page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
+                _install_kol_response_capture(page)
+                _reset_kol_response_capture_state(page)
+                page.wait_for_timeout(300)
+                _prime_kol_api_capture(page, reload_if_empty=False)
+                rows = page.locator(".blogger-list_list .d-new-table tbody tr").filter(has_not=page.locator(".skeleton-block"))
+                try:
+                    row_count = min(rows.count(), 300)
+                except Exception:
+                    row_count = 0
+                for index in range(row_count):
+                    row = rows.nth(index)
+                    creator = _parse_row_text(row.inner_text(timeout=2500), page.url)
+                    if not creator:
+                        continue
+                    target = by_nickname.get(str(creator.get("nickname") or "").strip())
+                    if not target:
+                        continue
+                    api_kol = _match_api_kol(page, index, creator)
+                    api_recent_note_briefs = _recent_note_briefs_from_kol(api_kol, max_notes=2) if api_kol else []
+                    api_recent_notes = _collect_recent_note_details_from_api(page, api_kol, max_notes=2) if api_kol else []
+                    link_fields = _extract_row_link_fields(row) or _api_kol_link_fields(page, index, creator)
+                    detail_url = str(link_fields.get("pgy_url") or link_fields.get("profile_url") or "")
+                    item_started_at = _now_text()
+                    item_started_perf = time.perf_counter()
+                    detail = _collect_first_detail_for_creator(context, row, detail_url)
+                    item_timing = _elapsed_timing(item_started_at, item_started_perf)
+                    if detail:
+                        merged = {**target, **link_fields, **detail, "creator_id": target.get("creator_id")}
+                        raw_payload = merged.get("raw_payload") if isinstance(merged.get("raw_payload"), dict) else {}
+                        if api_recent_note_briefs:
+                            raw_payload["recent_note_briefs"] = api_recent_note_briefs
+                        if api_recent_notes:
+                            raw_payload["recent_notes"] = api_recent_notes
+                        if raw_payload:
+                            merged["raw_payload"] = raw_payload
+                        attach_timing(merged, item_timing)
+                        completed.append(merged)
+                        matched_ids.add(str(target.get("creator_id")))
+                        emit_progress("collecting", merged)
+                    else:
+                        failed.append({
+                            "creator_id": target.get("creator_id"),
+                            "nickname": target.get("nickname"),
+                            "message": "详情页打开失败",
+                            "detail_collection_timing": item_timing,
+                        })
+                        emit_progress("collecting", target)
+
+            for target in fallback_targets:
                 creator_id = str(target.get("creator_id") or "")
                 if creator_id in matched_ids:
                     continue
-                url = str(target.get("pgy_url") or target.get("profile_url") or "")
-                if "/blogger-detail/" not in url:
-                    if not any(item.get("creator_id") == creator_id for item in failed):
-                        failed.append({"creator_id": creator_id, "nickname": target.get("nickname"), "message": "当前列表未找到该达人，且本地没有可打开的详情页链接"})
-                    continue
-                item_started_at = _now_text()
-                item_started_perf = time.perf_counter()
-                detail = _collect_detail_by_url(context, url)
-                item_timing = _elapsed_timing(item_started_at, item_started_perf)
-                if detail:
-                    completed.append(attach_timing({**target, **detail, "creator_id": creator_id}, item_timing))
-                else:
-                    failed.append({
-                        "creator_id": creator_id,
-                        "nickname": target.get("nickname"),
-                        "message": "详情页解析失败",
-                        "detail_collection_timing": item_timing,
-                    })
+                failed.append({
+                    "creator_id": creator_id,
+                    "nickname": target.get("nickname"),
+                    "message": "当前列表未找到该达人，且本地没有可打开的详情页链接",
+                })
+                emit_progress("collecting", target)
         payload = finish_payload(True, "")
+        emit_progress("finished")
         payload["message"] = (
             f"详情页补全完成 {len(completed)} 个，失败 {len(failed)} 个"
             f"；总耗时 {payload['duration_text']}"

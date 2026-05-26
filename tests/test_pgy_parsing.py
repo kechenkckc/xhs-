@@ -18,6 +18,9 @@ from rpa_mcp_sync.pgy_browser import (
     _install_kol_response_capture,
     _prime_kol_api_capture,
     _should_reload_for_api_prime,
+    _filter_already_selected,
+    _detail_url_fields,
+    _extract_detail_fields,
 )
 
 
@@ -27,6 +30,28 @@ def test_parse_number_handles_pgy_follower_formats():
     assert parse_number("8.4w") == 84000
     assert parse_number("--") is None
     assert _number_from_text("粉丝数 2.6 万+") == 26000
+
+
+def test_detail_url_fields_builds_xhs_profile_url_from_pgy_blogger_id():
+    fields = _detail_url_fields(
+        "https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/67e3aefa000000000d008d1b?track_id=1",
+        source="pytest",
+    )
+
+    assert fields["pgy_url"] == "https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/67e3aefa000000000d008d1b"
+    assert fields["profile_url"] == "https://www.xiaohongshu.com/user/profile/67e3aefa000000000d008d1b"
+    assert fields["pgy_blogger_id"] == "67e3aefa000000000d008d1b"
+
+
+def test_extract_detail_fields_builds_xhs_profile_url_from_current_pgy_url():
+    detail = _extract_detail_fields(
+        "笔记主页\n直播主页\n听课宝达人\n小红书号：\n95292130186\n北京\n无机构\n教育\n粉丝数\n1234",
+        "https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/67e3aefa000000000d008d1b",
+    )
+
+    assert detail["xiaohongshu_id"] == "95292130186"
+    assert detail["pgy_blogger_id"] == "67e3aefa000000000d008d1b"
+    assert detail["profile_url"] == "https://www.xiaohongshu.com/user/profile/67e3aefa000000000d008d1b"
 
 
 def test_parse_row_text_prefers_table_follower_value_over_position_guess():
@@ -162,6 +187,30 @@ def test_parse_row_text_ignores_shifted_percent_quote_from_table():
     assert creator["followers_count"] == 16000
 
 
+def test_parse_row_text_marks_no_order_permission():
+    creator = _parse_row_text(
+        "\n".join(
+            [
+                "无权限达人",
+                "北京",
+                "教育",
+                "粉丝数",
+                "1.2w",
+                "合作报价",
+                "图文笔记一口价",
+                "无接单权限",
+            ]
+        ),
+        "https://pgy.xiaohongshu.com/solar/pre-trade/note/kol",
+        table_payload={"raw_table": {"全部报价": "无接单权限"}, "pgy_url": "https://pgy.xiaohongshu.com/creator/no-permission"},
+    )
+
+    assert creator is not None
+    assert creator["order_permission_status"] == "无接单权限"
+    assert creator["raw_payload"]["order_permission_status"] == "无接单权限"
+    assert creator.get("quote_price") is None
+
+
 def test_sanitize_creator_type_rejects_detail_metric_text():
     bad_type = "4.8w/获赞与收藏/42.8w/收藏/邀约/合作报价/图文笔记一口价/¥1,151"
     assert sanitize_creator_type(bad_type) == ""
@@ -266,6 +315,56 @@ def test_api_prime_reload_policy_preserves_preflight_and_filtered_collect():
     assert _should_reload_for_api_prime(apply_filters=True, preserve_existing_filters=False, preflight_only=True) is False
     assert _should_reload_for_api_prime(apply_filters=False, preserve_existing_filters=True, preflight_only=False) is False
     assert _should_reload_for_api_prime(apply_filters=False, preserve_existing_filters=False, preflight_only=False) is True
+
+
+def test_selected_filter_text_confirms_all_required_subfields():
+    class FakeLocator:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def inner_text(self, timeout=None):
+            return "\n".join(
+                [
+                    "合作报价：",
+                    "图文笔记：不限-1000",
+                    "视频笔记：不限-1000",
+                    "合作笔记-预估阅读单价：",
+                    "图文笔记阅读单价：不限-3",
+                    "合作笔记-预估互动单价：",
+                    "预估图文互动单价：不限-10",
+                    "日常笔记-曝光中位数：",
+                    "2000-不限",
+                    "重置",
+                    "存为常用筛选",
+                ]
+            )
+
+    class FakePage:
+        def locator(self, selector):
+            return FakeLocator()
+
+    page = FakePage()
+
+    assert _filter_already_selected(
+        page,
+        {"field": "合作报价", "sub_fields": ["图文笔记", "视频笔记"], "max": 1000},
+    )
+    assert not _filter_already_selected(
+        page,
+        {"field": "预估互动单价", "sub_fields": ["图文笔记互动单价", "视频笔记互动单价"], "max": 10},
+    )
+    assert not _filter_already_selected(
+        page,
+        {"field": "预估阅读单价", "sub_fields": ["图文笔记阅读单价", "视频笔记阅读单价"], "max": 3},
+    )
+    assert _filter_already_selected(
+        page,
+        {"field": "曝光中位数", "value": "2000以上", "min": 2000},
+    )
 
 
 def test_recent_note_comments_from_payload_flattens_top_level_and_replies():

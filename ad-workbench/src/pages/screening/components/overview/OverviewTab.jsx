@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   LayoutDashboard, Users, BarChart3, FolderPlus, ScrollText, ExternalLink,
   Filter, CheckCircle2, XCircle, AlertTriangle, Clock, ChevronRight,
@@ -16,19 +16,13 @@ import DataTable from '../../../../components/DataTable';
 import Badge from '../../../../components/Badge';
 import ProgressBar from '../../../../components/ProgressBar';
 import {
-  DEFAULT_SCORING_HARD_FILTER_FIELDS,
-  hardFilterKey,
-  hardFilterLabel,
   pgyFilterLabel,
 } from '../../constants/screeningConstants';
 import { getProjectCreators, getProjectStats } from '../../utils/projectMappers';
 import { getScoreColor, getScoreTier } from '../../utils/creatorScoring';
 import {
-  collectionHardFiltersToPgyFilters,
-  markManualPgyFilters,
   mergeOptionItems,
   pgyFilterKey,
-  syncCollectionHardFiltersFromPgyFilters,
 } from '../../utils/pgyFilters';
 import { getSchemeAdditionalFilters, getSchemeRequiredFilters, normalizeWorkbenchPlan, syncScreeningCriteria } from '../../utils/screeningPlan';
 import { SelectedChips } from '../filters/SelectedChips';
@@ -61,7 +55,7 @@ const batchSchemes = (batch = {}) => {
   return [];
 };
 
-export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, onSavePlan, onTabChange }) {
+export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, onRunningBatch, onRefresh, onSavePlan, onTabChange }) {
   const creators = useMemo(() => getProjectCreators(project), [project]);
   const stats = getProjectStats(project);
   const projectKey = project.id || project.project_id;
@@ -81,12 +75,79 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
   const lastProjectKeyRef = useRef(projectKey);
   const activeBatchIdRef = useRef('');
   const lastLoadedBatchIdRef = useRef('');
+  const pollingTimerRef = useRef(null);
+
+  const stopProgressPolling = useCallback(() => {
+    if (pollingTimerRef.current) {
+      window.clearInterval(pollingTimerRef.current);
+      pollingTimerRef.current = null;
+    }
+  }, []);
+
+  const applyBatchProgress = useCallback((batch, { resume = false } = {}) => {
+    if (!batch?.batch_id) return false;
+    if (activeBatchIdRef.current && batch.batch_id !== activeBatchIdRef.current) {
+      return false;
+    }
+    if (!activeBatchIdRef.current) {
+      activeBatchIdRef.current = batch.batch_id;
+    }
+    setCollectProgress(batch);
+    const schemes = batchSchemes(batch);
+    if (schemes.length) setCollectSchemeResults(schemes);
+    if (batch.status === 'running') {
+      const stageText = batch.progress_message || '采集中';
+      setCollecting(true);
+      setCollectStatus(`${resume ? '已续连后台采集：' : ''}${stageText} · 已采集 ${batch.total_count || 0} · 已进筛选 ${batch.success_count || 0}`);
+      return true;
+    }
+    setCollecting(false);
+    setStoppingCollect(false);
+    activeBatchIdRef.current = '';
+    if (batch.status === 'success') {
+      setCollectStatus(`采集完成，已进入筛选工作台 ${batch.success_count || 0} 个达人`);
+    } else if (batch.status === 'stopped') {
+      setCollectStatus(batch.progress_message || batch.error_message || '采集已停止');
+    } else if (batch.status === 'failed') {
+      setCollectStatus(batch.error_message || batch.progress_message || '采集失败');
+    } else {
+      setCollectStatus(batch.progress_message || batch.status || '采集状态已更新');
+    }
+    return false;
+  }, []);
+
+  const startProgressPolling = useCallback((initialBatchId = '') => {
+    if (!onLatestBatch) return;
+    if (initialBatchId) activeBatchIdRef.current = initialBatchId;
+    stopProgressPolling();
+    const poll = async () => {
+      if (!activeBatchIdRef.current) {
+        stopProgressPolling();
+        return;
+      }
+      try {
+        const batch = await onLatestBatch();
+        if (!batch?.batch_id) return;
+        const stillRunning = applyBatchProgress(batch);
+        if (!stillRunning) {
+          stopProgressPolling();
+          await onRefresh?.();
+        }
+      } catch {
+        // 页面可暂时失去连接，下一轮继续尝试。
+      }
+    };
+    pollingTimerRef.current = window.setInterval(poll, 2000);
+    poll();
+  }, [applyBatchProgress, onLatestBatch, onRefresh, stopProgressPolling]);
 
   useEffect(() => {
     const sameProject = lastProjectKeyRef.current === projectKey;
     if (sameProject && editingPlanRef.current) {
       return;
     }
+    stopProgressPolling();
+    activeBatchIdRef.current = '';
     const nextPlan = normalizeWorkbenchPlan(project.screeningPlan || {});
     const nextSchemes = nextPlan.pgyCollectionPlan?.schemes || [];
     const nextIds = enabledSchemeIdsFor(nextPlan.pgyCollectionPlan || {});
@@ -99,7 +160,9 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
     setSchemeSaveStatus({});
     setPlanStatus('');
     lastLoadedBatchIdRef.current = '';
-  }, [projectKey, project.screeningPlan]);
+  }, [projectKey, project.screeningPlan, stopProgressPolling]);
+
+  useEffect(() => () => stopProgressPolling(), [stopProgressPolling]);
 
   const savedPlan = useMemo(() => normalizeWorkbenchPlan(project.screeningPlan || {}), [project.screeningPlan]);
   const planDirty = JSON.stringify(planDraft) !== JSON.stringify(savedPlan);
@@ -158,16 +221,8 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
     ['需人工判断', collectionResult.needsManual, '风险或低分'],
   ];
 
-  const planSummary = `${selectedSchemeIds.length || schemes.length} 套采集方案 · ${planDraft.collectionHardFilters?.length || 0} 个采集前条件 · ${pgyPlan.display_metrics?.length || 0} 个展示指标`;
+  const planSummary = `${selectedSchemeIds.length || schemes.length} 套采集方案 · ${pgyPlan.display_metrics?.length || 0} 个展示指标`;
   const selectedSchemes = schemes.filter((scheme, index) => selectedSchemeIds.includes(schemeKey(scheme, index)));
-  const activePgyFilters = useMemo(
-    () => mergeOptionItems(
-      collectionHardFiltersToPgyFilters(planDraft.collectionHardFilters || []),
-      pgyPlan.filters || [],
-      pgyFilterKey
-    ),
-    [planDraft.collectionHardFilters, pgyPlan.filters]
-  );
 
   const updatePlanDraft = (updater) => {
     editingPlanRef.current = true;
@@ -202,6 +257,13 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
     const loadLatestBatch = async () => {
       if (!onLatestBatch) return;
       try {
+        const runningBatch = await onRunningBatch?.();
+        if (alive && runningBatch?.batch_id) {
+          lastLoadedBatchIdRef.current = runningBatch.batch_id;
+          applyBatchProgress(runningBatch, { resume: true });
+          startProgressPolling(runningBatch.batch_id);
+          return;
+        }
         const batch = await onLatestBatch();
         if (!alive || !batch?.batch_id || batch.batch_id === lastLoadedBatchIdRef.current) return;
         lastLoadedBatchIdRef.current = batch.batch_id;
@@ -216,20 +278,7 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
     return () => {
       alive = false;
     };
-  }, [onLatestBatch, projectKey]);
-
-  const updatePgyFilters = (filters = []) => {
-    const normalizedFilters = markManualPgyFilters(filters);
-    updatePlanDraft(old => ({
-      ...old,
-      collectionHardFilters: syncCollectionHardFiltersFromPgyFilters(normalizedFilters, old.collectionHardFilters || []),
-      pgyCollectionPlan: {
-        ...(old.pgyCollectionPlan || {}),
-        filters: normalizedFilters,
-        hard_filters: syncCollectionHardFiltersFromPgyFilters(normalizedFilters, old.collectionHardFilters || []),
-      },
-    }));
-  };
+  }, [applyBatchProgress, onLatestBatch, onRunningBatch, projectKey, startProgressPolling]);
 
   const updateWeight = (key, value) => {
     const number = Math.max(0, Number(value || 0));
@@ -349,46 +398,24 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
     setCollectStatus(`正在采集，目标上限 ${collectLimit} 个，已选 ${selectedSchemeIds.length || 1} 套方案...`);
     setCollectProgress({ status: 'running', total_count: 0, success_count: 0, progress_stage: 'starting', progress_message: '正在启动采集任务' });
     setCollectSchemeResults([]);
-    let stopped = false;
-    const pollProgress = async () => {
-      if (stopped || !onLatestBatch) return;
-      try {
-        const batch = await onLatestBatch();
-        if (batch?.batch_id) {
-          if (!activeBatchIdRef.current) {
-            if (batch.status !== 'running') return;
-            activeBatchIdRef.current = batch.batch_id;
-          } else if (batch.batch_id !== activeBatchIdRef.current) {
-            return;
-          }
-          setCollectProgress(batch);
-          const stageText = batch.progress_message || batch.status || '采集中';
-          setCollectStatus(`${stageText} · 已采集 ${batch.total_count || 0} · 已进筛选 ${batch.success_count || 0}`);
-          const schemes = batchSchemes(batch);
-          if (schemes.length) setCollectSchemeResults(schemes);
-          if (batch.status && batch.status !== 'running') {
-            stopped = true;
-            window.clearInterval(progressTimer);
-            setCollecting(false);
-            setStoppingCollect(false);
-          }
-        }
-      } catch {
-        // Ignore transient polling failures; the final collect response still settles the UI.
-      }
-    };
-    const progressTimer = window.setInterval(pollProgress, 2000);
-    pollProgress();
+    let keepPollingAfterStart = false;
+    stopProgressPolling();
     try {
       const result = await onCollect(syncScreeningCriteria(planDraft), {
         limit: collectLimit,
         schemeIds: selectedSchemeIds,
         multiScheme: true,
         preflight: true,
+        asyncCollect: true,
       });
       activeBatchIdRef.current = result?.batch?.batch_id || activeBatchIdRef.current;
-      stopped = true;
-      window.clearInterval(progressTimer);
+      if (result?.accepted) {
+        keepPollingAfterStart = true;
+        setCollectProgress(result.batch || null);
+        setCollectStatus(result.message || '采集已在后台启动，正在刷新进度...');
+        startProgressPolling(activeBatchIdRef.current);
+        return;
+      }
       const schemes = batchSchemes(result);
       if (schemes.length) setCollectSchemeResults(schemes);
       if (result?.ok) {
@@ -403,15 +430,14 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
         setCollectStatus(result?.message || result?.error || '采集未完成');
       }
     } catch (error) {
-      stopped = true;
-      window.clearInterval(progressTimer);
       setCollectStatus(error.message || '采集失败');
     } finally {
-      stopped = true;
-      window.clearInterval(progressTimer);
-      setCollecting(false);
-      setStoppingCollect(false);
-      activeBatchIdRef.current = '';
+      if (!keepPollingAfterStart) {
+        stopProgressPolling();
+        setCollecting(false);
+        setStoppingCollect(false);
+        activeBatchIdRef.current = '';
+      }
     }
   };
 
@@ -651,18 +677,6 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
                   })}
                 </div>
               )}
-              <div className="collection-plan-block">
-                <div className="collection-plan-title-row">
-                  <div>
-                    <div className="collection-plan-title">采集前筛选条件</div>
-                    <div className="collection-plan-subtitle">按蒲公英「找博主」筛选区组织，选中项会写入采集计划。</div>
-                  </div>
-                </div>
-                <PgyFindBloggerFilterPanel
-                  filters={activePgyFilters}
-                  onChange={updatePgyFilters}
-                />
-              </div>
               <div className="collection-plan-actions">
                 <span className={planStatus.includes('失败') ? 'is-error' : ''}>{planStatus || '修改后点击保存，采集会使用当前筛选计划。'}</span>
                 <button className="btn btn-primary" onClick={savePlan} disabled={!planDirty && planStatus.includes('已保存')}>
@@ -681,16 +695,6 @@ export function OverviewTab({ project, onCollect, onStopCollect, onLatestBatch, 
                     emptyText="暂无已勾选方案"
                   />
                   {selectedSchemes.length > 4 && <span className="collection-compact-more">+{selectedSchemes.length - 4}</span>}
-                </div>
-                <div className="collection-plan-compact">
-                  <SelectedChips
-                    items={(planDraft.collectionHardFilters || []).slice(0, 4)}
-                    getKey={hardFilterKey}
-                    getLabel={hardFilterLabel}
-                    onRemove={(item) => setPlanDraft(old => ({ ...old, collectionHardFilters: (old.collectionHardFilters || []).filter(next => hardFilterKey(next) !== hardFilterKey(item)) }))}
-                    emptyText="暂无采集前条件"
-                  />
-                  {(planDraft.collectionHardFilters || []).length > 4 && <span className="collection-compact-more">+{(planDraft.collectionHardFilters || []).length - 4}</span>}
                 </div>
               </div>
               <div className="collection-plan-actions">

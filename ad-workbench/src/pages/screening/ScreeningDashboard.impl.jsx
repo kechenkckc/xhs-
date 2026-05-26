@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
   LayoutDashboard, Users, BarChart3, FolderPlus, ScrollText, FolderOpen, ExternalLink,
@@ -33,7 +33,7 @@ const tabs = [
 ];
 
 function getProjectKey(project = {}) {
-  return project.id || project.project_id;
+  return project?.id || project?.project_id || '';
 }
 
 function tierDistribution(creators = []) {
@@ -168,6 +168,22 @@ function buildDetailResultSummary(result = {}, requestedCount = 0, label = '') {
   };
 }
 
+function detailProgressInfo(task = {}) {
+  const total = Number(task.total_count || 0);
+  const completed = Number(task.completed_count || 0);
+  const failed = Number(task.failed_count || 0);
+  const done = Math.min(total || completed + failed, completed + failed);
+  const ratio = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  return {
+    total,
+    completed,
+    failed,
+    done,
+    ratio,
+    text: total ? `${done}/${total} 达人已完成` : `${done} 位达人已完成`,
+  };
+}
+
 function buildScoreResultSummary(result = {}, refreshedCreators = []) {
   const mappedCreators = (refreshedCreators || []).map(mapBackendCreator);
   const sources = result.sources || {};
@@ -199,6 +215,45 @@ function buildScoreResultSummary(result = {}, refreshedCreators = []) {
   };
 }
 
+function buildWritebackResultSummary(result = {}) {
+  const syncStatus = result.sync_status || {};
+  const selectedTable = result.selected_table || {};
+  const imageResult = result.image_result || {};
+  const target = result.target || {};
+  const ok = result.ok !== false;
+  const writtenCount = result.written_count ?? ((result.result?.created || []).length + (result.result?.updated || []).length);
+  const errors = [
+    !ok ? (result.message || result.error || '写回飞书失败') : '',
+    imageResult?.ok === false ? (imageResult.message || imageResult.error || '粉丝画像图片写入失败') : '',
+  ].filter(Boolean);
+
+  return {
+    type: ok ? 'success' : 'error',
+    title: ok ? '写回飞书完成' : '写回飞书未完成',
+    subtitle: ok ? (result.message || '已结束本次写回') : (result.message || result.error || '请检查飞书权限、字段映射或网络状态后重试'),
+    stats: [
+      ['写回达人', writtenCount ?? 0],
+      ['成功标记', syncStatus.success ?? (ok ? writtenCount ?? 0 : 0)],
+      ['失败', syncStatus.failed ?? (ok ? 0 : 1)],
+      ['目标资源', target.resource_type || '-'],
+      ['目标子表', selectedTable.name || selectedTable.title || selectedTable.sheet_id || selectedTable.table_id || '-'],
+    ],
+    schemes: [
+      {
+        label: '记录写入',
+        value: ok ? '已返回结果' : '未完成',
+        note: result.result?.message || result.error || '',
+      },
+      ...(imageResult.message ? [{
+        label: '粉丝画像图片',
+        value: imageResult.enabled === false ? '未启用' : (imageResult.ok === false ? '失败' : '已处理'),
+        note: imageResult.message,
+      }] : []),
+    ],
+    errors,
+  };
+}
+
 function ResultSummaryModal({ summary, onClose }) {
   if (!summary) return null;
   return (
@@ -206,7 +261,7 @@ function ResultSummaryModal({ summary, onClose }) {
       <div className="modal result-summary-modal" onClick={event => event.stopPropagation()}>
         <div className="modal-header result-summary-header">
           <div>
-            <span className={`result-summary-pill is-${summary.type || 'success'}`}>{summary.type === 'error' ? '需要关注' : '已完成'}</span>
+            <span className={`result-summary-pill is-${summary.type || 'success'}`}>{summary.type === 'error' ? '需要关注' : summary.type === 'progress' ? '进行中' : '已完成'}</span>
             <h3>{summary.title}</h3>
             {summary.subtitle && <p>{summary.subtitle}</p>}
           </div>
@@ -266,6 +321,30 @@ function ResultSummaryModal({ summary, onClose }) {
     </div>
   );
 }
+
+function DetailProgressBanner({ task, onDismiss }) {
+  if (!task) return null;
+  const progress = detailProgressInfo(task);
+  return (
+    <div className="detail-progress-banner">
+      <div className="detail-progress-main">
+        <div>
+          <strong>详情完善中</strong>
+          <span>{task.progress_message || progress.text}</span>
+        </div>
+        <small>{task.current_nickname || task.current_creator_id ? `当前：${task.current_nickname || task.current_creator_id}` : task.progress_stage || 'running'}</small>
+      </div>
+      <div className="detail-progress-track" aria-label={progress.text}>
+        <i style={{ width: `${progress.ratio}%` }} />
+      </div>
+      <div className="detail-progress-meta">
+        <span>{progress.text}</span>
+        <span>成功 {progress.completed} · 失败 {progress.failed}</span>
+      </div>
+      <button className="btn btn-sm btn-ghost" onClick={onDismiss}>收起</button>
+    </div>
+  );
+}
 function patchProject(project = {}, patch = {}) {
   return {
     ...project,
@@ -280,7 +359,7 @@ function patchProject(project = {}, patch = {}) {
   };
 }
 
-export default function ScreeningDashboard() {
+export default function ScreeningDashboard({ selectedProjectId = '', onSelectedProjectIdChange } = {}) {
   const navigate = useNavigate();
   const { tab } = useParams();
   const [activeTab, setActiveTab] = useState(tab || 'projects');
@@ -295,6 +374,11 @@ export default function ScreeningDashboard() {
   const [feishuFields, setFeishuFields] = useState([]);
   const [loadedCreatorProjectIds, setLoadedCreatorProjectIds] = useState({});
   const [resultModal, setResultModal] = useState(null);
+  const [detailProgress, setDetailProgress] = useState(null);
+  const currentProjectIdRef = useRef('');
+  const detailCollectInFlightRef = useRef(new Set());
+  const detailProgressTimerRef = useRef(null);
+  const projectId = currentProject?.id || currentProject?.project_id;
 
   useEffect(() => {
     setActiveTab(tab || 'projects');
@@ -325,26 +409,55 @@ export default function ScreeningDashboard() {
   }, [projectList, projectListLoadFailed, projects]);
 
   useEffect(() => {
-    if (!currentProject && mergedProjects.length > 0) {
-      setCurrentProject(mergedProjects[0]);
-    }
-  }, [currentProject, mergedProjects]);
+    currentProjectIdRef.current = projectId || '';
+  }, [projectId]);
 
-  const selectProject = (project) => {
+  useEffect(() => {
+    if (!mergedProjects.length) return;
+    const currentId = getProjectKey(currentProject);
+    const next = selectedProjectId
+      ? mergedProjects.find(item => getProjectKey(item) === selectedProjectId)
+      : null;
+    if (next && getProjectKey(next) !== currentId) {
+      currentProjectIdRef.current = getProjectKey(next) || '';
+      setCurrentProject(next);
+      return;
+    }
+    if (!currentProject) {
+      const fallback = next || mergedProjects[0];
+      currentProjectIdRef.current = getProjectKey(fallback) || '';
+      setCurrentProject(fallback);
+      onSelectedProjectIdChange?.(getProjectKey(fallback));
+    }
+  }, [currentProject, mergedProjects, onSelectedProjectIdChange, selectedProjectId]);
+
+  const selectProject = (project, options = {}) => {
     setCurrentProject(project);
-    setActiveTab('overview');
-    navigate('/workbench/screening/overview');
+    const nextId = getProjectKey(project);
+    if (nextId) {
+      currentProjectIdRef.current = nextId;
+      onSelectedProjectIdChange?.(nextId);
+      try {
+        window.localStorage.setItem('adflow-selected-screening-project', nextId);
+        window.localStorage.setItem('adflow-selected-project', nextId);
+      } catch {
+        // Project selection still works without local storage.
+      }
+    }
+    if (options.navigateToOverview !== false) {
+      setActiveTab('overview');
+      navigate('/workbench/screening/overview');
+    }
   };
 
   const createProject = (newProject) => {
     setProjects((prev) => [...prev, newProject]);
     setCurrentProject(newProject);
+    onSelectedProjectIdChange?.(getProjectKey(newProject));
     setActiveTab('project-setup');
     setShowCreateModal(false);
     navigate('/workbench/screening/project-setup');
   };
-
-  const projectId = currentProject?.id || currentProject?.project_id;
 
   useEffect(() => {
     if (!projectId) {
@@ -404,15 +517,13 @@ export default function ScreeningDashboard() {
     }
   }, []);
 
-  const refreshProjectData = useCallback(async (options = {}) => {
-    if (!projectId) return { ok: false, error: '未选择项目' };
-    const [projectPayload, creatorsPayload] = await Promise.all([
-      safeApi(`/api/projects/${projectId}`),
-      safeApi(`/api/projects/${projectId}/creators`),
-    ]);
-    const mappedCreators = (creatorsPayload.creators || []).map(mapBackendCreator);
+  const applyProjectPayload = useCallback((projectPayload, mappedCreators, options = {}) => {
+    const payloadProjectId = projectPayload?.project?.project_id;
+    if (payloadProjectId && currentProjectIdRef.current && payloadProjectId !== currentProjectIdRef.current) {
+      return;
+    }
     if (projectPayload?.project) {
-      const mappedProject = mapBackendProject(projectPayload.project, mappedCreators, feishuConfig);
+      const mappedProject = mapBackendProject(projectPayload.project, mappedCreators, feishuConfig, options.creatorStats);
       const nextProject = options.screeningPlan
         ? { ...mappedProject, screeningPlan: options.screeningPlan }
         : mappedProject;
@@ -428,23 +539,97 @@ export default function ScreeningDashboard() {
     } else if (mappedCreators.length) {
       updateCurrentProject({ creators: mappedCreators });
     }
-    setLoadedCreatorProjectIds((prev) => ({ ...prev, [projectId]: true }));
+  }, [feishuConfig, updateCurrentProject]);
+
+  const fetchCreatorsPaged = useCallback(async (targetProjectId, pageSize = 200, onFirstPage, options = {}) => {
+    const firstPayload = await safeApi(`/api/projects/${targetProjectId}/creators?page=1&page_size=${pageSize}`);
+    const firstCreators = firstPayload.creators || [];
+    onFirstPage?.(firstPayload);
+    const total = Number(firstPayload.total || firstCreators.length);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    if (options.firstPageOnly) {
+      return { ...firstPayload, creators: firstCreators, partial: totalPages > 1 };
+    }
+    if (totalPages <= 1) return { ...firstPayload, creators: firstCreators };
+    const restPayloads = await Promise.all(
+      Array.from({ length: totalPages - 1 }, (_, index) => (
+        safeApi(`/api/projects/${targetProjectId}/creators?page=${index + 2}&page_size=${pageSize}`)
+      )),
+    );
+    return {
+      ...firstPayload,
+      creators: [
+        ...firstCreators,
+        ...restPayloads.flatMap(payload => payload.creators || []),
+      ],
+      total,
+      has_more: false,
+    };
+  }, [safeApi]);
+
+  const refreshProjectData = useCallback(async (options = {}) => {
+    if (!projectId) return { ok: false, error: '未选择项目' };
+    const requestedProjectId = projectId;
+    const background = Boolean(options.background);
+    const firstPageOnly = Boolean(options.firstPageOnly);
+    const [projectPayload, statsPayload] = await Promise.all([
+      safeApi(`/api/projects/${requestedProjectId}`),
+      safeApi(`/api/projects/${requestedProjectId}/creators/stats`),
+    ]);
+    const creatorStats = statsPayload?.tiers ? statsPayload : null;
+    if (currentProjectIdRef.current && currentProjectIdRef.current !== requestedProjectId) {
+      return { ok: false, stale: true, project: projectPayload?.project, creators: [] };
+    }
+    let firstPageApplied = false;
+    const creatorsPayload = await fetchCreatorsPaged(requestedProjectId, 500, (firstPayload) => {
+      if (currentProjectIdRef.current && currentProjectIdRef.current !== requestedProjectId) return;
+      firstPageApplied = true;
+      const firstMappedCreators = (firstPayload.creators || []).map(mapBackendCreator);
+      applyProjectPayload(projectPayload, firstMappedCreators, { ...options, creatorStats });
+    }, { firstPageOnly });
+    if (currentProjectIdRef.current && currentProjectIdRef.current !== requestedProjectId) {
+      return { ok: false, stale: true, project: projectPayload?.project, creators: [] };
+    }
+    const mappedCreators = (creatorsPayload.creators || []).map(mapBackendCreator);
+    if (!firstPageOnly && (!firstPageApplied || mappedCreators.length !== (creatorsPayload.creators || []).length || mappedCreators.length > 50)) {
+      applyProjectPayload(projectPayload, mappedCreators, { ...options, creatorStats });
+    }
+    if (!firstPageOnly || !creatorsPayload.partial) {
+      setLoadedCreatorProjectIds((prev) => ({ ...prev, [requestedProjectId]: true }));
+    } else if (!background) {
+      refreshProjectData({ ...options, background: true, firstPageOnly: false });
+    }
     return { ok: true, project: projectPayload?.project, creators: creatorsPayload.creators || [] };
-  }, [feishuConfig, projectId, safeApi, updateCurrentProject]);
+  }, [applyProjectPayload, fetchCreatorsPaged, projectId, safeApi]);
 
   useEffect(() => {
     if (!projectId || currentProject?.creators?.length) return;
     if (loadedCreatorProjectIds[projectId]) return;
-    if (!['overview', 'screening-review', 'creator-audit', 'score-preview'].includes(activeTab)) return;
-    refreshProjectData();
+    if (!['screening-review', 'creator-audit'].includes(activeTab)) return;
+    refreshProjectData({ firstPageOnly: true });
   }, [activeTab, currentProject?.creators?.length, loadedCreatorProjectIds, projectId, refreshProjectData]);
 
   const handleSaveProject = async (payload = {}) => {
     updateCurrentProject(payload);
     if (!projectId) return { ok: false, error: '未选择项目' };
+    const basePlan = payload.screening_plan || currentProject?.screeningPlan || {};
+    const payloadWithMeta = {
+      ...payload,
+      screening_plan: {
+        ...(basePlan || {}),
+        uiProject: {
+          product: payload.product || currentProject?.product || '',
+          poolType: payload.poolType || currentProject?.poolType || '',
+          sharedPoolId: payload.sharedPoolId || currentProject?.sharedPoolId || '',
+          budget: payload.budget ?? currentProject?.budget ?? 0,
+          singleBudget: payload.singleBudget ?? currentProject?.singleBudget ?? '',
+          cooperationType: payload.cooperationType || currentProject?.cooperationType || '',
+        },
+      },
+    };
     const result = await safeApi(`/api/projects/${projectId}`, {
       method: 'POST',
-      body: JSON.stringify(payload),
+      body: JSON.stringify(payloadWithMeta),
     });
     if (result.project) {
       setProjectList((prev) => {
@@ -465,14 +650,33 @@ export default function ScreeningDashboard() {
   };
 
   const handleSaveScreeningPlan = async (screeningPlan, projectPatch = {}) => {
-    const payload = { ...projectPatch, screening_plan: screeningPlan };
+    const payload = {
+      ...projectPatch,
+      screening_plan: {
+        ...(screeningPlan || {}),
+        uiProject: {
+          product: projectPatch.product || currentProject?.product || '',
+          poolType: projectPatch.poolType || currentProject?.poolType || '',
+          sharedPoolId: projectPatch.sharedPoolId || currentProject?.sharedPoolId || '',
+          budget: projectPatch.budget ?? currentProject?.budget ?? 0,
+          singleBudget: projectPatch.singleBudget ?? currentProject?.singleBudget ?? '',
+          cooperationType: projectPatch.cooperationType || currentProject?.cooperationType || '',
+        },
+      },
+    };
     updateCurrentProject(payload);
     return handleSaveProject(payload);
   };
 
   const getLatestCollectBatch = async () => {
     if (!projectId) return {};
-    const payload = await safeApi(`/api/projects/${projectId}/batches`);
+    const payload = await safeApi(`/api/projects/${projectId}/batches?limit=1`);
+    return (payload.batches || [])[0] || {};
+  };
+
+  const getRunningCollectBatch = async () => {
+    if (!projectId) return {};
+    const payload = await safeApi(`/api/projects/${projectId}/batches?status=running&limit=1`);
     return (payload.batches || [])[0] || {};
   };
 
@@ -517,33 +721,93 @@ export default function ScreeningDashboard() {
         scheme_ids: schemeIds,
         multi_scheme: options.multiScheme !== false,
         preflight: options.preflight !== false,
+        async_collect: options.asyncCollect === true,
       }),
     });
-    if (result.ok) {
+    if (result.ok && !result.accepted) {
       await refreshProjectData({ screeningPlan: activePlan });
     }
-    setResultModal(buildCollectResultSummary(result));
+    if (!result.accepted) {
+      setResultModal(buildCollectResultSummary(result));
+    }
     return result;
   };
 
   const handleCollectDetails = async ({ creatorIds = [], segment = '', segmentLabel = '' } = {}) => {
     if (!projectId) return { ok: false, error: '未选择项目' };
-    const result = await safeApi('/api/pgy/collect/detail', {
-      method: 'POST',
-      body: JSON.stringify({
-        project_id: projectId,
-        creator_ids: creatorIds.map(String),
-        segment,
-        manual: true,
-      }),
-    });
-    setResultModal(buildDetailResultSummary(result, creatorIds.length, segmentLabel));
-    return result;
+    const normalizedIds = [...new Set(creatorIds.map(String).filter(Boolean))].sort();
+    const requestedCount = normalizedIds.length;
+    const requestKey = `${projectId}:${normalizedIds.join(',') || 'auto'}:${segment || ''}`;
+    if (detailCollectInFlightRef.current.has(requestKey)) {
+      return {
+        ok: false,
+        error: 'detail_collection_already_running',
+        message: '这批达人详情正在完善中，请稍等',
+      };
+    }
+    detailCollectInFlightRef.current.add(requestKey);
+    try {
+      const result = await safeApi('/api/pgy/collect/detail', {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: projectId,
+          creator_ids: normalizedIds,
+          segment,
+          manual: true,
+          limit: normalizedIds.length || 500,
+          async_collect: true,
+        }),
+      });
+      if (result?.accepted && result?.task?.task_id) {
+        const taskId = result.task.task_id;
+        setDetailProgress({ ...result.task, segmentLabel });
+        const finalResult = await new Promise((resolve) => {
+          let stopped = false;
+          const poll = async () => {
+            if (stopped) return;
+            const payload = await safeApi(`/api/pgy/collect/detail/tasks/${taskId}`);
+            const task = payload?.task;
+            if (!task) {
+              stopped = true;
+              resolve(result);
+              return;
+            }
+            if (task.status === 'running') {
+              setDetailProgress({ ...task, segmentLabel });
+              detailProgressTimerRef.current = window.setTimeout(poll, 1200);
+              return;
+            }
+            stopped = true;
+            setDetailProgress(null);
+            const finalResult = task.result || { ok: task.status !== 'failed', message: task.progress_message || result.message };
+            setResultModal(buildDetailResultSummary(finalResult, requestedCount, segmentLabel));
+            if (finalResult.ok !== false) {
+              await refreshProjectData();
+            }
+            resolve(finalResult);
+          };
+          detailProgressTimerRef.current = window.setTimeout(poll, 800);
+        });
+        return { ...result, finalResult };
+      }
+      setResultModal(buildDetailResultSummary(result, requestedCount, segmentLabel));
+      return result;
+    } finally {
+      detailCollectInFlightRef.current.delete(requestKey);
+    }
   };
 
-  const handleScore = async () => {
+  const handleScore = async ({ source = 'manual', creatorIds = [], segment = '', segmentLabel = '' } = {}) => {
     if (!projectId) return { ok: false, error: '未选择项目' };
-    const result = await safeApi(`/api/projects/${projectId}/creators/score`, { method: 'POST' });
+    const result = await safeApi(`/api/projects/${projectId}/creators/score`, {
+      method: 'POST',
+      body: JSON.stringify({
+        source,
+        creator_ids: creatorIds.map(String),
+        segment,
+        segment_label: segmentLabel,
+      }),
+    });
     if (result?.ok === false) {
       setResultModal(buildScoreResultSummary(result, []));
       return result;
@@ -631,10 +895,24 @@ export default function ScreeningDashboard() {
     return result;
   };
 
-  const handleWriteBack = async (tableId = '') => safeApi('/api/projects/feishu/writeback', {
-    method: 'POST',
-    body: JSON.stringify({ project_id: projectId, table_id: tableId, quality_only: true, rows: [] }),
-  });
+  const handleWriteBack = async (tableId = '') => {
+    if (!projectId) {
+      const result = { ok: false, message: '未选择项目，无法写回飞书' };
+      setResultModal(buildWritebackResultSummary(result));
+      return result;
+    }
+    const result = await safeApi('/api/projects/feishu/writeback', {
+      method: 'POST',
+      body: JSON.stringify({ project_id: projectId, table_id: tableId, quality_only: true, rows: [] }),
+      timeoutMs: 90000,
+      timeoutMessage: '写回飞书超过 90 秒未返回，已停止等待。请检查飞书权限、字段映射或网络后重试。',
+    });
+    setResultModal(buildWritebackResultSummary(result));
+    if (result?.ok !== false) {
+      await refreshProjectData();
+    }
+    return result;
+  };
 
   const handleTabChange = (nextTab) => {
     setActiveTab(nextTab);
@@ -707,7 +985,18 @@ export default function ScreeningDashboard() {
 
     switch (activeTab) {
       case 'overview':
-        return <OverviewTab project={currentProject} onCollect={handleCollect} onStopCollect={handleStopCollect} onLatestBatch={getLatestCollectBatch} onSavePlan={handleSaveScreeningPlan} onTabChange={handleTabChange} />;
+        return (
+          <OverviewTab
+            project={currentProject}
+            onCollect={handleCollect}
+            onStopCollect={handleStopCollect}
+            onLatestBatch={getLatestCollectBatch}
+            onRunningBatch={getRunningCollectBatch}
+            onRefresh={handleRefresh}
+            onSavePlan={handleSaveScreeningPlan}
+            onTabChange={handleTabChange}
+          />
+        );
       case 'screening-review':
         return (
           <ScreeningReviewTab
@@ -745,7 +1034,7 @@ export default function ScreeningDashboard() {
           <ProjectSetupTab
             project={currentProject}
             projects={mergedProjects}
-            onSelectProject={setCurrentProject}
+            onSelectProject={(project) => selectProject(project, { navigateToOverview: false })}
             onCreateProject={() => setShowCreateModal(true)}
             feishuConfig={feishuConfig}
             feishuFields={feishuFields}
@@ -792,12 +1081,25 @@ export default function ScreeningDashboard() {
       case 'legacy':
         return <AdvancedConfigTab />;
       default:
-        return <OverviewTab project={currentProject} onCollect={handleCollect} onStopCollect={handleStopCollect} onLatestBatch={getLatestCollectBatch} onSavePlan={handleSaveScreeningPlan} onTabChange={handleTabChange} />;
+        return (
+          <OverviewTab
+            project={currentProject}
+            onCollect={handleCollect}
+            onStopCollect={handleStopCollect}
+            onLatestBatch={getLatestCollectBatch}
+            onRunningBatch={getRunningCollectBatch}
+            onRefresh={handleRefresh}
+            onSavePlan={handleSaveScreeningPlan}
+            onTabChange={handleTabChange}
+          />
+        );
     }
   };
 
   return (
     <div style={{ padding: 24 }}>
+      <DetailProgressBanner task={detailProgress} onDismiss={() => setDetailProgress(null)} />
+
       <div>
         {renderTabContent()}
       </div>

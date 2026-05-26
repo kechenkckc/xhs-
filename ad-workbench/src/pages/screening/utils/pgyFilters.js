@@ -125,8 +125,8 @@ export function normalizePgyFilterItem(item = {}) {
   if (field === '博主人设') {
     const map = {
       家庭身份: { field: '家庭身份', value: '妈妈', control_type: 'checkbox_popover' },
-      职业身份: { field: '职业身份', value: '教育科研', control_type: 'checkbox_popover' },
-      特色背景: { field: '特色背景', value: '备考经验', control_type: 'checkbox_popover' },
+      职业身份: { field: '职业身份', value: '学生', control_type: 'checkbox_popover' },
+      特色背景: { field: '特色背景', value: '留学背景', control_type: 'checkbox_popover' },
     };
     return { ...base, ...(map[value] || {}) };
   }

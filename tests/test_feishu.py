@@ -188,6 +188,24 @@ def test_upsert_sheet_records_updates_existing_row_by_pgy_url():
     assert session.put_calls[0][1]["valueRange"]["range"] == "sheet123!A2:C2"
 
 
+def test_upsert_sheet_records_can_leave_image_cell_blank_for_image_api():
+    session = DummySession({"code": 0, "data": {"valueRange": {"values": []}, "updates": {"updatedRows": 1}}})
+    client = FeishuClient("cli_test", "secret", session=session)
+    client._tenant_access_token = "token"
+
+    client.upsert_sheet_records(
+        "spreadsheetToken",
+        "sheet123",
+        [
+            {"field_name": "达人昵称", "column_index": 0},
+            {"field_name": "粉丝画像", "column_index": 1},
+        ],
+        [{"达人昵称": "测试达人", "粉丝画像": ""}],
+    )
+
+    assert session.last_post_json["valueRange"]["values"] == [["测试达人", ""]]
+
+
 def test_ensure_sheet_field_reuses_existing_column():
     session = DummySession({"code": 0, "data": {}})
     client = FeishuClient("cli_test", "secret", session=session)

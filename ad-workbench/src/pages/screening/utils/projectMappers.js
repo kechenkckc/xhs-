@@ -18,43 +18,69 @@ export function normalizeProjectBrief(item, base) {
   };
 }
 
-export function mapBackendProject(item, creators = [], feishuConfig = null) {
-  const base = initialProjects[0];
+export function mapBackendProject(item, creators = [], feishuConfig = null, creatorStats = null) {
+  const template = initialProjects.find(project => project.id === item.project_id);
+  const isTemplateProject = Boolean(template);
+  const base = template || {};
   const linked = Boolean(feishuConfig?.feishu_url);
   const normalizedBrief = normalizeProjectBrief(item, base);
+  const storedPlan = parseStoredScreeningPlan(item.screening_plan, {});
+  const uiMeta = storedPlan.uiProject || storedPlan.projectMeta || {};
+  const product = uiMeta.product || uiMeta.product_name || base.product || item.product || item.project_name || '未填写产品';
+  const poolType = uiMeta.poolType || uiMeta.pool_type || base.poolType || 'isolated';
+  const periodStart = item.period_start || base.periodStart || '';
+  const periodEnd = item.period_end || base.periodEnd || '';
+  const status = item.archived_at
+    ? '已归档'
+    : item.creator_pool_count || item.screening_candidate_count
+      ? '进行中'
+      : base.status || '待启动';
   return {
     ...base,
     id: item.project_id,
+    project_id: item.project_id,
     name: item.project_name,
-    product: '有道答疑笔Pro',
+    project_name: item.project_name,
+    product,
+    poolType,
+    sharedPoolId: uiMeta.sharedPoolId || uiMeta.shared_pool_id || base.sharedPoolId || null,
+    budget: Number(uiMeta.budget ?? base.budget ?? 0),
+    singleBudget: uiMeta.singleBudget ?? uiMeta.single_budget ?? base.singleBudget ?? '',
+    cooperationType: uiMeta.cooperationType || uiMeta.cooperation_type || base.cooperationType || '合作笔记',
     creatorCount: item.target_qualified_creator_count || 10,
-    periodStart: item.period_start || base.periodStart,
-    periodEnd: item.period_end || base.periodEnd,
-    period: `${item.period_start || '2026-05-07'} 至 ${item.period_end || '2026-05-19'}`,
+    periodStart,
+    periodEnd,
+    period: periodStart || periodEnd ? `${periodStart || '待定'} 至 ${periodEnd || '待定'}` : base.period || '待定',
     createdAt: item.created_at || '',
     updatedAt: item.updated_at || '',
     archivedAt: item.archived_at || '',
-    status: item.archived_at ? '已归档' : base.status,
-    description: normalizedBrief.description || base.description,
+    status,
+    description: normalizedBrief.description || base.description || '',
     brief: normalizedBrief,
     currentStep: linked ? 6 : 4,
     creators,
     feishuBinding: {
       linked,
       tableUrl: feishuConfig?.feishu_url || '',
-      tableName: linked ? '有道答疑笔达人池' : '',
+      tableName: linked ? `${item.project_name || '项目'}达人池` : '',
       baseToken: feishuConfig?.target?.token || '',
       tableId: feishuConfig?.target?.table_id || '',
       viewId: '',
-      fieldMapping: base.feishuBinding.fieldMapping,
+      fieldMapping: base.feishuBinding?.fieldMapping || [],
     },
     stats: {
-      total: item.screening_candidate_count ?? item.creator_pool_count ?? creators.length,
+      total: creatorStats?.total ?? item.screening_candidate_count ?? item.creator_pool_count ?? creators.length,
       pool: item.creator_pool_count || 0,
-      passed: item.qualified_creator_count || 0,
+      passed: creatorStats?.passed ?? item.qualified_creator_count ?? 0,
       ratio: item.qualified_ratio || 0,
+      rejected: creatorStats?.rejected ?? 0,
+      backup: creatorStats?.backup ?? 0,
+      review: creatorStats?.review ?? 0,
+      pending: creatorStats?.pending ?? 0,
+      tiers: creatorStats?.tiers || null,
+      statuses: creatorStats?.statuses || null,
     },
-    screeningPlan: parseStoredScreeningPlan(item.screening_plan, base.screeningPlan),
+    screeningPlan: parseStoredScreeningPlan(item.screening_plan, isTemplateProject ? base.screeningPlan : {}),
   };
 }
 

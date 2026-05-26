@@ -44,6 +44,31 @@ export function deriveDimensionScores(item) {
   return null;
 }
 
+export function normalizeScoreTierKey(value, score) {
+  const text = String(value ?? '').trim().replace(/\s+/g, '').toUpperCase();
+  if (['S', 'A', 'B+', 'B', 'C'].includes(text)) return text;
+  if (['S档', 'S級', 'S级'].includes(text)) return 'S';
+  if (['A档', 'A級', 'A级'].includes(text)) return 'A';
+  if (['B+档', 'B＋档', 'B+級', 'B+级', 'B＋級', 'B＋级'].includes(text)) return 'B+';
+  if (['B档', 'B級', 'B级'].includes(text)) return 'B';
+  if (['C档', 'C級', 'C级'].includes(text)) return 'C';
+  if (/未评分|待评分|UNSCORED|PENDING/.test(text)) return '未评分';
+  if (/最高优先级/.test(text)) return 'S';
+  if (/高优先级/.test(text) && !/中高/.test(text)) return 'A';
+  if (/中高优先级/.test(text)) return 'B+';
+  if (/中优先级/.test(text)) return 'B';
+  if (/低优先级/.test(text)) return 'C';
+
+  if (score === null || score === undefined || score === '') return '';
+  const number = Number(score);
+  if (!Number.isFinite(number)) return '';
+  if (number >= 95) return 'S';
+  if (number >= 80) return 'A';
+  if (number >= 75) return 'B+';
+  if (number >= 70) return 'B';
+  return 'C';
+}
+
 export function sanitizeCreatorType(value) {
   const text = String(value || '').trim().replace(/\s+/g, '');
   if (!text) return '';
@@ -176,6 +201,9 @@ function deriveScoringRiskLabels(item, scores) {
 export function mapBackendCreator(item) {
   const hasScore = item.total_score !== null && item.total_score !== undefined && item.total_score !== '';
   const score = hasScore ? Math.round(Number(item.total_score || 0)) : null;
+  const ruleGroupScore = item.rule_group_score !== null && item.rule_group_score !== undefined && item.rule_group_score !== ''
+    ? Math.round(Number(item.rule_group_score || 0))
+    : score;
   const type = getCreatorDisplayType(item);
   const categoryType = getCreatorCategoryType(item);
   const scores = deriveDimensionScores(item);
@@ -192,7 +220,7 @@ export function mapBackendCreator(item) {
   const pgyUrl = getPgyUrl({ raw: item });
   if (!pgyUrl) risks.push(SCORING_RISK_STANDARDS.execution);
   if (Number(item.quote_price || 0) >= 20000) risks.push(SCORING_RISK_STANDARDS.efficiency);
-  if (item.rate_limit_risk && !['无', '无明显'].includes(item.rate_limit_risk)) risks.push(normalizeRiskLabel(item.rate_limit_risk));
+  if (item.rate_limit_risk && !['无', '无明显', '低风险'].includes(item.rate_limit_risk)) risks.push(normalizeRiskLabel(item.rate_limit_risk));
   risks.push(...deriveScoringRiskLabels({ ...item, pgy_url: pgyUrl }, scores));
   const uniqueRisks = uniqueCompactItems(risks, 4);
   return {
@@ -205,12 +233,13 @@ export function mapBackendCreator(item) {
     quote: formatCurrency(item.quote_price),
     quoteNum: Number(item.quote_price || 0),
     baseScore: score,
+    ruleGroupScore,
     scorePending: !hasScore,
     baseOnlyScore: Math.round(Number(item.base_score || 0)),
     bonusScore: Math.round(Number(item.bonus_score || 0)),
     informationCompleteness: item.information_completeness,
     informationCompletenessLabel: formatCompleteness(item.information_completeness),
-    initialTier: item.initial_tier || item.tier || '',
+    initialTier: normalizeScoreTierKey(item.initial_tier || item.tier || item.detail_collection_priority, score),
     detailCollectionPriority: item.detail_collection_priority || '',
     risk: uniqueRisks,
     scores,
@@ -232,38 +261,136 @@ export function mapBackendCreator(item) {
     avatarUrl: item.avatar_url || '',
     topicPoint: item.topic_point || '',
     childGrade: item.child_grade || '',
+    childGradeConfidence: item.child_grade_confidence || '',
+    childGradeEvidence: item.child_grade_evidence || '',
     naturalCpe: item.natural_cpe,
+    effectiveCpc: item.effective_cpc,
+    effectiveCpcSource: item.effective_cpc_source || '',
+    effectiveCpe: item.effective_cpe,
+    effectiveCpeSource: item.effective_cpe_source || '',
     fans35PlusRatio: item.fans_35_plus_ratio,
+    fans35PlusRatioSource: item.fans_35_plus_ratio_source || '',
+    contentSceneTags: item.content_scene_tags || '',
+    contentSceneEvidence: item.content_scene_evidence || '',
+    presentationStyleTags: item.presentation_style_tags || '',
+    searchReviewStatus: item.search_recommend_review_status || '',
+    searchReviewNote: item.search_recommend_review_note || '',
+    rateLimitRiskReason: item.rate_limit_risk_reason || '',
+    llmManualReviewItems: parseStructuredList(item.manual_review_items),
+    llmEvidenceQuotes: parseStructuredList(item.evidence_quotes),
+    llmConfidence: item.llm_confidence,
+    llmPromptVersion: item.llm_prompt_version || '',
+    llmSchemaVersion: item.llm_schema_version || '',
     raw: item,
   };
 }
 
 export function getScoreColor(score) {
   if (score === null || score === undefined || score === '') return '#64748B';
-  if (score >= 100) return '#10B981';
-  if (score >= 90) return '#3B82F6';
-  if (score >= 80) return '#F59E0B';
+  if (score >= 95) return '#10B981';
+  if (score >= 80) return '#3B82F6';
+  if (score >= 75) return '#F59E0B';
   if (score >= 70) return '#D97706';
   return '#EF4444';
 }
 
 export function getScoreTier(score) {
   if (score === null || score === undefined || score === '') return { key: '未评分', label: '未评分', variant: 'default', text: '待评分', color: '#64748B' };
-  if (score >= 100) return { key: 'S', label: 'S档', variant: 'green', text: '最高优先级', color: '#10B981' };
-  if (score >= 90) return { key: 'A', label: 'A档', variant: 'blue', text: '高优先级', color: '#3B82F6' };
-  if (score >= 80) return { key: 'B+', label: 'B+档', variant: 'amber', text: '中高优先级', color: '#F59E0B' };
+  if (score >= 95) return { key: 'S', label: 'S档', variant: 'green', text: '最高优先级', color: '#10B981' };
+  if (score >= 80) return { key: 'A', label: 'A档', variant: 'blue', text: '高优先级', color: '#3B82F6' };
+  if (score >= 75) return { key: 'B+', label: 'B+档', variant: 'amber', text: '中高优先级', color: '#F59E0B' };
   if (score >= 70) return { key: 'B', label: 'B档', variant: 'amber', text: '中优先级', color: '#D97706' };
   return { key: 'C', label: 'C档', variant: 'red', text: '低优先级', color: '#EF4444' };
+}
+
+export function getCreatorDisplayTier(creator) {
+  if (!creator || creator.scorePending) return getScoreTier(null);
+  const normalizedTier = normalizeScoreTierKey(creator.initialTier, creator.baseScore);
+  if (!normalizedTier) return getScoreTier(creator.baseScore);
+  const labels = {
+    S: { key: 'S', label: 'S档', variant: 'green', text: '最高优先级', color: '#10B981' },
+    A: { key: 'A', label: 'A档', variant: 'blue', text: '高优先级', color: '#3B82F6' },
+    'B+': { key: 'B+', label: 'B+档', variant: 'amber', text: '中高优先级', color: '#F59E0B' },
+    B: { key: 'B', label: 'B档', variant: 'amber', text: '中优先级', color: '#D97706' },
+    C: { key: 'C', label: 'C档', variant: 'red', text: '低优先级', color: '#EF4444' },
+  };
+  return labels[normalizedTier] || getScoreTier(creator.baseScore);
+}
+
+export function getCreatorPrioritySignals(creator) {
+  const reason = String(creator?.aiReason || creator?.reason || creator?.raw?.score_reason || '');
+  const text = `${creator?.name || ''} ${getCreatorIntro(creator)} ${getCreatorTags(creator).join(' ')} ${reason}`;
+  const signals = [];
+  if (/听课宝优先级1|S档依据|留学|留学生|海外|国外|美本|英本|海本|国际学校|overseas/i.test(text)) {
+    signals.push({ label: '留学/留学生背景', tone: 'primary' });
+  }
+  if (/听课宝优先级2|Brief|学习|听课|课堂|上课|笔记|复盘|备考|essay|assignment|教程|干货/i.test(text)) {
+    signals.push({ label: '命中Brief学习场景', tone: 'content' });
+  }
+  if (/听课宝优先级3|综合数据|成本效率|阅读\/互动|CPM|CPC|CPE|平均阅读|平均互动|中位阅读|互动/i.test(text)) {
+    signals.push({ label: '阅读互动与成本优秀', tone: 'metric' });
+  }
+  return signals.slice(0, 3);
 }
 
 export function getCreatorDetailStatus(creator) {
   const completeness = creator.informationCompletenessLabel || formatCompleteness(creator.informationCompleteness);
   if (!getPgyUrl(creator)) return { label: '缺详情链接', variant: 'red' };
+  const noteCount = getCreatorRealNoteCases(creator).length;
+  if (hasCreatorDetailEvidence(creator)) {
+    return { label: noteCount ? `详情已完善 · ${noteCount}篇` : '详情已完善', variant: 'green' };
+  }
   if (completeness === '待补') return { label: '详情待补', variant: 'amber' };
   const number = Number(String(completeness).replace('%', ''));
-  if (Number.isFinite(number) && number >= 80) return { label: `详情完整 ${completeness}`, variant: 'green' };
+  if (Number.isFinite(number) && number >= 80) return { label: `详情已完善 · ${completeness}`, variant: 'green' };
   if (Number.isFinite(number) && number >= 50) return { label: `详情部分 ${completeness}`, variant: 'blue' };
   return { label: `详情待补 ${completeness}`, variant: 'amber' };
+}
+
+function hasMeaningfulDetailValue(value) {
+  if (value === null || value === undefined) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === 'object') return Object.values(value).some(hasMeaningfulDetailValue);
+  return String(value).trim() !== '';
+}
+
+function hasDetailSummaryEvidence(payload) {
+  const summary = payload?.detail_collection_summary || payload?.detailCollectionSummary;
+  if (!summary || typeof summary !== 'object') return false;
+  const count = Number(summary.module_count ?? summary.moduleCount ?? summary.field_count ?? summary.fieldCount ?? summary.note_count ?? summary.noteCount ?? 0);
+  if (Number.isFinite(count) && count > 0) return true;
+  if (hasMeaningfulDetailValue(summary.collected_at || summary.collectedAt || summary.completed_at || summary.completedAt)) return true;
+  const status = String(summary.status || '').toLowerCase();
+  return /success|complete|completed|done|collected|已完成|完成|成功/.test(status);
+}
+
+export function hasCreatorDetailEvidence(creator) {
+  const rawPayload = getCreatorRawPayload(creator);
+  const nestedPayloads = collectNestedPayloads(rawPayload, creator.raw, creator.rawPayload, creator.raw_payload);
+
+  if (nestedPayloads.flatMap(collectNoteCaseArrays).length > 0) return true;
+  if (nestedPayloads.some(hasDetailSummaryEvidence)) return true;
+
+  const detailFields = [
+    'personal_intro',
+    'profile_intro',
+    'xhs_profile_intro',
+    'blogger_profile',
+    'user_profile',
+    'audience_profile_chart_metrics',
+    'cooperation_note_case_pages',
+    'cooperation_note_cases',
+    'recent_note_cases',
+    'recent_notes',
+    'fans_age_distribution',
+    'fans_gender_distribution',
+    'content_scene_evidence',
+    'child_grade_evidence',
+  ];
+  return nestedPayloads.some(payload => (
+    detailFields.some(key => hasMeaningfulDetailValue(payload[key]))
+    || hasMeaningfulDetailValue(payload.detail)
+  ));
 }
 
 export function isValidPgyDetailUrl(value) {
@@ -297,14 +424,54 @@ export function pickCreatorValue(creator, keys, fallback = '') {
 
 export function getCreatorRawPayload(creator) {
   const payload = creator?.raw?.raw_payload ?? creator?.rawPayload ?? creator?.raw_payload;
-  if (!payload) return {};
+  return parsePayloadObject(payload);
+}
+
+function parsePayloadObject(payload, depth = 0) {
+  if (!payload || depth > 4) return {};
   if (typeof payload === 'object') return payload;
   if (typeof payload !== 'string') return {};
   try {
     const parsed = JSON.parse(payload);
+    if (typeof parsed === 'string') return parsePayloadObject(parsed, depth + 1);
     return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
     return {};
+  }
+}
+
+function collectNestedPayloads(...items) {
+  const payloads = [];
+  const seen = new Set();
+  const visit = (item, depth = 0) => {
+    if (!item || depth > 4) return;
+    const payload = typeof item === 'string' ? parsePayloadObject(item) : item;
+    if (!payload || typeof payload !== 'object') return;
+    if (seen.has(payload)) return;
+    seen.add(payload);
+    payloads.push(payload);
+    ['detail', 'raw_payload', 'rawPayload', 'payload', 'data', 'parsed'].forEach((key) => visit(payload[key], depth + 1));
+  };
+  items.forEach(item => visit(item));
+  return payloads;
+}
+
+export function parseStructuredList(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.map(item => String(item || '').trim()).filter(Boolean);
+  }
+  if (typeof value === 'object') {
+    return Object.values(value).map(item => String(item || '').trim()).filter(Boolean);
+  }
+  if (typeof value !== 'string') return [];
+  const text = value.trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    return parseStructuredList(parsed);
+  } catch {
+    return text.split(/[；;\n]+/).map(item => item.trim()).filter(Boolean);
   }
 }
 
@@ -366,6 +533,7 @@ export function getCreatorDisplayId(creator) {
 
 export function getCreatorIntro(creator) {
   const rawPayload = getCreatorRawPayload(creator);
+  const nestedPayloads = collectNestedPayloads(rawPayload, creator.raw);
   const intro = [
     creator.personalIntro,
     creator.personal_intro,
@@ -378,15 +546,17 @@ export function getCreatorIntro(creator) {
     creator.raw?.profile_intro,
     creator.raw?.bio,
     creator.raw?.signature,
-    rawPayload.personal_intro,
-    rawPayload.profile_intro,
-    rawPayload.xhs_profile_intro,
-    rawPayload.bio,
-    rawPayload.signature,
-    rawPayload.blogger_profile,
-    rawPayload.user_profile,
-    rawPayload.profile?.intro,
-    rawPayload.profile?.bio,
+    ...nestedPayloads.flatMap(payload => [
+      payload.personal_intro,
+      payload.profile_intro,
+      payload.xhs_profile_intro,
+      payload.bio,
+      payload.signature,
+      payload.blogger_profile,
+      payload.user_profile,
+      payload.profile?.intro,
+      payload.profile?.bio,
+    ]),
   ].find(value => String(value || '').trim());
   return intro ? String(intro).trim() : '暂无详情页个人简介';
 }
@@ -398,25 +568,19 @@ export function getCreatorAvatarUrl(creator) {
 export function getCreatorMetricChips(creator) {
   const chips = [];
   const grade = pickCreatorValue(creator, ['childGrade', 'child_grade', '孩子年级']);
-  const age = pickCreatorValue(creator, ['child_age', '孩子年龄']);
-  const gender = pickCreatorValue(creator, ['child_gender', '孩子性别']);
-  const fans35 = pickCreatorValue(creator, ['fans35PlusRatio', 'fans_35_plus_ratio', '35岁以上粉丝占比']);
-  const cpe = pickCreatorValue(creator, ['naturalCpe', 'natural_cpe', '合作笔记自然CPE']);
-  const cpc = pickCreatorValue(creator, ['natural_cpc', '合作笔记自然CPC']);
-  const searchRatio = pickCreatorValue(creator, ['search_recommend_ratio', '搜索+推荐占比']);
+  const cpe = pickCreatorValue(creator, ['effectiveCpe', 'effective_cpe', 'naturalCpe', 'natural_cpe', '合作笔记自然CPE', 'image_interaction_unit_price', 'video_interaction_unit_price']);
+  const cpc = pickCreatorValue(creator, ['effectiveCpc', 'effective_cpc', 'natural_cpc', '合作笔记自然CPC', 'image_read_unit_price', 'video_read_unit_price']);
+  const searchReviewStatus = pickCreatorValue(creator, ['searchReviewStatus', 'search_recommend_review_status']);
   const traffic = pickCreatorValue(creator, ['traffic_stability', '近30天流量稳定性']);
   const rateLimit = pickCreatorValue(creator, ['rateLimitRisk', 'rate_limit_risk', '限流风险判断']);
-  const shop30 = pickCreatorValue(creator, ['shop_cost_30d', '30天外溢进店成本']);
+  const cpeNumber = Number(cpe);
+  const cpcNumber = Number(cpc);
   if (grade) chips.push(`年级 ${grade}`);
-  if (age) chips.push(`孩子${age}岁`);
-  if (gender && gender !== '未披露') chips.push(`${gender}孩`);
-  if (fans35) chips.push(`35+ ${formatPercentValue(fans35)}`);
-  if (cpe) chips.push(`CPE ${cpe}`);
-  if (cpc) chips.push(`CPC ${cpc}`);
-  if (searchRatio) chips.push(`搜推 ${formatPercentValue(searchRatio)}`);
+  if (Number.isFinite(cpeNumber)) chips.push(cpeNumber <= 10 ? '互动成本优秀' : cpeNumber <= 20 ? '互动成本达标' : '互动成本偏高');
+  if (Number.isFinite(cpcNumber)) chips.push(cpcNumber <= 2 ? '阅读成本优秀' : cpcNumber <= 3 ? '阅读成本达标' : '阅读成本偏高');
+  if (searchReviewStatus && searchReviewStatus !== '已复核') chips.push('搜推待复核');
   if (traffic) chips.push(`流量${traffic}`);
-  if (rateLimit && !['无', '低'].includes(String(rateLimit))) chips.push(`限流${rateLimit}`);
-  if (shop30) chips.push(`进店¥${shop30}`);
+  if (rateLimit && !['无', '低', '低风险'].includes(String(rateLimit))) chips.push(`风险${rateLimit}`);
   return uniqueCompactItems(chips, 8);
 }
 
@@ -484,25 +648,29 @@ export function collectNoteCaseArrays(payload = {}) {
   const pages = Array.isArray(payload.cooperation_note_case_pages)
     ? payload.cooperation_note_case_pages.flatMap(page => page?.cases || [])
     : [];
+  const dataPages = Array.isArray(payload.data?.cooperation_note_case_pages)
+    ? payload.data.cooperation_note_case_pages.flatMap(page => page?.cases || [])
+    : [];
   return [
     ...(Array.isArray(payload.recent_note_cases) ? payload.recent_note_cases : []),
     ...(Array.isArray(payload.recent_notes) ? payload.recent_notes : []),
+    ...(Array.isArray(payload.recent_note_briefs) ? payload.recent_note_briefs : []),
     ...(Array.isArray(payload.cooperation_note_cases) ? payload.cooperation_note_cases : []),
     ...(Array.isArray(payload.note_cases) ? payload.note_cases : []),
     ...(Array.isArray(payload.notes) ? payload.notes : []),
+    ...(Array.isArray(payload.note_list) ? payload.note_list : []),
+    ...(Array.isArray(payload.noteList) ? payload.noteList : []),
+    ...(Array.isArray(payload.data?.recent_notes) ? payload.data.recent_notes : []),
+    ...(Array.isArray(payload.data?.cooperation_note_cases) ? payload.data.cooperation_note_cases : []),
+    ...(Array.isArray(payload.data?.note_cases) ? payload.data.note_cases : []),
     ...pages,
+    ...dataPages,
   ];
 }
 
 export function getCreatorRealNoteCases(creator) {
   const rawPayload = getCreatorRawPayload(creator);
-  const nestedPayloads = [
-    rawPayload,
-    rawPayload.detail,
-    rawPayload.raw_payload,
-    creator.raw,
-    creator.raw?.detail,
-  ].filter(item => item && typeof item === 'object');
+  const nestedPayloads = collectNestedPayloads(rawPayload, creator.raw, creator.rawPayload, creator.raw_payload);
   const rawCases = [
     ...nestedPayloads.flatMap(collectNoteCaseArrays),
   ];
@@ -511,26 +679,46 @@ export function getCreatorRealNoteCases(creator) {
     .map((item, index) => {
       if (typeof item === 'string') return { brand: '笔记', title: item, index };
       if (!item || typeof item !== 'object') return null;
+      const noteId = item.note_id || item.noteId || item.noteID || item.id || item.note_id_str || '';
+      const rawComments = Array.isArray(item.comments)
+        ? item.comments
+        : Array.isArray(item.comment_samples)
+          ? item.comment_samples
+          : Array.isArray(item.commentSamples)
+            ? item.commentSamples
+            : Array.isArray(item.visibleComments)
+              ? item.visibleComments
+              : [];
+      const title = item.title || item.note_title || item.noteTitle || item.name || item.content_title || item.contentTitle || item.display_title || item.desc_title || (noteId ? `笔记 ${String(noteId).slice(-6)}` : '未命名笔记');
+      const cover = item.cover_url || item.coverUrl || item.imgUrl || item.imageUrl || item.image || item.image_url || item.cover || item.pic_url || item.picUrl || item.thumbnail || item.thumbnail_url || item.thumbnailUrl || '';
+      const content = item.content || item.text || item.desc || item.description || item.note_content || item.note_text || item.body || item.caption || item.rich_text || item.richText || '';
       return {
         index,
-        brand: item.brand || item.cooperation_brand || item.category || item.note_type || '近期笔记',
-        title: item.title || item.note_title || item.name || item.content_title || '未命名笔记',
-        readCount: item.read_count ?? item.readCount ?? item.read ?? '',
-        likeCount: item.like_count ?? item.likeCount ?? item.likes ?? '',
-        saveCount: item.save_count ?? item.saveCount ?? item.saves ?? '',
-        commentCount: item.comment_count ?? item.commentCount ?? item.comments ?? '',
-        shareCount: item.share_count ?? item.shareCount ?? item.shares ?? '',
-        publishedAt: item.published_at || item.publish_time || item.time || '',
-        promoted: Boolean(item.has_promoted_traffic || item.promoted),
+        noteId,
+        brand: item.brand || item.cooperation_brand || item.brandName || item.category || item.content_category || item.contentTag || item.note_type || '近期笔记',
+        title,
+        readCount: item.read_count ?? item.readCount ?? item.read ?? item.readNum ?? item.read_num ?? item.viewCount ?? item.view_count ?? item.third_read_user_num ?? '',
+        likeCount: item.like_count ?? item.likeCount ?? item.likes ?? item.likeNum ?? item.like_num ?? '',
+        saveCount: item.save_count ?? item.saveCount ?? item.saves ?? item.favNum ?? item.fav_num ?? item.collectNum ?? item.collect_num ?? '',
+        commentCount: item.comment_count ?? item.commentCount ?? item.cmtNum ?? item.cmt_num ?? (Array.isArray(item.comments) ? item.comments.length : item.comments) ?? '',
+        shareCount: item.share_count ?? item.shareCount ?? item.shares ?? item.shareNum ?? item.share_num ?? '',
+        exposureCount: item.exposure_count ?? item.exposureCount ?? item.impression_count ?? item.impressionCount ?? item.impNum ?? item.imp_num ?? '',
+        followCount: item.follow_count ?? item.followCount ?? item.followCnt ?? item.follow_cnt ?? '',
+        publishedAt: item.published_at || item.publish_time || item.publishTime || item.createTime || item.date || item.time || '',
+        promoted: Boolean(item.has_promoted_traffic || item.promoted || item.isAdvertise),
         crossDomain: Boolean(item.cross_domain || item.crossDomain || item.is_cross_domain),
         noteType: item.note_type || item.type || item.media_type || (item.video_url || item.videoUrl ? '视频笔记' : '图文笔记'),
-        contentCategory: item.content_category || item.category || item.brand || '全部类目',
-        coverUrl: item.cover_url || item.coverUrl || item.imgUrl || item.imageUrl || item.image || item.image_url || '',
-        link: item.url || item.note_url || item.link || item.source_url || item.case_section_url || '',
-        content: item.content || item.text || item.desc || item.description || item.note_content || item.note_text || item.body || '',
+        contentCategory: item.content_category || item.contentCategory || item.contentTag || item.category || item.brand || '全部类目',
+        coverUrl: cover,
+        link: item.url || item.note_url || item.noteUrl || item.noteLink || item.link || item.source_url || item.sourceUrl || item.case_section_url || '',
+        content,
         summary: item.summary || item.note_summary || item.excerpt || '',
         description: item.description || item.note_description || '',
-        topics: Array.isArray(item.topics) ? item.topics : Array.isArray(item.tags) ? item.tags : [],
+        commentSummary: item.comment_summary || item.commentSummary || '',
+        comments: rawComments,
+        topics: Array.isArray(item.topics) ? item.topics : Array.isArray(item.tags) ? item.tags : Array.isArray(item.feature_tags) ? item.feature_tags : Array.isArray(item.featureTags) ? item.featureTags : [],
+        industryTags: Array.isArray(item.industry_tags) ? item.industry_tags : [],
+        featureTags: Array.isArray(item.feature_tags) ? item.feature_tags : Array.isArray(item.featureTags) ? item.featureTags : [],
         trafficComparison: item.traffic_comparison || item.trafficComparison || '',
         readVsMedian: item.read_vs_median ?? item.readVsMedian ?? null,
         interactionVsMedian: item.interaction_vs_median ?? item.interactionVsMedian ?? null,
@@ -540,9 +728,9 @@ export function getCreatorRealNoteCases(creator) {
       };
     })
     .filter(Boolean)
-    .filter(item => item.title && item.title !== '未命名笔记')
+    .filter(item => (item.title && item.title !== '未命名笔记') || item.coverUrl || item.noteId)
     .filter((item) => {
-      const key = `${item.brand}|${item.title}|${item.publishedAt}`;
+      const key = item.noteId || item.link || `${item.brand}|${item.title}|${item.publishedAt}|${item.coverUrl}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -728,7 +916,7 @@ export function getCreatorModelProfile(creator, project) {
     audienceModel: {
       followerTier: creator.followers || '待补',
       parentAudienceFit: /35\+|妈妈|家长|家庭/.test(`${tags.persona.join(' ')} ${tags.metric.join(' ')}`) ? 'high' : 'medium',
-      ageFit: pickCreatorValue(creator, ['fans35PlusRatio', 'fans_35_plus_ratio']) ? `35+ ${formatPercentValue(pickCreatorValue(creator, ['fans35PlusRatio', 'fans_35_plus_ratio']))}` : '粉丝年龄待补',
+      ageFit: pickCreatorValue(creator, ['fans35PlusRatio', 'fans_35_plus_ratio']) ? '粉丝年龄已采集' : '粉丝年龄待补',
       geoFit: getCreatorLocation(creator),
       risks: (creator.risk || []).filter(item => /粉丝|35|地域/.test(item)),
     },
@@ -892,8 +1080,8 @@ function summarizeNoteAverages(creator, noteCases = []) {
 function getCostTone(label, value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return 'muted';
-  if (label === 'CPE') return number <= 10 ? 'good' : number <= 20 ? 'ok' : 'bad';
-  if (label === 'CPC') return number <= 2 ? 'good' : number <= 3 ? 'ok' : 'bad';
+  if (label === '互动单价') return number <= 10 ? 'good' : number <= 20 ? 'ok' : 'bad';
+  if (label === '阅读单价') return number <= 2 ? 'good' : number <= 3 ? 'ok' : 'bad';
   if (label === 'CPM') return number <= 80 ? 'good' : number <= 150 ? 'ok' : 'bad';
   return 'muted';
 }
@@ -1012,13 +1200,13 @@ function buildNoteContentWeaknesses(noteCases = [], productProfile = DEFAULT_PRO
 export function getCreatorAdRecommendation(creator, noteCases = [], project = {}) {
   const rawReason = String(creator.aiReason || creator.reason || '').replace(/^【(?:大模型分析|通用初筛)】/, '').trim();
   const productProfile = getProjectProductProfile(project);
-  const cpe = getNumericMetric(creator, ['naturalCpe', 'natural_cpe', '合作笔记自然CPE', 'image_interaction_unit_price', 'video_interaction_unit_price'], 'CPE');
-  const cpc = getNumericMetric(creator, ['natural_cpc', '合作笔记自然CPC', 'image_read_unit_price', 'video_read_unit_price'], 'CPC');
+  const cpe = getNumericMetric(creator, ['effectiveCpe', 'effective_cpe', 'naturalCpe', 'natural_cpe', '合作笔记自然CPE', 'image_interaction_unit_price', 'video_interaction_unit_price'], 'CPE');
+  const cpc = getNumericMetric(creator, ['effectiveCpc', 'effective_cpc', 'natural_cpc', '合作笔记自然CPC', 'image_read_unit_price', 'video_read_unit_price'], 'CPC');
   const cpm = getNumericMetric(creator, ['image_cpm', 'video_cpm', '预估CPM', '图文预估CPM价格', '视频预估CPM价格'], 'CPM');
   const costMetrics = [
-    { label: 'CPE', value: formatCostMetric(cpe), tone: getCostTone('CPE', cpe) },
+    { label: '互动单价', value: formatCostMetric(cpe), tone: getCostTone('互动单价', cpe) },
     { label: 'CPM', value: formatCostMetric(cpm), tone: getCostTone('CPM', cpm) },
-    { label: 'CPC', value: formatCostMetric(cpc), tone: getCostTone('CPC', cpc) },
+    { label: '阅读单价', value: formatCostMetric(cpc), tone: getCostTone('阅读单价', cpc) },
   ];
   const knownTones = costMetrics.map(item => item.tone).filter(tone => tone !== 'muted');
   const costVerdict = knownTones.includes('bad') ? '成本偏高' : knownTones.includes('good') ? '成本优秀' : knownTones.includes('ok') ? '成本达标' : '成本待补';
@@ -1051,6 +1239,12 @@ export function getCreatorAdRecommendation(creator, noteCases = [], project = {}
   const noteSummary = noteTitles
     ? `基于 ${noteCases.length} 条笔记样本计算平均数/中位数；重点复核 ${noteTitles} 是否能自然呈现${productProfile.name}。`
     : `缺少可核验合作笔记样本，需补看是否能自然呈现${productProfile.name}。`;
+  const searchReviewStatus = pickCreatorValue(creator, ['searchReviewStatus', 'search_recommend_review_status']) || '待复核';
+  const searchReviewNote = pickCreatorValue(creator, ['searchReviewNote', 'search_recommend_review_note']) || '需人工在蒲公英页面复核搜索+推荐占比';
+  const manualReviewItems = [
+    `搜索+推荐占比：${searchReviewStatus}`,
+    searchReviewStatus !== '已复核' ? searchReviewNote : '',
+  ].filter(Boolean);
 
   return {
     verdict: primaryStandard,
@@ -1063,6 +1257,7 @@ export function getCreatorAdRecommendation(creator, noteCases = [], project = {}
     noteSummary,
     strengths: strengths.length ? strengths : ['暂未提取到明确优势，建议完善详情页和笔记证据。'],
     weaknesses: weaknesses.length ? weaknesses : ['暂无明显硬风险，仍需结合内容样本复核。'],
+    manualReviewItems,
     action,
     summary: `${primaryStandard}：${standardEvidence} 重点看${productProfile.name}场景。`,
   };
@@ -1076,11 +1271,10 @@ export function getCreatorDeepAuditReason(creator, noteCases = []) {
   const metrics = uniqueCompactItems([
     getMetricText(creator.followers, '粉丝 ', value => value),
     getMetricText(creator.quote, '报价 ', value => value),
-    getMetricText(pickCreatorValue(creator, ['naturalCpe', 'natural_cpe']), 'CPE ', value => value),
-    getMetricText(pickCreatorValue(creator, ['natural_cpc']), 'CPC ', value => value),
+    getMetricText(pickCreatorValue(creator, ['effectiveCpe', 'effective_cpe', 'naturalCpe', 'natural_cpe']), '互动单价 ', value => value),
+    getMetricText(pickCreatorValue(creator, ['effectiveCpc', 'effective_cpc', 'natural_cpc']), '阅读单价 ', value => value),
     getMetricText(pickCreatorValue(creator, ['video_completion_rate']), '视频完播 ', formatPercentValue),
-    getMetricText(pickCreatorValue(creator, ['fans35PlusRatio', 'fans_35_plus_ratio']), '35+ ', formatPercentValue),
-    getMetricText(pickCreatorValue(creator, ['search_recommend_ratio']), '搜推 ', formatPercentValue),
+    getMetricText(pickCreatorValue(creator, ['searchReviewStatus', 'search_recommend_review_status']), '搜推 ', value => value),
   ], 6);
   const noteText = noteCases.length
     ? `${noteCases.slice(0, 2).map(note => note.title).join('、')} 等 ${noteCases.length} 条内容可作样本`

@@ -1,18 +1,18 @@
 import { DEFAULT_PGY_DISPLAY_METRICS } from '../constants/pgyConstants';
 import {
   HARD_FILTER_OPTIONS,
-  DEFAULT_COLLECTION_HARD_FILTER_FIELDS,
   DEFAULT_SCORING_HARD_FILTER_FIELDS,
   PGY_REQUIRED_FILTER_FIELDS,
   PGY_ADDITIONAL_FILTER_FIELDS,
+  pgyFilterKey,
 } from '../constants/screeningConstants';
 import {
   cloneHardFilterOption,
   defaultHardFilterCondition,
   getHardFilterOptionMeta,
   hardFilterConditionsFor,
+  mergeOptionItems,
   normalizePgyFilters,
-  syncCollectionHardFiltersFromPgyFilters,
 } from './pgyFilters';
 
 export { defaultHardFilterCondition, hardFilterConditionsFor };
@@ -75,11 +75,23 @@ export function getSchemeAdditionalFilters(scheme = {}) {
   return (scheme.filters || []).filter(item => PGY_ADDITIONAL_FILTER_FIELDS.has(item.field));
 }
 
+function splitSchemeFilters(filters = []) {
+  const required = [];
+  const additional = [];
+  (filters || []).forEach(item => {
+    if (PGY_REQUIRED_FILTER_FIELDS.has(item.field)) {
+      required.push(item);
+    } else {
+      additional.push(item);
+    }
+  });
+  return { required, additional };
+}
+
 export function normalizeWorkbenchPlan(plan = {}) {
   const pgyPlan = plan.pgyCollectionPlan || {};
-  const collectionDefaults = hardFilterOptionsFor(DEFAULT_COLLECTION_HARD_FILTER_FIELDS);
   const scoringDefaults = hardFilterOptionsFor(DEFAULT_SCORING_HARD_FILTER_FIELDS);
-  const collectionHardFilters = normalizeHardFilterList(getLegacyCollectionHardFilters(plan), collectionDefaults);
+  const collectionHardFilters = [];
   const scoringHardFilters = normalizeHardFilterList(getLegacyScoringHardFilters(plan), scoringDefaults);
   const normalizePlanFilter = (item = {}) => ({
     field: item.field || '',
@@ -101,19 +113,24 @@ export function normalizeWorkbenchPlan(plan = {}) {
     source: item.source || '',
   });
   const normalizePlanFilterList = (filters = []) => normalizePgyFilters(filters || []).map(normalizePlanFilter);
+  const planFilters = normalizePlanFilterList(pgyPlan.filters || []);
+  const inheritedSchemeFilters = splitSchemeFilters(planFilters);
   const schemes = Array.isArray(pgyPlan.schemes)
     ? pgyPlan.schemes.map(scheme => {
       const requiredFilters = normalizePlanFilterList(scheme.required_filters || scheme.base_filters || []);
       const additionalFilters = normalizePlanFilterList(scheme.additional_filters || scheme.extra_filters || []);
       const enabledAdditionalFilters = normalizePlanFilterList(scheme.enabled_additional_filters || scheme.enabled_extra_filters || []);
+      const mergedRequiredFilters = mergeOptionItems(requiredFilters, inheritedSchemeFilters.required, pgyFilterKey);
+      const mergedAdditionalFilters = mergeOptionItems(additionalFilters, inheritedSchemeFilters.additional, pgyFilterKey);
+      const mergedEnabledAdditionalFilters = mergeOptionItems(enabledAdditionalFilters, inheritedSchemeFilters.additional, pgyFilterKey);
       return {
         ...scheme,
-        required_filters: requiredFilters,
-        base_filters: requiredFilters,
-        additional_filters: additionalFilters,
-        extra_filters: additionalFilters,
-        enabled_additional_filters: enabledAdditionalFilters,
-        enabled_extra_filters: enabledAdditionalFilters,
+        required_filters: mergedRequiredFilters,
+        base_filters: mergedRequiredFilters,
+        additional_filters: mergedAdditionalFilters,
+        extra_filters: mergedAdditionalFilters,
+        enabled_additional_filters: mergedEnabledAdditionalFilters,
+        enabled_extra_filters: mergedEnabledAdditionalFilters,
       };
     })
     : pgyPlan.schemes;
@@ -129,7 +146,7 @@ export function normalizeWorkbenchPlan(plan = {}) {
     pgyCollectionPlan: {
       ...pgyPlan,
       hard_filters: collectionHardFilters,
-      filters: normalizePlanFilterList(pgyPlan.filters || []),
+      filters: Array.isArray(schemes) && schemes.length ? [] : planFilters,
       schemes,
       display_metrics: pgyPlan.display_metrics || DEFAULT_PGY_DISPLAY_METRICS,
       detail_fields: pgyPlan.detail_fields || ['基础画像', '粉丝画像', '报价', '合作表现', '内容表现'],
@@ -156,10 +173,9 @@ export function syncScreeningCriteria(plan = {}) {
   const scoringCriteria = plan.scoringCriteria && typeof plan.scoringCriteria === 'object' ? plan.scoringCriteria : {};
   const pgyCollectionPlan = plan.pgyCollectionPlan && typeof plan.pgyCollectionPlan === 'object' ? plan.pgyCollectionPlan : {};
   const pgyFilters = Array.isArray(pgyCollectionPlan.filters) ? normalizePgyFilters(pgyCollectionPlan.filters) : [];
-  const collectionSource = pgyFilters.length
-    ? syncCollectionHardFiltersFromPgyFilters(pgyFilters, plan.collectionHardFilters || getLegacyCollectionHardFilters(plan))
-    : plan.collectionHardFilters || getLegacyCollectionHardFilters(plan);
-  const collectionHardFilters = normalizeForSave(collectionSource);
+  const collectionHardFilters = [];
+  const hasSchemes = Array.isArray(pgyCollectionPlan.schemes) && pgyCollectionPlan.schemes.length > 0;
+  const inheritedSchemeFilters = splitSchemeFilters(pgyFilters);
   return {
     ...plan,
     collectionHardFilters,
@@ -168,17 +184,25 @@ export function syncScreeningCriteria(plan = {}) {
     scoringWeights,
     pgyCollectionPlan: {
       ...pgyCollectionPlan,
-      filters: pgyFilters.length ? pgyFilters : pgyCollectionPlan.filters,
+      filters: hasSchemes ? [] : (pgyFilters.length ? pgyFilters : pgyCollectionPlan.filters),
       schemes: Array.isArray(pgyCollectionPlan.schemes)
-        ? pgyCollectionPlan.schemes.map(scheme => ({
-          ...scheme,
-          required_filters: normalizePgyFilters(scheme.required_filters || scheme.base_filters || []),
-          base_filters: normalizePgyFilters(scheme.required_filters || scheme.base_filters || []),
-          additional_filters: normalizePgyFilters(scheme.additional_filters || scheme.extra_filters || []),
-          extra_filters: normalizePgyFilters(scheme.additional_filters || scheme.extra_filters || []),
-          enabled_additional_filters: normalizePgyFilters(scheme.enabled_additional_filters || scheme.enabled_extra_filters || []),
-          enabled_extra_filters: normalizePgyFilters(scheme.enabled_additional_filters || scheme.enabled_extra_filters || []),
-        }))
+        ? pgyCollectionPlan.schemes.map(scheme => {
+          const requiredFilters = normalizePgyFilters(scheme.required_filters || scheme.base_filters || []);
+          const additionalFilters = normalizePgyFilters(scheme.additional_filters || scheme.extra_filters || []);
+          const enabledAdditionalFilters = normalizePgyFilters(scheme.enabled_additional_filters || scheme.enabled_extra_filters || []);
+          const mergedRequiredFilters = mergeOptionItems(requiredFilters, inheritedSchemeFilters.required, pgyFilterKey);
+          const mergedAdditionalFilters = mergeOptionItems(additionalFilters, inheritedSchemeFilters.additional, pgyFilterKey);
+          const mergedEnabledAdditionalFilters = mergeOptionItems(enabledAdditionalFilters, inheritedSchemeFilters.additional, pgyFilterKey);
+          return {
+            ...scheme,
+            required_filters: mergedRequiredFilters,
+            base_filters: mergedRequiredFilters,
+            additional_filters: mergedAdditionalFilters,
+            extra_filters: mergedAdditionalFilters,
+            enabled_additional_filters: mergedEnabledAdditionalFilters,
+            enabled_extra_filters: mergedEnabledAdditionalFilters,
+          };
+        })
         : pgyCollectionPlan.schemes,
       hard_filters: collectionHardFilters,
     },

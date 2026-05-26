@@ -4,11 +4,13 @@ import copy
 import json
 import re
 import threading
+import uuid
 from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -24,22 +26,30 @@ from .config_store import (
 from .creator_store import (
     DETAIL_PRIORITY_HIGH_VALUES,
     archive_project,
+    bulk_upsert_creators,
     connect,
     change_creator_stage,
+    compact_creator_for_list,
+    count_creators,
     create_asset,
     create_handoff,
     create_task,
     create_tasks_from_handoff,
     create_batch,
+    close_stale_running_batches,
     creator_pool,
     creator_pool_detail,
+    creator_screening_stats,
     export_creator_pool_csv,
     finish_batch,
+    get_batch,
     get_project,
+    get_creator,
     delete_project,
     import_csv,
     get_project_writeback_settings,
     init_db,
+    is_test_project_id,
     list_assets,
     list_batches,
     list_creators,
@@ -105,9 +115,44 @@ _COLLECT_LOCKS: dict[str, threading.Lock] = {}
 _COLLECT_LOCKS_GUARD = threading.Lock()
 _COLLECT_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _COLLECT_CANCEL_EVENTS_GUARD = threading.Lock()
+_DETAIL_COLLECT_LOCKS: dict[str, threading.Lock] = {}
+_DETAIL_COLLECT_LOCKS_GUARD = threading.Lock()
+_DETAIL_COLLECT_TASKS: dict[str, dict[str, Any]] = {}
+_DETAIL_COLLECT_TASKS_GUARD = threading.Lock()
 SCREENING_OPTIMIZE_LLM_MAX_TOKENS = 64000
 SCREENING_OPTIMIZE_LLM_TIMEOUT_SECONDS = 300
 PGY_COLLECTION_SCHEME_COUNT = 4
+
+
+def _queue_collect_scoring(project_id: str, creator_ids: list[str], batch_id: str) -> dict[str, Any]:
+    queued_ids = list(dict.fromkeys(str(item) for item in creator_ids if item))
+    if not queued_ids:
+        return {"async": False, "queued": 0, "message": "无待评分达人"}
+    update_batch_progress(
+        batch_id,
+        stage="score_queued",
+        message=f"采集入库完成，已排队后台规则评分：{len(queued_ids)} 位达人",
+    )
+    if is_test_project_id(project_id):
+        return {"async": True, "queued": len(queued_ids), "use_llm": False, "message": "测试项目已记录规则评分排队"}
+
+    def runner() -> None:
+        try:
+            result = score_project(project_id, use_llm=False, creator_ids=queued_ids, trigger_source="pgy_collect_rule")
+            scored = int(result.get("scored") or 0)
+            update_batch_progress(
+                batch_id,
+                stage="rule_scored",
+                message=f"后台规则评分完成：{scored}/{len(queued_ids)} 位达人",
+            )
+        except Exception as error:
+            message = f"后台规则评分失败：{str(error)[:180]}"
+            update_batch_progress(batch_id, stage="score_failed", message=message)
+            with connect() as conn:
+                log(conn, project_id, "score", "后台规则评分失败", project_id, "系统", message, "failed")
+
+    threading.Thread(target=runner, name=f"pgy-score-{batch_id[:8]}", daemon=True).start()
+    return {"async": True, "queued": len(queued_ids), "use_llm": False, "message": "规则评分已转入后台执行"}
 
 
 def _collect_lock(project_id: str) -> threading.Lock:
@@ -126,6 +171,75 @@ def _collect_cancel_event(project_id: str) -> threading.Event:
             event = threading.Event()
             _COLLECT_CANCEL_EVENTS[project_id] = event
         return event
+
+
+def _detail_collect_lock(project_id: str) -> threading.Lock:
+    with _DETAIL_COLLECT_LOCKS_GUARD:
+        lock = _DETAIL_COLLECT_LOCKS.get(project_id)
+        if lock is None:
+            lock = threading.Lock()
+            _DETAIL_COLLECT_LOCKS[project_id] = lock
+        return lock
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _detail_collect_task_snapshot(task_id: str) -> dict[str, Any] | None:
+    with _DETAIL_COLLECT_TASKS_GUARD:
+        task = _DETAIL_COLLECT_TASKS.get(task_id)
+        return copy.deepcopy(task) if task else None
+
+
+def _running_detail_collect_task(project_id: str) -> dict[str, Any] | None:
+    with _DETAIL_COLLECT_TASKS_GUARD:
+        running = [
+            task
+            for task in _DETAIL_COLLECT_TASKS.values()
+            if task.get("project_id") == project_id and task.get("status") == "running"
+        ]
+        if not running:
+            return None
+        running.sort(key=lambda item: str(item.get("started_at") or ""), reverse=True)
+        return copy.deepcopy(running[0])
+
+
+def _update_detail_collect_task(task_id: str, **patch: Any) -> dict[str, Any]:
+    with _DETAIL_COLLECT_TASKS_GUARD:
+        task = _DETAIL_COLLECT_TASKS.get(task_id) or {"task_id": task_id}
+        task.update({key: value for key, value in patch.items() if value is not None})
+        total = int(task.get("total_count") or 0)
+        completed = int(task.get("completed_count") or 0)
+        failed = int(task.get("failed_count") or 0)
+        done = min(total, completed + failed) if total else completed + failed
+        if total:
+            task["progress_text"] = f"{done}/{total} 达人已完成"
+            if not task.get("progress_message"):
+                task["progress_message"] = f"详情完善中：{done}/{total} 达人已完成"
+        _DETAIL_COLLECT_TASKS[task_id] = task
+        return copy.deepcopy(task)
+
+
+def _create_detail_collect_task(project_id: str, targets: list[dict[str, Any]], payload: DetailCollectPayload) -> dict[str, Any]:
+    task_id = f"detail_{uuid.uuid4().hex}"
+    total = len(targets)
+    return _update_detail_collect_task(
+        task_id,
+        project_id=project_id,
+        status="running",
+        progress_stage="starting",
+        total_count=total,
+        completed_count=0,
+        failed_count=0,
+        current_creator_id="",
+        current_nickname="",
+        segment=payload.segment or "",
+        manual=bool(payload.manual or payload.creator_ids),
+        started_at=_now_text(),
+        finished_at="",
+        progress_message=f"详情完善中：0/{total} 达人已完成",
+    )
 
 
 class FeishuConnectionPayload(BaseModel):
@@ -184,6 +298,13 @@ class CreatorPayload(BaseModel):
 class CreatorImportPayload(BaseModel):
     csv_path: str | None = None
     rows: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ScorePayload(BaseModel):
+    creator_ids: list[str] = Field(default_factory=list)
+    source: str = "manual"
+    segment: str = ""
+    segment_label: str = ""
 
 
 class ReviewPayload(BaseModel):
@@ -280,6 +401,7 @@ class BatchCollectPayload(BaseModel):
     multi_scheme: bool = True
     preflight: bool = True
     collect_out_of_range: bool = False
+    async_collect: bool = False
 
 
 class BatchCollectStopPayload(BaseModel):
@@ -291,7 +413,8 @@ class DetailCollectPayload(BaseModel):
     creator_ids: list[str] = Field(default_factory=list)
     segment: str | None = None
     manual: bool = False
-    limit: int = 20
+    limit: int = 500
+    async_collect: bool = False
 
 
 class XhsNoteParsePayload(BaseModel):
@@ -334,6 +457,7 @@ class ScreeningStandardPayload(BaseModel):
 
 
 app = FastAPI(title="第三事业部达人筛选工作台")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -343,6 +467,7 @@ app.add_middleware(
 
 ensure_dirs()
 init_db()
+close_stale_running_batches("服务已重启，原采集线程不存在，已自动收口为停止状态；请以新批次为准")
 
 
 @app.get("/")
@@ -381,7 +506,7 @@ def overview(
     include_test_projects: bool = Query(default=False),
     include_archived: bool = Query(default=False),
 ) -> dict[str, Any]:
-    return {"projects": list_projects(include_test_projects=include_test_projects, include_archived=include_archived)}
+    return {"projects": _hydrate_projects_for_response(list_projects(include_test_projects=include_test_projects, include_archived=include_archived))}
 
 
 @app.get("/api/runtime/version")
@@ -394,7 +519,7 @@ def api_projects(
     include_test_projects: bool = Query(default=False),
     include_archived: bool = Query(default=False),
 ) -> dict[str, Any]:
-    return {"projects": list_projects(include_test_projects=include_test_projects, include_archived=include_archived)}
+    return {"projects": _hydrate_projects_for_response(list_projects(include_test_projects=include_test_projects, include_archived=include_archived))}
 
 
 @app.get("/api/projects/{project_id}")
@@ -402,14 +527,23 @@ def api_project(project_id: str) -> dict[str, Any]:
     project = get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail={"message": "项目不存在"})
-    return {"project": project}
+    return {"project": _hydrate_project_for_response(project)}
 
 
 @app.post("/api/projects/{project_id}")
 def api_save_project(project_id: str, payload: ProjectPayload) -> dict[str, Any]:
     data = payload.model_dump(exclude_none=True)
     if isinstance(data.get("screening_plan"), dict):
+        existing = get_project(project_id) or {}
         data["screening_plan"] = _sync_screening_plan_criteria(data["screening_plan"])
+        brief_text = str(data.get("brief") or existing.get("brief") or "")
+        data["screening_plan"] = _sync_screening_plan_criteria(
+            _prune_default_fan_age_hard_filters_for_brief(data["screening_plan"], brief_text)
+        )
+        data["screening_plan"] = _hydrate_screening_plan_project_defaults(
+            data["screening_plan"],
+            brief_text,
+        )
     return {"project": save_project(project_id, data)}
 
 
@@ -442,13 +576,43 @@ def api_creators(
     project_id: str,
     status: str | None = Query(default=None),
     q: str | None = Query(default=None),
+    include_raw: bool = Query(default=False),
+    page: int | None = Query(default=None, ge=1),
+    page_size: int | None = Query(default=None, ge=1, le=500),
 ) -> dict[str, Any]:
-    return {"creators": list_creators(project_id, status=status, q=q)}
+    limit = page_size if page and page_size else None
+    offset = ((page or 1) - 1) * (page_size or 0) if limit is not None else 0
+    creators = list_creators(project_id, status=status, q=q, include_raw=include_raw, limit=limit, offset=offset)
+    if not include_raw:
+        creators = [compact_creator_for_list(creator) for creator in creators]
+    payload: dict[str, Any] = {"creators": creators}
+    if limit is not None:
+        total = count_creators(project_id, status=status, q=q)
+        payload.update({
+            "page": page or 1,
+            "page_size": page_size,
+            "total": total,
+            "has_more": offset + len(creators) < total,
+        })
+    return payload
+
+
+@app.get("/api/projects/{project_id}/creators/stats")
+def api_creator_screening_stats(project_id: str) -> dict[str, Any]:
+    return creator_screening_stats(project_id)
 
 
 @app.get("/api/projects/{project_id}/creators/quality-summary")
 def api_creator_quality_summary(project_id: str) -> dict[str, Any]:
     return creator_quality_summary(project_id)
+
+
+@app.get("/api/projects/{project_id}/creators/{creator_id}")
+def api_creator_detail(project_id: str, creator_id: str) -> dict[str, Any]:
+    creator = get_creator(project_id, creator_id)
+    if not creator:
+        raise HTTPException(status_code=404, detail={"message": "达人不存在"})
+    return {"creator": creator}
 
 
 @app.post("/api/projects/{project_id}/creators")
@@ -481,8 +645,56 @@ def api_update_creator(project_id: str, creator_id: str, payload: CreatorPayload
 
 
 @app.post("/api/projects/{project_id}/creators/score")
-def api_score_creators(project_id: str) -> dict[str, Any]:
-    return score_project(project_id, trigger_source="manual")
+def api_score_creators(project_id: str, payload: ScorePayload | None = None) -> dict[str, Any]:
+    payload = payload or ScorePayload()
+    creator_ids = [str(item) for item in payload.creator_ids if str(item or "").strip()]
+    source = payload.source or "manual_ai"
+    if source in {"rule", "manual_rule", "system", "system_rule", "batch_rule", "pgy_collect_rule"}:
+        return score_project(
+            project_id,
+            use_llm=False,
+            creator_ids=creator_ids or None,
+            trigger_source=source,
+        )
+    ai_config = read_ai_config()
+    if not ai_config.get("api_key_configured"):
+        message = f"未配置 API Key 或环境变量 {ai_config.get('api_key_env') or 'OPENAI_API_KEY'}，无法调用大模型评分"
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "ok": False,
+                "error": "llm_config_missing",
+                "message": message,
+                "source": "llm",
+                "sources": {"llm": 0, "generated": 0, "rule": 0},
+                "trigger_source": source,
+                "llm_errors": [message],
+                "suggestion": "请在高级配置中填写 API Key，或设置对应环境变量后重启服务，再点击模型连接测试。",
+            },
+        )
+    try:
+        return score_project(
+            project_id,
+            use_llm=True,
+            creator_ids=creator_ids or None,
+            trigger_source=source,
+            fallback_on_llm_error=False,
+        )
+    except RuntimeError as error:
+        message = str(error) or "大模型评分失败"
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "ok": False,
+                "error": "llm_score_failed",
+                "message": message,
+                "source": "llm",
+                "sources": {"llm": 0, "generated": 0, "rule": 0},
+                "trigger_source": source,
+                "llm_errors": [message],
+                "suggestion": "请检查大模型 API Key、Base URL、模型名称、网络连通性，或在高级配置中先测试模型连接。",
+            },
+        )
 
 
 @app.post("/api/projects/{project_id}/creators/review")
@@ -592,8 +804,12 @@ def api_export_creator_pool_xlsx(project_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/projects/{project_id}/batches")
-def api_batches(project_id: str) -> dict[str, Any]:
-    return {"batches": list_batches(project_id)}
+def api_batches(
+    project_id: str,
+    status: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=100),
+) -> dict[str, Any]:
+    return {"batches": list_batches(project_id, status=status, limit=limit)}
 
 
 @app.get("/api/projects/{project_id}/logs")
@@ -911,6 +1127,7 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
     fields = payload.feishu_fields or []
     names = [str(item.get("field_name") or item.get("name") or item.get("title") or "") for item in fields]
     project_info = payload.project or {}
+    brief_text = payload.brief or ""
 
     def number(value: Any, default: float = 0) -> float:
         try:
@@ -921,7 +1138,7 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
     total_budget = number(project_info.get("budget"), 120000)
     target_count = max(int(number(project_info.get("creatorCount"), 10)), 1)
     expected_single_cost = round(total_budget / target_count, 2)
-    single_hard_cap = number(project_info.get("singleBudget"), 20000)
+    single_hard_cap = number(project_info.get("singleBudget"), _brief_single_budget_cap(brief_text) or 20000)
 
     def match(*keywords: str) -> str | None:
         for name in names:
@@ -935,7 +1152,6 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
 
     hard_filters = [
         {"field": "单达人预算硬上限", "condition": "<=", "value": f"报价≤¥{single_hard_cap:g}；参考成本¥{expected_single_cost:g}", "required": True, "feishuField": match("平台报价", "报价", "合作价格")},
-        {"field": "已确认粉丝画像", "condition": ">=", "value": "35岁以上占比 40%；仅在已采到该字段时作为确认事实", "required": True, "feishuField": match("34岁以上", "35岁以上")},
         {"field": "近30天效果", "condition": "同T级对比", "value": "曝光、阅读、互动需达到同T级正常线，明显低于P25视为数据风险", "required": True, "feishuField": match("曝光", "阅读", "互动")},
         {"field": "预算效果效率", "condition": "核算", "value": "用报价、CPM、CPC、CPE推导单达人可获得曝光/阅读/互动总量", "required": True, "feishuField": match("cpm", "cpc", "cpe")},
         {"field": "已确认风险", "condition": "规避", "value": "仅已确认限流、违规、异常流量作为风险；缺字段不等于风险", "required": True, "feishuField": match("限流风险", "流量稳定")},
@@ -979,13 +1195,14 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
         mapping("品牌反馈", "品牌反馈", confidence=0.75),
         mapping("达人反馈", "达人反馈", confidence=0.75),
     ]
-    brief_text = payload.brief or ""
     emphasizes_region = _brief_mentions_region_priority(brief_text)
     wants_parent = any(keyword in brief_text for keyword in ["母婴", "亲子", "妈妈", "爸爸", "孩子", "大孩", "家庭"])
-    wants_education = any(keyword in brief_text for keyword in ["教育", "学习", "升学", "初中", "高中", "小升初", "答疑", "老师", "教师"])
+    wants_education = any(keyword in brief_text for keyword in ["教育", "学习", "升学", "初中", "高中", "小升初", "答疑", "老师", "教师", "留学", "语言"])
+    wants_parent_decision = any(keyword in brief_text for keyword in ["家长", "父母", "妈妈", "爸爸", "宝妈", "亲子", "家庭决策", "陪读"])
+    wants_study_abroad = _brief_is_study_abroad(brief_text)
     strong_preferences = [
-        "高知/教师/教育规划人设",
-        "小升初、初中、高中等大孩家庭",
+        "目标人群、使用者或决策者与产品推广目标一致",
+        "内容场景能自然讲清产品痛点、使用链路和核心卖点",
         "自然流量效率较好，CPC/CPE可解释",
     ]
     if emphasizes_region:
@@ -998,31 +1215,63 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
     backend_mappable_filters.extend(
         [
             {"field": "粉丝量", "value": "1万以上", "mapping_type": "direct", "confidence": "medium", "business_requirement": "保证基础粉丝量；只设下限避免误卡上限"},
-            {"field": "粉丝年龄", "value": "35～44 占比高", "mapping_type": "direct", "confidence": "high", "business_requirement": "家长决策人群"},
             {"field": "合作报价", "value": f"图文笔记：0.1万～{single_hard_cap / 10000:g}万", "mapping_type": "direct", "confidence": "high", "business_requirement": "单达人预算上限"},
         ]
     )
+    if wants_parent_decision and not wants_study_abroad:
+        backend_mappable_filters.append({"field": "粉丝年龄", "value": "35～44 占比高", "mapping_type": "proxy", "confidence": "medium", "business_requirement": "Brief 明确出现家长/亲子等人群时可作为代理字段"})
+    if wants_study_abroad:
+        backend_mappable_filters.extend(
+            [
+                {"field": "职业身份", "value": "学生", "mapping_type": "direct", "confidence": "medium", "business_requirement": "Brief 明确出现学生身份时可作为候选画像字段"},
+                {"field": "特色背景", "value": "留学背景", "mapping_type": "direct", "confidence": "medium", "business_requirement": "Brief 明确出现留学/海外背景时可作为候选画像字段"},
+            ]
+        )
     if emphasizes_region:
         backend_mappable_filters.append({"field": "地域", "value": "北京/上海", "mapping_type": "direct", "confidence": "medium", "business_requirement": "地域优先"})
     brief_decomposition = {
         "brief_facts": [
             {"category": "budget", "fact": f"单达人预算上限约 ¥{single_hard_cap:g}，参考单人成本 ¥{expected_single_cost:g}"},
-            {"category": "audience", "fact": "优先家长决策人群，粉丝年龄以35岁以上为重要信号"},
-            {"category": "persona", "fact": "教育、亲子、家庭教育决策场景是核心相关方向"},
+            {"category": "audience", "fact": "需要从 Brief 中识别核心使用者、决策者与目标受众"},
+            {"category": "persona", "fact": "账号人设、内容场景和表达方式需要能承接产品推广策略"},
             {"category": "performance", "fact": "需要结合报价、CPM/CPC/CPE和近30天曝光/阅读/互动判断投流效果"},
+        ],
+        "promotion_audience_analysis": {
+            "actual_users": ["Brief 中产品场景指向的真实使用者/体验者"],
+            "decision_makers": ["Brief 中购买/报名/转化链路指向的决策者"],
+            "content_influenced_audience": ["Brief 中内容场景主要影响的人群"],
+            "inferred_fans_age": [
+                {
+                    "pgy_field": "粉丝年龄",
+                    "pgy_value": "Brief未明确",
+                    "reason": "本地兜底不预设固定年龄段；需依据 Brief 原文、产品使用者和转化链路人工校正。",
+                    "confidence": "low",
+                    "placement": "manual_review",
+                }
+            ],
+            "not_target_audiences": ["Brief 未明确要求的历史模板人群"],
+            "reasoning": "本地兜底只保留中性结构，不预设行业固定人群；最终应以 Brief 原文和采后证据校正。",
+        },
+        "rule_placement_matrix": [
+            {"brief_requirement": "单达人预算上限", "placement": "hard_rule", "reason": "报价字段可直接确认，超预算会影响合作可行性", "is_one_vote_veto": True},
+            {"brief_requirement": "身份/背景要求", "placement": "pgy_additional", "reason": "若 Brief 明确要求且蒲公英存在对应真实画像字段，可作为附加筛选；采后仍需用主页简介和笔记证据复核真实性", "is_one_vote_veto": False},
+            {"brief_requirement": "内容主题/内容占比要求", "placement": "post_score", "reason": "默认需要结合近期笔记证据判断；如 Brief 明确为硬性且已有稳定字段可验证，可调整为 hard_rule", "is_one_vote_veto": False},
+            {"brief_requirement": "限流/异常流量", "placement": "hard_rule", "reason": "仅在字段已确认高风险时作为硬风险", "is_one_vote_veto": True},
         ],
         "must_have_requirements": [
             "报价不超过单达人预算硬上限",
-            "粉丝年龄与家长决策人群相关",
-            "账号内容或人设需要与教育/亲子/家庭教育场景有明确证据",
+            "账号内容或人设需要与产品目标人群、使用场景或决策链路有明确证据",
+            "近期内容需要能自然承接产品痛点和核心卖点，不能只靠类目关键词命中",
         ],
         "strong_preferences": strong_preferences,
         "negative_constraints": [
-            "不优先孕期、低幼辅食、低龄早教等与大孩教育决策弱相关账号",
-            "不优先纯生活方式妈妈或泛家庭日常账号",
-            "不优先护肤、养生、家居等只挂母婴标签但教育场景弱的账号",
-            "不优先缺少教育内容证据、仅靠类目关键词命中的账号",
+            "不优先只挂相关类目但缺少产品使用场景证据的账号",
+            "不优先内容主题与产品痛点、目标人群或转化场景弱相关的账号",
+            "不优先报价虽低但阅读互动过弱、无法支撑基础种草效果的账号",
+            "不优先近期内容高度泛化、硬广感强或风险字段不明的账号",
         ],
+        "assumptions": ["本地兜底无法完整理解 Brief，仅按预算、字段和可执行筛选结构生成保守假设"],
+        "unknowns": ["Brief 中未明确的真实目标人群、硬性门槛和负向排除项需要人工复核"],
         "backend_mappable_filters": backend_mappable_filters,
         "proxy_filters": [
             {
@@ -1035,14 +1284,15 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
             }
         ] if wants_parent else [],
         "post_score_rules": [
-            {"rule_name": "教育决策场景相关度", "required_evidence": ["达人类目", "主页简介", "近期笔记标题", "笔记文案"], "fallback_action": "证据不足则降档并待复核", "score_impact": "high"},
-            {"rule_name": "大孩家庭相关度", "required_evidence": ["孩子年龄", "孩子年级", "近期内容主题"], "fallback_action": "缺失不视为通过，最多备选", "score_impact": "high"},
-            {"rule_name": "高知/教师人设", "required_evidence": ["主页简介", "身份标签", "长期内容主题"], "fallback_action": "仅关键词命中不加高分", "score_impact": "medium"},
+            {"rule_name": "产品场景相关度", "required_evidence": ["达人类目", "主页简介", "近期笔记标题", "笔记文案"], "fallback_action": "证据不足则降档并待复核", "score_impact": "high"},
+            {"rule_name": "目标人群匹配度", "required_evidence": ["粉丝画像", "账号人设", "近期内容主题", "评论互动语境"], "fallback_action": "缺失不视为通过，最多备选", "score_impact": "high"},
+            {"rule_name": "卖点承接能力", "required_evidence": ["内容形式", "表达方式", "产品痛点相关笔记", "历史商业内容"], "fallback_action": "无法自然讲清卖点则不进入强推荐", "score_impact": "medium"},
             {"rule_name": "投流效率", "required_evidence": ["报价", "CPM", "CPC", "CPE", "阅读/互动中位数"], "fallback_action": "效率缺失时保留但不进入强推荐", "score_impact": "high"},
+            {"rule_name": "内容主题占比", "required_evidence": ["近期笔记标题", "笔记正文", "详情页内容标签"], "fallback_action": "作为内容匹配加减分和复核项，不作为一票否决", "score_impact": "medium"},
         ],
         "manual_review_rules": [
-            "高知家庭、教师身份、国际学校/住校生/学区房叙事需人工确认",
-            "母婴补量池达人必须复核是否真有大孩教育场景",
+            "Brief 中无法被蒲公英前置筛出的目标人群、身份背景、真实使用场景需人工确认",
+            "所有 proxy 补量池达人必须复核是否真的能承接产品推广策略",
             "类目相关但内容证据不足的达人不得直接进入强推荐",
         ],
     }
@@ -1066,7 +1316,6 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
                 {"field": "博主类目", "value": "教育", "sub_value": "家庭教育", "reason": "必备筛选：教育学习场景强相关"},
                 {"field": "博主类目", "value": "教育", "sub_value": "k12教育", "reason": "必备筛选：覆盖K12/小升初/初高中学习场景"},
                 {"field": "粉丝量", "value": "1万以上", "reason": "必备筛选：优先有基础粉丝量达人；只设下限避免误卡上限", "control_type": "preset_or_number_range", "min": 10000, "range_policy": "min_only"},
-                {"field": "粉丝年龄", "value": "35～44 占比高", "reason": "必备筛选：家长决策人群优先", "control_type": "dropdown"},
                 {"field": "合作报价", "value": "图文笔记：0.1万～2万", "reason": "必备筛选：控制单达人预算", "control_type": "subfield_preset_or_number_range", "sub_field": "图文笔记", "max": 20000},
             ],
             "additional_filters": [
@@ -1074,7 +1323,7 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
                 {"field": "预估互动单价", "value": "图文笔记互动单价≤20", "reason": "附加筛选：数量过多时控制互动成本", "control_type": "subfield_preset_or_number_range", "sub_field": "图文笔记互动单价", "max": 20},
             ],
             "filters": [],
-            "expand_if_too_few": ["放宽粉丝年龄", "放宽合作报价上限但保留评分扣分"],
+            "expand_if_too_few": ["放宽合作报价上限但保留评分扣分", "放宽粉丝量下限"],
             "narrow_if_too_many": ["启用预估阅读单价≤2", "启用预估互动单价≤20"],
         },
         {
@@ -1091,7 +1340,6 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
                 {"field": "博主类目", "value": "母婴", "sub_value": "育儿经验", "reason": "覆盖家长和亲子账号"},
                 {"field": "博主类目", "value": "母婴", "sub_value": "早教", "reason": "补充亲子教育/启蒙相关账号，需采后复核是否符合大孩教育"},
                 {"field": "粉丝量", "value": "1万以上", "reason": "必备筛选：优先有基础粉丝量达人；只设下限避免误卡上限", "control_type": "preset_or_number_range", "min": 10000, "range_policy": "min_only"},
-                {"field": "粉丝年龄", "value": "35～44 占比高", "reason": "必备筛选：家长决策人群优先", "control_type": "dropdown"},
                 {"field": "合作报价", "value": "图文笔记：0.1万～2万", "reason": "必备筛选：控制单达人预算", "control_type": "subfield_preset_or_number_range", "sub_field": "图文笔记", "max": 20000},
             ],
             "additional_filters": [
@@ -1114,7 +1362,6 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
                 {"field": "博主类目", "value": "教育", "sub_value": "k12教育", "reason": "保持教育场景相关"},
                 {"field": "博主类目", "value": "教育", "sub_value": "学习日常", "reason": "补充学习效率/学习工具内容型达人"},
                 {"field": "粉丝量", "value": "0.5万以上", "reason": "必备筛选：扩大低预算中腰部达人；只设下限避免误卡上限", "control_type": "preset_or_number_range", "min": 5000, "range_policy": "min_only"},
-                {"field": "粉丝年龄", "value": "35～44 占比高", "reason": "必备筛选：家长决策人群优先", "control_type": "dropdown"},
                 {"field": "合作报价", "value": "图文笔记：0.1万～1万", "reason": "必备筛选：强调性价比", "control_type": "subfield_preset_or_number_range", "sub_field": "图文笔记", "max": 10000},
             ],
             "additional_filters": [
@@ -1139,7 +1386,6 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
                 {"field": "博主类目", "value": "教育", "sub_value": "k12教育", "reason": "覆盖K12/大孩学习场景"},
                 {"field": "博主类目", "value": "母婴", "sub_value": "育儿经验", "reason": "覆盖亲子和家庭教育叙事"},
                 {"field": "粉丝量", "value": "1万以上", "reason": "保证基础讨论度；只设下限避免误卡上限", "control_type": "preset_or_number_range", "min": 10000, "range_policy": "min_only"},
-                {"field": "粉丝年龄", "value": "35～44 占比高", "reason": "优先命中家长决策人群", "control_type": "dropdown"},
                 {"field": "合作报价", "value": "图文笔记：0.1万～2万", "reason": "满足单达人预算上限", "control_type": "subfield_preset_or_number_range", "sub_field": "图文笔记", "max": 20000},
             ],
             "additional_filters": [
@@ -1151,6 +1397,14 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
             "narrow_if_too_many": ["启用曝光中位数门槛", "启用阅读中位数门槛"],
         },
     ]
+    project_fit_config = _fallback_project_fit_config(brief_text, brief_decomposition)
+    promotion_strategy = _fallback_promotion_strategy(brief_text, brief_decomposition, project_fit_config)
+    project_special_scoring = _fallback_project_special_scoring(
+        brief_text,
+        brief_decomposition,
+        promotion_strategy,
+        project_fit_config,
+    )
     scoring_criteria = {
         "purpose": "用于采集后对达人做两阶段评分：先用找博主列表页数据做数据层分级，再用达人详情页、主页简介、笔记标题/文案做大模型人设内容判断。",
         "budget_policy": budget_policy,
@@ -1163,8 +1417,8 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
             {"key": "fans", "name": "粉丝T级坐标", "weight": weights["fans"], "positive": ["用T级校准同量级预期"], "negative": ["不因粉丝多直接加分；不因缺画像直接淘汰"]},
             {"key": "cpe", "name": "CPM/CPC/CPE效率", "weight": weights["cpe"], "positive": ["CPM/CPC/CPE达到同T级正常或优秀水平"], "negative": ["成本效率明显低于同T级标准"]},
             {"key": "engagement", "name": "近30天曝光阅读互动", "weight": weights["engagement"], "positive": ["近30天曝光、阅读、互动达到同T级P50/P75"], "negative": ["多项低于P25或明显异常"]},
-            {"key": "persona", "name": "人设与 Brief 匹配", "weight": weights["persona"], "positive": ["主页简介、详情页、笔记标题/文案能证明大孩家长、教育规划等场景"], "negative": ["只有关键词或偶发内容，缺少长期证据"]},
-            {"key": "content", "name": "内容调性与笔记证据", "weight": weights["content"], "positive": ["整体内容调性稳定，笔记标题/正文有真实场景"], "negative": ["内容泛化、硬广感强或与Brief场景弱相关"]},
+            {"key": "persona", "name": "人设与 Brief 匹配", "weight": weights["persona"], "positive": ["主页简介、详情页、笔记标题/文案能证明目标人群、使用场景或决策链路"], "negative": ["只有关键词或类目命中，缺少长期内容证据"]},
+            {"key": "content", "name": "内容调性与笔记证据", "weight": weights["content"], "positive": ["整体内容调性稳定，能自然承接产品痛点、卖点和转化场景"], "negative": ["内容泛化、硬广感强或与Brief场景弱相关"]},
         ],
         "recommendation_rules": [
             {"level": "强推荐", "condition": "硬性条件通过且综合分≥85，至少一个核心人设或效率优势明显"},
@@ -1182,6 +1436,9 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
         "dataLayerScoring": data_layer_scoring,
         "hardFilters": hard_filters,
         "briefDecomposition": brief_decomposition,
+        "projectFitConfig": project_fit_config,
+        "promotionStrategy": promotion_strategy,
+        "projectSpecialScoring": project_special_scoring,
         "scoringWeights": weights,
         "scoringCriteria": scoring_criteria,
         "fieldMappings": field_mappings,
@@ -1307,6 +1564,10 @@ def _brief_preferred_blogger_categories(brief: str) -> list[dict[str, Any]]:
         add("教育", "k12教育", "Brief 命中K12/小升初/初高中学习场景")
     if any(keyword in text for keyword in ["学习日常", "学习博主", "学习效率", "学习工具", "学霸", "学习"]):
         add("教育", "学习日常", "Brief 命中学习日常/学习效率内容场景")
+    if any(keyword in text for keyword in ["留学", "海外留学", "留学生", "出国", "雅思", "托福", "语言学习"]):
+        add("教育", "留学教育", "Brief 命中留学/海外学习场景")
+    if any(keyword in text for keyword in ["大学", "大学生", "高校", "留学生"]):
+        add("教育", "大学教育", "Brief 命中大学生/高校学习场景")
     if any(keyword in text for keyword in ["母婴", "亲子", "妈妈", "爸爸", "孩子", "育儿", "陪伴", "大孩"]):
         add("母婴", "育儿经验", "Brief 命中母婴/育儿/亲子家庭场景")
     if any(keyword in text for keyword in ["早教", "启蒙"]):
@@ -1333,7 +1594,13 @@ def _ensure_scheme_multi_blogger_subcategories(pgy_plan: dict[str, Any], brief: 
             value = item["value"]
             sub_value = item["sub_value"]
             should_add = any(str(existing.get("value") or "") == value for existing in category_items)
-            if value == "教育" and any(keyword in text for keyword in ["education", "教育", "学习", "k12", "family", "家庭", "city"]):
+            has_non_education_category = any(str(existing.get("value") or "") != "教育" for existing in category_items)
+            is_supplement_proxy = str(scheme.get("role") or "").lower() in {"supplement", "risk_test"} or any(keyword in text for keyword in ["proxy", "补量", "代理", "生活"])
+            if (
+                value == "教育"
+                and not (has_non_education_category and is_supplement_proxy)
+                and any(keyword in text for keyword in ["education", "教育", "学习", "k12", "family", "家庭", "city", "留学"])
+            ):
                 should_add = True
             if value == "母婴" and any(keyword in text for keyword in ["parent", "parenting", "母婴", "亲子", "家庭", "补量", "育儿"]):
                 should_add = True
@@ -1353,6 +1620,365 @@ def _ensure_scheme_multi_blogger_subcategories(pgy_plan: dict[str, Any], brief: 
     return plan
 
 
+def _pgy_filter_item(field: str, value: str, reason: str = "", **extra: Any) -> dict[str, Any]:
+    item = {
+        "field": field,
+        "value": value,
+        "reason": reason,
+    }
+    item.update({key: val for key, val in extra.items() if val not in (None, "", [])})
+    return item
+
+
+def _prepend_unique_filter(filters: list[dict[str, Any]], item: dict[str, Any]) -> list[dict[str, Any]]:
+    return _dedupe_filters([item, *(filters or [])])
+
+
+def _remove_filter(filters: list[dict[str, Any]], *, field: str, value: str | None = None, sub_value: str | None = None) -> list[dict[str, Any]]:
+    result = []
+    for item in filters or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("field") or "") != field:
+            result.append(item)
+            continue
+        if value is not None and str(item.get("value") or "") != value:
+            result.append(item)
+            continue
+        if sub_value is not None and str(item.get("sub_value") or item.get("subValue") or "") != sub_value:
+            result.append(item)
+            continue
+    return result
+
+
+def _brief_prefers_video(brief: str) -> bool:
+    text = str(brief or "")
+    return any(keyword in text for keyword in ["最好是视频", "视频优先", "视频为主", "短视频", "视频"])
+
+
+def _brief_is_study_abroad(brief: str) -> bool:
+    text = str(brief or "")
+    return any(keyword in text for keyword in ["留学", "海外留学", "海外留学生", "留学生", "出国", "雅思", "托福"])
+
+
+def _is_default_fan_age_hard_filter(item: dict[str, Any]) -> bool:
+    field = str(item.get("field") or item.get("standard") or "").strip()
+    pgy_field = str(item.get("pgyField") or "").strip()
+    value = str(item.get("value") or "").strip()
+    reason = str(item.get("reason") or "").strip()
+    return (
+        (field == "粉丝年龄" or pgy_field == "粉丝年龄")
+        and any(keyword in value for keyword in ["35", "34", "35～44", "35-44"])
+        and not any(keyword in reason for keyword in ["手动", "用户", "Brief明确", "客户明确"])
+    )
+
+
+def _prune_default_fan_age_hard_filters_for_brief(plan: dict[str, Any], brief: str) -> dict[str, Any]:
+    if not _brief_is_study_abroad(brief):
+        return plan
+    cleaned = copy.deepcopy(plan or {})
+
+    def prune(items: Any) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in (items or [])
+            if isinstance(item, dict) and not _is_default_fan_age_hard_filter(item)
+        ]
+
+    cleaned["collectionHardFilters"] = prune(cleaned.get("collectionHardFilters"))
+    cleaned["scoringHardFilters"] = prune(cleaned.get("scoringHardFilters"))
+    cleaned["hardFilters"] = prune(cleaned.get("hardFilters"))
+    criteria = cleaned.get("scoringCriteria") if isinstance(cleaned.get("scoringCriteria"), dict) else {}
+    cleaned["scoringCriteria"] = {**criteria, "hard_rules": prune(criteria.get("hard_rules"))}
+    pgy_plan = cleaned.get("pgyCollectionPlan") if isinstance(cleaned.get("pgyCollectionPlan"), dict) else {}
+    if pgy_plan:
+        cleaned["pgyCollectionPlan"] = {**pgy_plan, "hard_filters": prune(pgy_plan.get("hard_filters"))}
+    return cleaned
+
+
+def _brief_has_low_koc_budget(brief: str) -> bool:
+    text = str(brief or "").lower()
+    return "koc" in text and any(keyword in text for keyword in ["1000", "1,000", "一千", "千元"])
+
+
+def _quality_narrowing_filters_for_scheme(brief: str, scheme: dict[str, Any], *, video_scheme: bool = False) -> list[dict[str, Any]]:
+    low_budget = _brief_has_low_koc_budget(brief)
+    cpc_candidates = [3, 2, 1.5] if low_budget else [5, 3, 2]
+    cpe_candidates = [20, 15, 10] if low_budget else [30, 20, 15]
+    read_candidates = [300, 500, 1000] if low_budget else [500, 1000, 3000]
+    exposure_candidates = [500, 1000, 2000] if low_budget else [1000, 3000, 5000]
+    interaction_candidates = [30, 50, 100] if low_budget else [50, 100, 300]
+    cpc_max = cpc_candidates[0]
+    cpe_max = cpe_candidates[0]
+    read_min = read_candidates[0]
+    exposure_min = exposure_candidates[0]
+    interaction_min = interaction_candidates[0]
+    cpc_sub_fields = ["视频笔记阅读单价"] if video_scheme else ["图文笔记阅读单价", "视频笔记阅读单价"]
+    cpe_sub_fields = ["视频笔记互动单价"] if video_scheme else ["图文笔记互动单价", "视频笔记互动单价"]
+    cpc_label = "/".join(cpc_sub_fields)
+    cpe_label = "/".join(cpe_sub_fields)
+    return [
+        _pgy_filter_item(
+            "预估互动单价",
+            f"{cpe_label}≤{cpe_max:g}",
+            "超出估量时优先追加：温和控制 CPE，保留互动效率更好的达人",
+            control_type="subfield_preset_or_number_range",
+            sub_field=cpe_sub_fields[0] if len(cpe_sub_fields) == 1 else "",
+            sub_fields=cpe_sub_fields,
+            max=cpe_max,
+            adaptive_direction="max",
+            adaptive_values=cpe_candidates,
+        ),
+        _pgy_filter_item(
+            "曝光中位数",
+            _format_saved_min_only_value(exposure_min, wan_unit=True),
+            "超出估量时追加：提高常规曝光稳定性",
+            control_type="preset_or_number_range",
+            min=exposure_min,
+            max="",
+            range_policy="min_only",
+            adaptive_direction="min",
+            adaptive_values=exposure_candidates,
+        ),
+        _pgy_filter_item(
+            "阅读中位数",
+            _format_saved_min_only_value(read_min, wan_unit=True),
+            "超出估量时追加：提高常规阅读稳定性",
+            control_type="preset_or_number_range",
+            min=read_min,
+            max="",
+            range_policy="min_only",
+            adaptive_direction="min",
+            adaptive_values=read_candidates,
+        ),
+        _pgy_filter_item(
+            "互动中位数",
+            _format_saved_min_only_value(interaction_min),
+            "超出估量时追加：过滤低互动样本",
+            control_type="preset_or_number_range",
+            min=interaction_min,
+            max="",
+            range_policy="min_only",
+            adaptive_direction="min",
+            adaptive_values=interaction_candidates,
+        ),
+        _pgy_filter_item(
+            "预估阅读单价",
+            f"{cpc_label}≤{cpc_max:g}",
+            "超出估量时追加：控制 CPC，保留阅读效率更好的达人",
+            control_type="subfield_preset_or_number_range",
+            sub_field=cpc_sub_fields[0] if len(cpc_sub_fields) == 1 else "",
+            sub_fields=cpc_sub_fields,
+            max=cpc_max,
+            adaptive_direction="max",
+            adaptive_values=cpc_candidates,
+        ),
+    ]
+
+
+def _quality_narrowing_labels(filters: list[dict[str, Any]]) -> list[str]:
+    labels = []
+    for item in filters:
+        field = str(item.get("field") or "")
+        value = str(item.get("value") or "")
+        if field and value:
+            labels.append(f"启用{field}：{value}")
+    return labels
+
+
+PGY_QUALITY_NARROWING_FIELDS = {"预估互动单价", "曝光中位数", "阅读中位数", "互动中位数", "预估阅读单价"}
+PGY_LEGACY_QUALITY_NARROWING_FIELDS = PGY_QUALITY_NARROWING_FIELDS | {"预估CPM"}
+PGY_DYNAMIC_RECOMMEND_TARGET_MIN = 100
+PGY_DYNAMIC_RECOMMEND_TARGET_MAX = 2000
+
+
+def _adaptive_filter_variants(item: dict[str, Any]) -> list[dict[str, Any]]:
+    if item.get("adaptive_locked") is True or item.get("fixed") is True or item.get("locked") is True:
+        return [copy.deepcopy(item)]
+    direction = str(item.get("adaptive_direction") or "").strip()
+    values = item.get("adaptive_values")
+    if direction not in {"min", "max"} or not isinstance(values, list) or not values:
+        return [copy.deepcopy(item)]
+    variants = []
+    field = str(item.get("field") or "")
+    sub_field = str(item.get("sub_field") or item.get("subField") or "")
+    sub_fields = item.get("sub_fields") or item.get("subFields") or []
+    if not isinstance(sub_fields, list):
+        sub_fields = [sub_fields] if sub_fields else []
+    sub_field_label = "/".join(str(part) for part in sub_fields if str(part)) or sub_field
+    for raw_value in values:
+        value = parse_number(raw_value)
+        if value is None:
+            continue
+        variant = copy.deepcopy(item)
+        if direction == "min":
+            variant["min"] = value
+            variant["max"] = ""
+            variant["range_policy"] = "min_only"
+            variant["value"] = _format_saved_min_only_value(value, wan_unit=field in PGY_WAN_UNIT_SAVED_FIELDS)
+        else:
+            variant["min"] = ""
+            variant["max"] = value
+            variant["range_policy"] = "max_only"
+            variant["value"] = f"{sub_field_label or field}≤{value:g}"
+        variant["adaptive_selected_value"] = value
+        variants.append(variant)
+    return variants or [copy.deepcopy(item)]
+
+
+def _active_filter_replace_key(item: dict[str, Any]) -> tuple[str, str]:
+    sub_fields = item.get("sub_fields") or item.get("subFields") or []
+    if isinstance(sub_fields, list) and sub_fields:
+        sub_key = "|".join(str(part) for part in sub_fields if str(part))
+    else:
+        sub_key = str(item.get("sub_field") or item.get("subField") or "")
+    return (str(item.get("field") or ""), sub_key)
+
+
+def _replace_active_additional_filter(filters: list[dict[str, Any]], item: dict[str, Any]) -> list[dict[str, Any]]:
+    replace_key = _active_filter_replace_key(item)
+    kept = [
+        existing
+        for existing in (filters or [])
+        if _active_filter_replace_key(existing) != replace_key
+    ]
+    return _dedupe_filters([*kept, item])
+
+
+def _refresh_auto_quality_narrowing_filters(pgy_plan: dict[str, Any], brief: str) -> dict[str, Any]:
+    plan = copy.deepcopy(pgy_plan or {})
+    schemes = [scheme for scheme in (plan.get("schemes") or []) if isinstance(scheme, dict)]
+    refreshed_schemes = []
+    for index, scheme in enumerate(schemes):
+        next_scheme = copy.deepcopy(scheme)
+        text = f"{next_scheme.get('scheme_id') or ''} {next_scheme.get('name') or ''} {next_scheme.get('goal') or ''}".lower()
+        is_video_scheme = index == 1 or any(keyword in text for keyword in ["video", "视频"])
+        quality_filters = _quality_narrowing_filters_for_scheme(brief, next_scheme, video_scheme=is_video_scheme)
+        raw_additional = next_scheme.get("additional_filters") or next_scheme.get("extra_filters") or []
+        additional = _clean_scheme_filters(raw_additional, allowed_fields=PGY_EXTRA_FILTER_FIELDS)
+        enabled = _clean_scheme_filters(next_scheme.get("enabled_additional_filters") or next_scheme.get("enabled_extra_filters") or [], allowed_fields=PGY_EXTRA_FILTER_FIELDS)
+        has_auto_quality = any(
+            isinstance(item, dict) and str(item.get("field") or "") in PGY_LEGACY_QUALITY_NARROWING_FIELDS
+            for item in raw_additional
+        )
+        if has_auto_quality:
+            pinned_additional = [
+                item
+                for item in additional
+                if item.get("field") == "笔记类型" and item.get("value") == "视频笔记为主"
+            ]
+            preserved_additional = [
+                item
+                for item in additional
+                if str(item.get("field") or "") not in PGY_LEGACY_QUALITY_NARROWING_FIELDS
+                and not (item.get("field") == "笔记类型" and item.get("value") == "视频笔记为主")
+            ]
+            preserved_enabled = [
+                item
+                for item in enabled
+                if str(item.get("field") or "") not in PGY_LEGACY_QUALITY_NARROWING_FIELDS
+            ]
+            next_scheme["additional_filters"] = _dedupe_filters([*pinned_additional, *preserved_additional, *quality_filters])
+            next_scheme["extra_filters"] = next_scheme["additional_filters"]
+            next_scheme["enabled_additional_filters"] = _dedupe_filters(preserved_enabled)
+            next_scheme["enabled_extra_filters"] = next_scheme["enabled_additional_filters"]
+            next_scheme["narrow_if_too_many"] = _quality_narrowing_labels(quality_filters)
+        refreshed_schemes.append(next_scheme)
+    plan["schemes"] = refreshed_schemes
+    return plan
+
+
+def _enforce_scheme_distinct_collection_logic(pgy_plan: dict[str, Any], brief: str) -> dict[str, Any]:
+    plan = copy.deepcopy(pgy_plan or {})
+    schemes = [scheme for scheme in (plan.get("schemes") or []) if isinstance(scheme, dict)]
+    if not schemes:
+        return plan
+    study_abroad = _brief_is_study_abroad(brief)
+    video_preferred = _brief_prefers_video(brief)
+    for index, scheme in enumerate(schemes):
+        text = f"{scheme.get('scheme_id') or ''} {scheme.get('name') or ''} {scheme.get('goal') or ''}".lower()
+        required = _clean_scheme_filters(scheme.get("required_filters") or scheme.get("base_filters") or [], allowed_fields=PGY_BASE_FILTER_FIELDS)
+        additional = _clean_scheme_filters(scheme.get("additional_filters") or scheme.get("extra_filters") or [], allowed_fields=PGY_EXTRA_FILTER_FIELDS)
+        enabled = _clean_scheme_filters(scheme.get("enabled_additional_filters") or scheme.get("enabled_extra_filters") or [], allowed_fields=PGY_EXTRA_FILTER_FIELDS)
+
+        is_video_scheme = index == 1 or any(keyword in text for keyword in ["video", "视频"])
+        is_overseas_proxy = study_abroad and (
+            index == 2
+            or any(keyword in text for keyword in ["overseas", "海外", "生活"])
+        )
+        is_broad_education = (
+            index == 3
+            or any(keyword in text for keyword in ["广", "泛", "其他"])
+            or any(token in text for token in ["edu_broad", "broad_proxy", "broad_education", "broad education"])
+        )
+
+        if study_abroad and index == 0:
+            required = _prepend_unique_filter(required, _pgy_filter_item("博主类目", "教育", "Brief 命中留学学习主场景", control_type="tag_select_with_hover_subcategory", sub_value="留学教育"))
+            required = _prepend_unique_filter(required, _pgy_filter_item("博主类目", "教育", "Brief 要求学习类内容占比高", control_type="tag_select_with_hover_subcategory", sub_value="学习日常"))
+
+        if is_video_scheme and video_preferred:
+            video_filter = _pgy_filter_item("笔记类型", "视频笔记为主", "Brief 明确视频优先，视频池默认启用该附加筛选", control_type="dropdown_single")
+            additional = _prepend_unique_filter(additional, video_filter)
+            enabled = _prepend_unique_filter(enabled, video_filter)
+            scheme["goal"] = scheme.get("goal") or "优先采集视频笔记为主、适合视频报备合作的达人"
+            scheme["target_count_range"] = scheme.get("target_count_range") or "80-800"
+
+        if is_overseas_proxy:
+            required = _remove_filter(required, field="博主类目", value="教育", sub_value="学习日常")
+            required = _remove_filter(required, field="博主类目", value="教育", sub_value="留学教育")
+            required = _remove_filter(required, field="博主类目", value="教育", sub_value="大学教育")
+            required = _prepend_unique_filter(required, _pgy_filter_item("博主类目", "生活记录", "补量承接海外/留学日常场景，采后复核学习内容占比", control_type="tag_select_with_hover_subcategory", sub_value="中外生活"))
+            required = _prepend_unique_filter(required, _pgy_filter_item("博主类目", "生活记录", "补量承接海外校园生活场景，采后复核是否真留学/学习内容", control_type="tag_select_with_hover_subcategory", sub_value="校园生活"))
+            scheme["role"] = "supplement"
+            scheme["precision_level"] = "medium"
+            scheme["max_quota"] = min(_parse_positive_int(scheme.get("max_quota"), 16) or 16, 20)
+            scheme["precision_warning"] = scheme.get("precision_warning") or "海外生活是留学场景代理条件，只能作为补量池；采后必须复核留学身份和学习内容占比。"
+
+        if is_broad_education:
+            has_language_or_other = any(
+                item.get("field") == "博主类目"
+                and item.get("value") == "教育"
+                and item.get("sub_value") in {"语言教育", "教育其他"}
+                for item in required
+            )
+            if has_language_or_other:
+                required = _remove_filter(required, field="博主类目", value="教育", sub_value="学习日常")
+                required = _remove_filter(required, field="博主类目", value="教育", sub_value="留学教育")
+                required = _remove_filter(required, field="博主类目", value="教育", sub_value="大学教育")
+                required = _remove_filter(required, field="博主类目", value="生活记录")
+            scheme["role"] = "supplement"
+            scheme["precision_level"] = "medium"
+            scheme["max_quota"] = min(_parse_positive_int(scheme.get("max_quota"), 20) or 20, 25)
+
+        quality_filters = _quality_narrowing_filters_for_scheme(brief, scheme, video_scheme=is_video_scheme)
+        pinned_additional = [
+            item
+            for item in additional
+            if item.get("field") == "笔记类型" and item.get("value") == "视频笔记为主"
+        ]
+        additional = _dedupe_filters([*pinned_additional, *quality_filters])
+        enabled = [
+            item
+            for item in enabled
+            if item.get("field") == "笔记类型"
+            or item.get("field") in PGY_QUALITY_NARROWING_FIELDS
+        ]
+        scheme["narrow_if_too_many"] = _quality_narrowing_labels(quality_filters)
+        scheme["required_filters"] = _dedupe_filters(required)
+        scheme["base_filters"] = scheme["required_filters"]
+        scheme["additional_filters"] = _dedupe_filters(additional)
+        scheme["extra_filters"] = scheme["additional_filters"]
+        scheme["enabled_additional_filters"] = _dedupe_filters(enabled)
+        scheme["enabled_extra_filters"] = scheme["enabled_additional_filters"]
+    plan["schemes"] = schemes[:PGY_COLLECTION_SCHEME_COUNT]
+    plan["filters"] = [
+        item
+        for item in (plan.get("filters") or [])
+        if isinstance(item, dict) and _is_manual_pgy_filter(item)
+    ]
+    return plan
+
+
 def _normalize_brief_decomposition(value: Any, fallback: dict[str, Any]) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
     fallback_source = fallback.get("briefDecomposition") if isinstance(fallback.get("briefDecomposition"), dict) else {}
@@ -1362,6 +1988,12 @@ def _normalize_brief_decomposition(value: Any, fallback: dict[str, Any]) -> dict
         if not isinstance(items, list):
             items = fallback_source.get(key) or []
         return [item for item in items if isinstance(item, dict)]
+
+    def dict_value(key: str) -> dict[str, Any]:
+        item = source.get(key)
+        if not isinstance(item, dict):
+            item = fallback_source.get(key) if isinstance(fallback_source.get(key), dict) else {}
+        return item if isinstance(item, dict) else {}
 
     def list_of_strings(key: str) -> list[str]:
         items = source.get(key)
@@ -1379,14 +2011,414 @@ def _normalize_brief_decomposition(value: Any, fallback: dict[str, Any]) -> dict
 
     return {
         "brief_facts": list_of_dicts("brief_facts"),
+        "promotion_audience_analysis": dict_value("promotion_audience_analysis"),
+        "rule_placement_matrix": list_of_dicts("rule_placement_matrix"),
         "must_have_requirements": list_of_strings("must_have_requirements"),
         "strong_preferences": list_of_strings("strong_preferences"),
         "negative_constraints": list_of_strings("negative_constraints"),
+        "assumptions": list_of_strings("assumptions"),
+        "unknowns": list_of_strings("unknowns"),
         "backend_mappable_filters": list_of_dicts("backend_mappable_filters"),
         "proxy_filters": list_of_dicts("proxy_filters"),
         "post_score_rules": list_of_dicts("post_score_rules"),
         "manual_review_rules": list_of_strings("manual_review_rules"),
     }
+
+
+def _contains_any_keyword(text: str, keywords: list[str]) -> bool:
+    return any(keyword in text for keyword in keywords if keyword)
+
+
+def _fallback_project_fit_config(brief: str, brief_decomposition: dict[str, Any] | None = None) -> dict[str, Any]:
+    text = str(brief or "")
+    negative_constraints = []
+    manual_review_rules = []
+    if isinstance(brief_decomposition, dict):
+        negative_constraints = [str(item).strip() for item in (brief_decomposition.get("negative_constraints") or []) if str(item).strip()]
+        manual_review_rules = [str(item).strip() for item in (brief_decomposition.get("manual_review_rules") or []) if str(item).strip()]
+
+    target_city_priority = []
+    if _brief_mentions_region_priority(text):
+        for city in ["北京", "上海", "广州", "深圳"]:
+            if city in text:
+                target_city_priority.append(city)
+        if not target_city_priority:
+            target_city_priority = ["北京", "上海"]
+
+    if "答疑笔" in text:
+        product_name = "有道答疑笔" if "有道" in text else "答疑笔"
+        product_category = "学习答疑工具"
+        core_users = ["小学高年级学生", "初中学生"]
+        core_decision_makers = ["家长"]
+        target_grade_keywords = ["六年级", "小升初", "初中", "初一", "初二", "初三", "高中", "高一", "高二", "高三"]
+        parent_decision_keywords = ["家长", "妈妈", "爸爸", "陪学", "辅导", "家庭教育", "家校", "提分", "作业"]
+        preferred_content_scenes = ["作业答疑", "错题讲解", "家长辅导", "学习规划", "中高考/升学"]
+        preferred_presentation_styles = ["老师讲解型", "经验型", "测评对比型", "清单型"]
+        discouraged_keywords = ["低幼", "启蒙", "早教", "孕期", "辅食", "纯生活方式", "纯情绪", "纯校园段子"]
+        high_priority_signals = ["能讲清作业卡点和解法", "有真实家长辅导场景", "能展示工具使用前后差异", "内容里有提分、效率、错题复盘链路"]
+        target_audience_summary = "重点看小学高年级到初中家庭，家长是决策者，学生是使用者。"
+    elif "听课宝" in text:
+        product_name = "有道留学听课宝" if "有道" in text else "听课宝"
+        product_category = "留学听课与学习效率工具"
+        core_users = ["海外留学生", "留学备考学生", "大学阶段学习者"]
+        core_decision_makers = ["学生本人"]
+        target_grade_keywords = ["留学", "海外", "大学", "本科", "研究生", "雅思", "托福", "课堂", "听课"]
+        parent_decision_keywords = ["学生本人", "留学生", "海外学习", "课堂记录", "复习"]
+        preferred_content_scenes = ["海外课堂听课", "课后复盘", "学习效率工具测评", "考试周复习", "留学学习日常"]
+        preferred_presentation_styles = ["测评对比型", "教程型", "学习经验型", "真实场景演示型"]
+        discouraged_keywords = ["低幼", "宝妈", "泛亲子", "纯生活方式", "全是vlog", "无学习内容"]
+        high_priority_signals = ["有真实留学或海外课堂场景", "能讲清听课记录和课后复盘链路", "学习类内容占比高", "能展示工具使用前后效率差异"]
+        target_audience_summary = "重点看留学生或海外学习人群，学生本人是核心使用者和决策者。"
+    elif "点读笔" in text:
+        product_name = "有道点读笔" if "有道" in text else "点读笔"
+        product_category = "亲子阅读与语言学习工具"
+        core_users = ["学龄前儿童", "小学低年级学生"]
+        core_decision_makers = ["家长"]
+        target_grade_keywords = ["幼儿园", "学龄前", "启蒙", "一年级", "二年级", "三年级", "小学低年级"]
+        parent_decision_keywords = ["家长", "妈妈", "爸爸", "亲子阅读", "英语启蒙", "自主阅读", "发音", "查词"]
+        preferred_content_scenes = ["亲子阅读", "英语启蒙", "自主阅读", "查词发音", "家长陪读"]
+        preferred_presentation_styles = ["老师讲解型", "经验型", "日常记录型", "测评对比型"]
+        discouraged_keywords = ["高考", "中考", "刷题", "错题", "纯鸡汤", "纯生活方式"]
+        high_priority_signals = ["能展示孩子跟读或点读过程", "有真实亲子阅读场景", "能体现发音/查词/自主阅读价值"]
+        target_audience_summary = "重点看亲子阅读和英语启蒙家庭，家长关注陪伴效率和孩子自主阅读体验。"
+    else:
+        product_name = "当前 Brief 产品"
+        product_category = "教育产品"
+        core_users = ["目标学生"]
+        core_decision_makers = ["家长"]
+        target_grade_keywords = ["小学", "初中", "高中", "大孩", "亲子"]
+        parent_decision_keywords = ["家长", "妈妈", "爸爸", "亲子", "家庭教育", "学习"]
+        preferred_content_scenes = ["学习规划", "家长辅导", "产品测评"]
+        preferred_presentation_styles = ["经验型", "老师讲解型", "测评对比型"]
+        discouraged_keywords = ["纯情绪", "纯生活方式", "低幼", "泛娱乐"]
+        high_priority_signals = ["能讲清问题场景", "能自然承接产品", "有真实家庭或学习内容证据"]
+        target_audience_summary = "优先看真正覆盖产品目标人群和决策者的内容。"
+
+    return {
+        "product_name": product_name,
+        "product_category": product_category,
+        "summary": f"围绕{product_name}生成项目化评分配置，重点判断达人是否真的能自然承接产品使用场景与决策链路。",
+        "target_audience_summary": target_audience_summary,
+        "core_users": core_users,
+        "core_decision_makers": core_decision_makers,
+        "target_grade_keywords": target_grade_keywords,
+        "parent_decision_keywords": parent_decision_keywords,
+        "target_city_priority": target_city_priority,
+        "preferred_content_scenes": preferred_content_scenes,
+        "preferred_presentation_styles": preferred_presentation_styles,
+        "discouraged_keywords": list(dict.fromkeys([*discouraged_keywords, *negative_constraints])),
+        "high_priority_signals": high_priority_signals,
+        "manual_review_focus": manual_review_rules,
+        "evidence_rules": {
+            "minimum_recent_note_count_for_high_score": 2,
+            "require_scene_evidence_for_a_tier": True,
+            "require_grade_or_parent_evidence_for_s_tier": True,
+            "insufficient_evidence_max_score": 84,
+            "weak_scene_match_max_score": 79,
+            "negative_hit_max_score": 74,
+        },
+    }
+
+
+def _is_stale_project_fit_config(value: dict[str, Any], brief: str) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    text = str(brief or "")
+    serialized = json.dumps(value, ensure_ascii=False)
+    generic_product_names = {"当前 Brief 产品", "当前Brief产品", "教育产品", "项目产品"}
+    product_name = str(value.get("product_name") or "").strip()
+    if product_name in generic_product_names:
+        return True
+    if "答疑笔" in text and "答疑笔" not in serialized:
+        return True
+    if "听课宝" in text and "听课宝" not in serialized and any(keyword in serialized for keyword in ["家长", "亲子", "宝妈", "小学", "初中"]):
+        return True
+    return False
+
+
+def _fallback_promotion_strategy(
+    brief: str,
+    brief_decomposition: dict[str, Any] | None,
+    project_fit_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    fit = project_fit_config if isinstance(project_fit_config, dict) else _fallback_project_fit_config(brief, brief_decomposition)
+    facts = []
+    if isinstance(brief_decomposition, dict):
+        facts = [str(item.get("fact") or "").strip() for item in (brief_decomposition.get("brief_facts") or []) if isinstance(item, dict) and str(item.get("fact") or "").strip()]
+    product_name = str(fit.get("product_name") or "当前 Brief 产品")
+    category = str(fit.get("product_category") or "项目产品")
+    scenes = [str(item).strip() for item in (fit.get("preferred_content_scenes") or []) if str(item).strip()]
+    styles = [str(item).strip() for item in (fit.get("preferred_presentation_styles") or []) if str(item).strip()]
+    high_priority_signals = [str(item).strip() for item in (fit.get("high_priority_signals") or []) if str(item).strip()]
+    return {
+        "product_positioning": f"{product_name} / {category}",
+        "target_users": fit.get("core_users") or ["Brief目标用户"],
+        "decision_makers": fit.get("core_decision_makers") or ["Brief决策人群"],
+        "core_selling_points": high_priority_signals or ["能解决目标人群的核心痛点", "内容能自然展示产品使用价值"],
+        "conversion_scenes": scenes or ["产品使用场景", "痛点解决场景", "对比测评场景"],
+        "content_angles": styles or ["经验分享型", "测评对比型", "场景演示型"],
+        "creator_fit_hypotheses": [
+            "达人长期内容应覆盖目标人群或使用场景",
+            "达人表达方式应能自然讲清产品痛点、卖点和使用链路",
+            "达人数据效率应支持本轮预算下的基础曝光、阅读或互动目标",
+        ],
+        "screening_implications": [
+            "蒲公英前置只筛可执行字段，用类目/粉丝量/年龄/报价先召回候选池",
+            "产品人群、真实身份、内容占比和卖点承接能力进入采后评分",
+            "宽类目召回必须作为proxy补量，并限制配额和人工复核",
+        ],
+        "scoring_implications": [
+            "相关性低的达人即使数据效率高也不能进入强推荐",
+            "内容证据不足时降低人设与内容分，并标记待复核",
+            "报价需结合CPM/CPC/CPE和近30天曝光/阅读/互动判断投放价值",
+        ],
+        "negative_fit_risks": (fit.get("discouraged_keywords") or [])[:8],
+        "source_facts": facts[:8],
+    }
+
+
+def _normalize_promotion_strategy(
+    value: Any,
+    brief: str,
+    brief_decomposition: dict[str, Any] | None,
+    project_fit_config: dict[str, Any] | None,
+    fallback_value: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    base = copy.deepcopy(
+        fallback_value
+        if isinstance(fallback_value, dict)
+        else _fallback_promotion_strategy(brief, brief_decomposition, project_fit_config)
+    )
+    source = value if isinstance(value, dict) else {}
+    for key, val in source.items():
+        if val in (None, "", []):
+            continue
+        if isinstance(val, list):
+            base[key] = [str(item).strip() for item in val if str(item).strip()]
+        elif isinstance(val, dict):
+            base[key] = val
+        else:
+            base[key] = str(val).strip()
+    return base
+
+
+def _keywords_from_values(values: list[Any], fallback: list[str], limit: int = 12) -> list[str]:
+    keywords: list[str] = []
+    for value in values:
+        text = " ".join(str(item) for item in value.values() if item) if isinstance(value, dict) else str(value or "")
+        for part in re.split(r"[、,，;；/|\s]+", text):
+            part = part.strip()
+            if 1 < len(part) <= 24 and part not in {"Brief", "未明确", "当前", "项目", "产品", "达人"}:
+                keywords.append(part)
+    keywords.extend(fallback)
+    return list(dict.fromkeys(item for item in keywords if item))[:limit]
+
+
+def _fallback_project_special_scoring(
+    brief: str,
+    brief_decomposition: dict[str, Any] | None = None,
+    promotion_strategy: dict[str, Any] | None = None,
+    project_fit_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    brief_decomposition = brief_decomposition if isinstance(brief_decomposition, dict) else {}
+    promotion_strategy = promotion_strategy if isinstance(promotion_strategy, dict) else {}
+    project_fit_config = project_fit_config if isinstance(project_fit_config, dict) else {}
+    label = str(project_fit_config.get("product_name") or promotion_strategy.get("product_positioning") or "项目专属")[:24]
+    facts = [item.get("fact") for item in brief_decomposition.get("brief_facts") or [] if isinstance(item, dict)]
+    identity_keywords = _keywords_from_values(
+        [*(promotion_strategy.get("target_users") or []), *(promotion_strategy.get("decision_makers") or []), *facts, *(brief_decomposition.get("must_have_requirements") or [])],
+        ["目标用户", "决策者", "核心人群"],
+    )
+    scene_keywords = _keywords_from_values(
+        [*(promotion_strategy.get("content_angles") or []), *(promotion_strategy.get("conversion_scenes") or []), *(project_fit_config.get("preferred_content_scenes") or []), *(brief_decomposition.get("strong_preferences") or [])],
+        ["使用场景", "测评", "教程", "体验", "种草"],
+        limit=18,
+    )
+    negative_keywords = _keywords_from_values(
+        [*(brief_decomposition.get("negative_constraints") or []), *(promotion_strategy.get("negative_fit_risks") or []), *(project_fit_config.get("discouraged_keywords") or [])],
+        ["弱相关", "泛化", "硬广"],
+        limit=10,
+    )
+    return {
+        "enabled": True,
+        "label": label or "项目专属",
+        "source": "brief_decomposition_fallback",
+        "identity": {
+            "name": "核心目标人群/身份",
+            "points": 30,
+            "fields": ["nickname", "creator_type", "persona_tags", "ip_city", "topic_point", "child_grade", "child_age"],
+            "keywords": identity_keywords,
+            "evidence_keywords": identity_keywords,
+        },
+        "scene": {
+            "name": "Brief核心内容/转化场景",
+            "max_points": 30,
+            "base_points": 10,
+            "points_per_hit": 4,
+            "max_keyword_hits": 5,
+            "direction_bonus": {"strong": 4, "medium": 2},
+            "keywords": scene_keywords,
+        },
+        "data": {
+            "max_points": 20,
+            "good_points": 15,
+            "excellent_points": 20,
+            "read_ratio_points": [{"min": 0.75, "points": 10}, {"min": 0.5, "points": 6}],
+            "interaction_bonus": [{"min": 120, "points": 4}, {"min": 60, "points": 2}],
+        },
+        "efficiency": {"max_points": 20, "good_points": 14, "excellent_points": 20, "fallback_points": 6},
+        "tier_rules": {
+            "s_min_priority_score": 86,
+            "s_score": 95,
+            "s_high_priority_score": 93,
+            "s_high_score": 97,
+            "a_min_priority_score": 72,
+            "a_score": 88,
+            "b_plus_min_priority_score": 55,
+            "b_plus_score": 80,
+            "b_min_priority_score": 40,
+            "b_score": 75,
+            "require_identity_for_s": True,
+            "require_scene_for_s": True,
+            "require_good_data_for_s": True,
+            "require_good_efficiency_for_s": True,
+            "no_identity_cap": 89,
+            "identity_only_s_cap": 94,
+        },
+        "negative": {"keywords": negative_keywords, "cap_without_scene": 84},
+        "project_fit_config_patch": {
+            "preferred_content_scenes": scene_keywords,
+            "preferred_presentation_styles": _keywords_from_values(promotion_strategy.get("content_angles") or [], ["测评", "教程", "经验", "日常体验"], limit=8),
+            "target_grade_keywords": project_fit_config.get("target_grade_keywords") or [],
+            "parent_decision_keywords": project_fit_config.get("parent_decision_keywords") or [],
+            "discouraged_keywords": negative_keywords,
+        },
+        "ignore_hard_filter_keywords": [],
+        "generation_notes": "由 Brief 拆解、promotionStrategy 和 projectFitConfig 生成，供初筛评分解释器读取。",
+    }
+
+
+def _normalize_project_special_scoring(value: Any, fallback: dict[str, Any]) -> dict[str, Any]:
+    config = copy.deepcopy(value) if isinstance(value, dict) else {}
+    if config.get("enabled") is False:
+        return {"enabled": False}
+    config = {**copy.deepcopy(fallback), **config} if config else copy.deepcopy(fallback)
+    config["enabled"] = config.get("enabled", True)
+    for section in ("identity", "scene", "data", "efficiency", "tier_rules", "negative"):
+        defaults = fallback.get(section) if isinstance(fallback.get(section), dict) else {}
+        source = config.get(section) if isinstance(config.get(section), dict) else {}
+        config[section] = {**defaults, **source}
+    identity = config["identity"]
+    identity["fields"] = identity.get("fields") or ["nickname", "creator_type", "persona_tags", "ip_city", "topic_point"]
+    identity["keywords"] = [str(item).strip() for item in (identity.get("keywords") or []) if str(item).strip()]
+    identity["evidence_keywords"] = [str(item).strip() for item in (identity.get("evidence_keywords") or identity.get("keywords") or []) if str(item).strip()]
+    scene = config["scene"]
+    scene["keywords"] = [str(item).strip() for item in (scene.get("keywords") or []) if str(item).strip()]
+    scene["direction_bonus"] = scene.get("direction_bonus") if isinstance(scene.get("direction_bonus"), dict) else {"strong": 4, "medium": 2}
+    for key in ("read_ratio_points", "interaction_bonus"):
+        if not isinstance(config["data"].get(key), list):
+            config["data"][key] = fallback.get("data", {}).get(key, [])
+    config["negative"]["keywords"] = [str(item).strip() for item in (config["negative"].get("keywords") or []) if str(item).strip()]
+    patch = config.get("project_fit_config_patch") if isinstance(config.get("project_fit_config_patch"), dict) else {}
+    fallback_patch = fallback.get("project_fit_config_patch") if isinstance(fallback.get("project_fit_config_patch"), dict) else {}
+    config["project_fit_config_patch"] = {**fallback_patch, **patch}
+    config["ignore_hard_filter_keywords"] = [str(item).strip() for item in (config.get("ignore_hard_filter_keywords") or []) if str(item).strip()]
+    return config
+
+
+def _normalize_project_fit_config(
+    value: Any,
+    brief: str,
+    brief_decomposition: dict[str, Any] | None,
+    fallback_value: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    base = copy.deepcopy(fallback_value if isinstance(fallback_value, dict) else _fallback_project_fit_config(brief, brief_decomposition))
+    source = value if isinstance(value, dict) else {}
+    if _is_stale_project_fit_config(source, brief):
+        source = {}
+
+    string_fields = ["product_name", "product_category", "summary", "target_audience_summary"]
+    list_fields = [
+        "core_users",
+        "core_decision_makers",
+        "target_grade_keywords",
+        "parent_decision_keywords",
+        "target_city_priority",
+        "preferred_content_scenes",
+        "preferred_presentation_styles",
+        "discouraged_keywords",
+        "high_priority_signals",
+        "manual_review_focus",
+    ]
+    for field in string_fields:
+        text = str(source.get(field) or "").strip()
+        if text:
+            base[field] = text
+    for field in list_fields:
+        items = source.get(field)
+        if isinstance(items, list):
+            base[field] = [str(item).strip() for item in items if str(item).strip()]
+
+    evidence_rules = source.get("evidence_rules")
+    if isinstance(evidence_rules, dict):
+        base_rules = base.get("evidence_rules") if isinstance(base.get("evidence_rules"), dict) else {}
+        base["evidence_rules"] = {
+            **base_rules,
+            **{key: evidence_rules[key] for key in evidence_rules if evidence_rules.get(key) not in (None, "")},
+        }
+    return base
+
+
+def _hydrate_screening_plan_project_defaults(plan: dict[str, Any], brief: str) -> dict[str, Any]:
+    normalized = copy.deepcopy(plan or {})
+    brief_decomposition = (
+        normalized.get("briefDecomposition")
+        if isinstance(normalized.get("briefDecomposition"), dict)
+        else normalized.get("brief_decomposition")
+        if isinstance(normalized.get("brief_decomposition"), dict)
+        else None
+    )
+    project_fit_config = _normalize_project_fit_config(
+        normalized.get("projectFitConfig"),
+        brief,
+        brief_decomposition,
+    )
+    promotion_strategy = _normalize_promotion_strategy(
+        normalized.get("promotionStrategy") or normalized.get("productPromotionStrategy"),
+        brief,
+        brief_decomposition,
+        project_fit_config,
+    )
+    normalized["projectSpecialScoring"] = _normalize_project_special_scoring(
+        normalized.get("projectSpecialScoring") or normalized.get("specialScoringPolicy") or normalized.get("project_scoring_policy"),
+        _fallback_project_special_scoring(brief, brief_decomposition, promotion_strategy, project_fit_config),
+    )
+    normalized["projectFitConfig"] = project_fit_config
+    normalized["promotionStrategy"] = promotion_strategy
+    return normalized
+
+
+def _hydrate_project_for_response(project: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not project:
+        return project
+    plan = _normalize_project_screening_plan(project.get("screening_plan"))
+    if not plan:
+        return project
+    brief = str(project.get("brief") or project.get("project_name") or "")
+    hydrated = _hydrate_screening_plan_project_defaults(plan, brief)
+    if hydrated == plan:
+        return project
+    result = dict(project)
+    result["screening_plan"] = json.dumps(hydrated, ensure_ascii=False)
+    return result
+
+
+def _hydrate_projects_for_response(projects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        hydrated if isinstance(hydrated, dict) else project
+        for project in projects
+        for hydrated in [_hydrate_project_for_response(project)]
+    ]
 
 
 def _normalize_screening_standard(result: dict[str, Any], payload: ScreeningStandardPayload) -> dict[str, Any]:
@@ -1406,6 +2438,25 @@ def _normalize_screening_standard(result: dict[str, Any], payload: ScreeningStan
         plan.get("briefDecomposition") or plan.get("brief_decomposition") or result.get("briefDecomposition") or result.get("brief_decomposition"),
         fallback,
     )
+    project_fit_config = _normalize_project_fit_config(
+        plan.get("projectFitConfig") or result.get("projectFitConfig"),
+        payload.brief,
+        brief_decomposition,
+        fallback.get("projectFitConfig") if isinstance(fallback.get("projectFitConfig"), dict) else None,
+    )
+    promotion_strategy = _normalize_promotion_strategy(
+        plan.get("promotionStrategy") or plan.get("productPromotionStrategy") or result.get("promotionStrategy") or result.get("productPromotionStrategy"),
+        payload.brief,
+        brief_decomposition,
+        project_fit_config,
+        fallback.get("promotionStrategy") if isinstance(fallback.get("promotionStrategy"), dict) else None,
+    )
+    project_special_scoring = _normalize_project_special_scoring(
+        plan.get("projectSpecialScoring") or plan.get("specialScoringPolicy") or plan.get("project_scoring_policy") or result.get("projectSpecialScoring") or result.get("specialScoringPolicy") or result.get("project_scoring_policy"),
+        fallback.get("projectSpecialScoring")
+        if isinstance(fallback.get("projectSpecialScoring"), dict)
+        else _fallback_project_special_scoring(payload.brief, brief_decomposition, promotion_strategy, project_fit_config),
+    )
     if isinstance(pgy_plan, dict):
         pgy_plan = {
             **pgy_plan,
@@ -1418,12 +2469,16 @@ def _normalize_screening_standard(result: dict[str, Any], payload: ScreeningStan
         pgy_plan = _ensure_pgy_scheme_count(pgy_plan, fallback["pgyCollectionPlan"])
         pgy_plan = _normalize_pgy_scheme_metadata(pgy_plan, fallback["pgyCollectionPlan"], brief_decomposition)
         pgy_plan = _ensure_scheme_multi_blogger_subcategories(pgy_plan, payload.brief)
+        pgy_plan = _enforce_scheme_distinct_collection_logic(pgy_plan, payload.brief)
         pgy_plan = _normalize_scheme_filter_structure(pgy_plan)
     scoring_criteria = plan.get("scoringCriteria") or plan.get("matchingCriteria") or fallback["scoringCriteria"]
     budget_policy = plan.get("budgetPolicy") or (scoring_criteria.get("budget_policy") if isinstance(scoring_criteria, dict) else None) or fallback.get("budgetPolicy") or {}
     tier_policy = plan.get("tierPolicy") or (scoring_criteria.get("tier_policy") if isinstance(scoring_criteria, dict) else None) or fallback.get("tierPolicy") or {}
     data_layer_scoring = plan.get("dataLayerScoring") or (scoring_criteria.get("data_layer_scoring") if isinstance(scoring_criteria, dict) else None) or fallback.get("dataLayerScoring") or {}
     if isinstance(scoring_criteria, dict):
+        post_score_rules = scoring_criteria.get("post_score_rules")
+        if not isinstance(post_score_rules, list):
+            post_score_rules = []
         scoring_criteria = {
             **scoring_criteria,
             "budget_policy": scoring_criteria.get("budget_policy") or budget_policy,
@@ -1431,8 +2486,10 @@ def _normalize_screening_standard(result: dict[str, Any], payload: ScreeningStan
             "data_layer_scoring": scoring_criteria.get("data_layer_scoring") or data_layer_scoring,
             "dimension_weights": scoring_criteria.get("dimension_weights") or weights,
             "hard_rules": scoring_criteria.get("hard_rules") or hard_filters,
+            "post_score_rules": post_score_rules,
         }
-    return {
+        scoring_criteria["hard_rules"] = scoring_hard_filters
+    normalized = {
         "briefType": plan.get("briefType") or fallback["briefType"],
         "budgetPolicy": budget_policy,
         "tierPolicy": tier_policy,
@@ -1441,17 +2498,22 @@ def _normalize_screening_standard(result: dict[str, Any], payload: ScreeningStan
         "scoringHardFilters": scoring_hard_filters,
         "hardFilters": hard_filters,
         "briefDecomposition": brief_decomposition,
+        "projectFitConfig": project_fit_config,
+        "promotionStrategy": promotion_strategy,
+        "projectSpecialScoring": project_special_scoring,
         "scoringWeights": weights,
         "scoringCriteria": scoring_criteria,
         "fieldMappings": plan.get("fieldMappings") or result.get("fieldMappings") or fallback["fieldMappings"],
         "pgyCollectionPlan": pgy_plan,
         "summary": plan.get("summary") or result.get("summary") or fallback["summary"],
     }
+    return _prune_default_fan_age_hard_filters_for_brief(normalized, payload.brief)
 
 
 def _sync_screening_plan_criteria(plan: dict[str, Any]) -> dict[str, Any]:
     normalized = copy.deepcopy(plan or {})
     def normalize_hard_filters(items: Any) -> list[dict[str, Any]]:
+        cleaned = items or []
         return [
             {
                 "field": str(item.get("field") or item.get("standard") or "").strip(),
@@ -1463,7 +2525,7 @@ def _sync_screening_plan_criteria(plan: dict[str, Any]) -> dict[str, Any]:
                 "valueControl": str(item.get("valueControl") or "").strip(),
                 "subField": str(item.get("subField") or "").strip(),
             }
-            for item in (items or [])
+            for item in cleaned
             if isinstance(item, dict) and (item.get("field") or item.get("standard") or item.get("value"))
         ]
 
@@ -1507,12 +2569,15 @@ def _sync_screening_plan_criteria(plan: dict[str, Any]) -> dict[str, Any]:
     pgy_plan = normalized.get("pgyCollectionPlan") if isinstance(normalized.get("pgyCollectionPlan"), dict) else {}
     pgy_plan = _normalize_scheme_filter_structure(pgy_plan)
     pgy_filter_hard_filters = hard_filters_from_pgy_filters(pgy_plan.get("filters") or [])
-    collection_hard_filters = normalize_hard_filters(
-        pgy_filter_hard_filters or normalized.get("collectionHardFilters") or pgy_plan.get("hard_filters") or legacy_hard_filters
-    )
+    if "collectionHardFilters" in normalized:
+        collection_hard_filters = normalize_hard_filters(normalized.get("collectionHardFilters") or [])
+    elif "hard_filters" in pgy_plan or "hardFilters" in pgy_plan:
+        collection_hard_filters = normalize_hard_filters(pgy_plan.get("hard_filters") or pgy_plan.get("hardFilters") or [])
+    else:
+        collection_hard_filters = normalize_hard_filters(pgy_filter_hard_filters or legacy_hard_filters)
     scoring_criteria_source = normalized.get("scoringCriteria") if isinstance(normalized.get("scoringCriteria"), dict) else {}
     scoring_hard_filters = normalize_hard_filters(
-        normalized.get("scoringHardFilters") or scoring_criteria_source.get("hard_rules")
+        normalized.get("scoringHardFilters") or scoring_criteria_source.get("hard_rules"),
     )
     if not scoring_hard_filters:
         scoring_hard_filters = normalize_hard_filters(legacy_hard_filters)
@@ -1534,7 +2599,39 @@ def _sync_screening_plan_criteria(plan: dict[str, Any]) -> dict[str, Any]:
         "dimension_weights": scoring_criteria.get("dimension_weights") or normalized.get("scoringWeights") or {},
     }
     normalized["scoringCriteria"] = scoring_criteria
+    if not isinstance(normalized.get("projectFitConfig"), dict):
+        normalized["projectFitConfig"] = {}
+    brief_text = json.dumps(normalized.get("briefDecomposition") or {}, ensure_ascii=False)
+    normalized["projectSpecialScoring"] = _normalize_project_special_scoring(
+        normalized.get("projectSpecialScoring") or normalized.get("specialScoringPolicy") or normalized.get("project_scoring_policy"),
+        _fallback_project_special_scoring(
+            brief_text,
+            normalized.get("briefDecomposition") if isinstance(normalized.get("briefDecomposition"), dict) else {},
+            normalized.get("promotionStrategy") if isinstance(normalized.get("promotionStrategy"), dict) else {},
+            normalized.get("projectFitConfig") if isinstance(normalized.get("projectFitConfig"), dict) else {},
+        ),
+    )
     return normalized
+
+
+def _creator_no_order_permission_issue(creator: dict[str, Any], raw_payload: dict[str, Any] | None = None) -> str:
+    raw = raw_payload if isinstance(raw_payload, dict) else {}
+    values = [
+        creator.get("order_permission_status"),
+        raw.get("order_permission_status"),
+        raw.get("text"),
+        raw.get("detail_text"),
+        raw.get("raw_table"),
+        raw.get("list_api_kol"),
+    ]
+    text = "".join(
+        json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "")
+        for value in values
+    )
+    compact = re.sub(r"\s+", "", text)
+    if any(hint in compact for hint in ["无接单权限", "暂无接单权限", "不可接单", "不能接单", "暂不接单", "未开通接单"]):
+        return "接单权限：蒲公英显示无接单权限，无法发起合作"
+    return ""
 
 
 def _creator_hard_filter_issues(project_id: str, creator: dict[str, Any], hard_filters: list[dict[str, Any]]) -> list[str]:
@@ -1548,6 +2645,9 @@ def _creator_hard_filter_issues(project_id: str, creator: dict[str, Any], hard_f
         text_blob = f"{text_blob} {json.dumps(source_raw_payload, ensure_ascii=False)}"
     category_items: list[dict[str, Any]] = []
     issues: list[str] = []
+    no_order_issue = _creator_no_order_permission_issue(creator, source_raw_payload)
+    if no_order_issue:
+        issues.append(no_order_issue)
     for item in hard_filters or []:
         if item.get("required") is False:
             continue
@@ -1576,19 +2676,17 @@ def _creator_hard_filter_issues(project_id: str, creator: dict[str, Any], hard_f
                 issues.append(f"{label}：35岁以上粉丝占比 {fans_ratio:.0%} 低于 {threshold:.0%}")
         if "cpc" in text:
             threshold = _threshold_from_text(value, "cpc", 2)
-            cpc = normalized.get("natural_cpc")
+            cpc = parse_number(normalized.get("effective_cpc")) or parse_number(normalized.get("natural_cpc"))
             if cpc is not None and cpc >= threshold:
                 issues.append(f"{label}：CPC {cpc:g} 未低于 {threshold:g}")
         if "cpe" in text:
             threshold = _threshold_from_text(value, "cpe", 20)
-            cpe = normalized.get("natural_cpe")
+            cpe = parse_number(normalized.get("effective_cpe")) or parse_number(normalized.get("natural_cpe"))
             if cpe is not None and cpe >= threshold:
                 issues.append(f"{label}：CPE {cpe:g} 未低于 {threshold:g}")
         if any(keyword in text for keyword in ["搜索+推荐", "搜索推荐"]):
-            threshold = _threshold_from_text(value, "search", 0.4)
-            search_ratio = normalized.get("search_recommend_ratio")
-            if search_ratio is not None and search_ratio <= threshold:
-                issues.append(f"{label}：搜索+推荐占比 {search_ratio:.0%} 未超过 {threshold:.0%}")
+            if str(normalized.get("search_recommend_review_status") or "") != "已复核":
+                issues.append(f"{label}：搜索+推荐占比待人工复核")
         if any(keyword in text for keyword in ["孩子年级", "小升初", "初中", "高中", "大孩"]):
             expected_values = _expand_rule_values(_split_rule_values(value) or ["小升初", "初中", "高中", "初一", "初二", "初三", "高一", "高二", "高三", "大孩"])
             if not any(keyword in text_blob for keyword in expected_values):
@@ -1669,8 +2767,6 @@ def _filter_creators_by_hard_filters(
     creators: list[dict[str, Any]],
     hard_filters: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if not hard_filters:
-        return creators, []
     accepted: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for creator in creators:
@@ -1711,19 +2807,134 @@ def _safe_llm_error(error: Exception) -> str:
     return f"{error.__class__.__name__}: {text[:360]}"
 
 
+def _brief_single_budget_cap(brief: str) -> float | None:
+    text = str(brief or "")
+    if not text:
+        return None
+    patterns = [
+        r"(?:单达人|单个达人|单人|达人)?(?:预算|报价|合作报价|费用|价格)[^\d一二三四五六七八九十百千万]{0,12}(\d+(?:\.\d+)?)\s*(万|千|k|K|元)?\s*(?:以下|以内|内|不超过|小于|≤|<)",
+        r"(\d+(?:\.\d+)?)\s*(万|千|k|K|元)?\s*(?:以下|以内|内|不超过).{0,12}(?:KOC|达人|博主)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        amount = parse_number(match.group(1))
+        if amount is None:
+            continue
+        unit = match.group(2) or ""
+        if unit == "万":
+            amount *= 10000
+        elif unit in {"千", "k", "K"}:
+            amount *= 1000
+        if amount > 0:
+            return float(amount)
+    return None
+
+
+def _pgy_filter_field_guide() -> dict[str, Any]:
+    def normalize_options(value: Any) -> Any:
+        if isinstance(value, list):
+            normalized = []
+            for item in value:
+                if isinstance(item, dict):
+                    normalized.append({
+                        key: normalize_options(val)
+                        for key, val in item.items()
+                        if key in {"label", "options", "value", "children"}
+                    })
+                else:
+                    normalized.append(item)
+            return normalized
+        return value
+
+    fields = []
+    for item in PGY_FILTER_CATALOG:
+        if not isinstance(item, dict):
+            continue
+        field = str(item.get("field") or "").strip()
+        if not field:
+            continue
+        if field in PGY_BASE_FILTER_FIELDS:
+            usage_group = "required_filters_allowed"
+            llm_usage = "可放入每套方案的 required_filters；其中博主类目可多条，粉丝量只设下限，合作报价按图文/视频子字段设置。"
+        elif field in PGY_PROFILE_EXTRA_FILTER_FIELDS:
+            usage_group = "additional_filters_allowed"
+            llm_usage = "高频画像筛选；Brief 明确要求且选项真实存在时，可放入 additional_filters 或 enabled_additional_filters，但不要作为每套方案的 required_filters。"
+        elif field in PGY_EXTRA_FILTER_FIELDS:
+            usage_group = "additional_filters_allowed"
+            llm_usage = "只放入 additional_filters 或 enabled_additional_filters，用于数量过多时提质收窄；不要作为主池必备条件。"
+        elif field in PGY_MANUAL_ONLY_FILTER_FIELDS:
+            usage_group = "manual_only"
+            llm_usage = "只允许用户手动添加或作为待补充建议；不要自动放入 required_filters。"
+        else:
+            usage_group = "cautious_or_manual"
+            llm_usage = "谨慎使用；只有 Brief 明确要求且字段选项真实存在时，才作为手动 filters 或低优先级附加条件。"
+        fields.append(
+            {
+                "field": field,
+                "usage_group": usage_group,
+                "control_type": item.get("control_type") or "",
+                "options": normalize_options(item.get("options") or []),
+                "option_groups": normalize_options(item.get("option_groups") or []),
+                "sub_fields": normalize_options(item.get("sub_fields") or []),
+                "input_fields": normalize_options(item.get("input_fields") or []),
+                "notes": item.get("notes") or "",
+                "llm_usage": llm_usage,
+            }
+        )
+    return {
+        "source": "pgy_scraped_filter_catalog",
+        "purpose": "告诉大模型蒲公英找博主页面真实存在的筛选字段、控件类型、可选项、二级选项和允许落位。",
+        "required_filters_allowed_fields": sorted(PGY_BASE_FILTER_FIELDS),
+        "additional_filters_allowed_fields": sorted(PGY_EXTRA_FILTER_FIELDS),
+        "manual_only_fields": sorted(PGY_MANUAL_ONLY_FILTER_FIELDS),
+        "unavailable_as_frontend_filters": [
+            "高知家庭",
+            "教师人设",
+            "国际学校家庭",
+            "大孩家庭",
+            "孩子年级",
+            "学习内容占比",
+            "是否全是vlog",
+            "真实使用场景",
+            "教育决策强度",
+            "中产教育叙事",
+        ],
+        "rules": [
+            "pgyCollectionPlan 只能从 fields 中选择真实字段；不在 fields 里的业务语义只能进入 post_score_rules/manual_review_rules。",
+            "required_filters 只能使用 required_filters_allowed_fields；additional_filters 只能使用 additional_filters_allowed_fields。",
+            "字段 value、sub_value、parent_value、sub_field 必须来自该字段 options/option_groups/sub_fields 或符合 input_fields 的填写规则。",
+            "宽类目只能作为召回入口或 proxy，不代表业务意图已被精准满足。",
+        ],
+        "fields": fields,
+    }
+
+
 @app.post("/api/projects/{project_id}/screening-standard/optimize")
 def optimize_screening_standard(project_id: str, payload: ScreeningStandardPayload) -> dict[str, Any]:
     payload.project_id = project_id
     project = get_project(project_id) or payload.project
     system_prompt = (
-        "你是广告投放达人评分机制设计专家。请先把客户 Brief 拆成标准化 briefDecomposition："
-        "明确区分蒲公英后台能直接执行的白名单前置筛选、只能宽代理表达的 proxy 条件、蒲公英做不到但必须采后评分的规则、以及人工复核项。"
+        "你是广告投放达人策略与评分机制设计专家。请先把客户 Brief 拆成标准化 briefDecomposition，"
+        "再输出 promotionStrategy：从产品定位、目标用户、决策链路、核心卖点、内容场景、转化路径和风险点解释这个产品应该怎样被推广。"
+        "筛选方案和评分机制都必须由 promotionStrategy 推导，而不是套用某个固定产品模板。"
+        "你必须先判断当前项目的真实推广对象：使用者是谁、购买/报名/转化决策者是谁、内容影响对象是谁、达人需要说服谁；"
+        "不要套用固定行业模板，也不要把历史项目中的人群年龄、身份或决策链路直接迁移到当前项目。"
+        "reasoning 只描述当前 Brief 的正向依据和未明确项，不要通过反驳某个历史模板、默认人群或固定年龄段来论证。"
+        "受众分析必须推导适合当前项目的粉丝年龄段，并映射到蒲公英前端真实筛选字段“粉丝年龄”的可选值；如果 Brief 证据不足，写明低置信假设或 Brief未明确。"
+        "你会收到 pgyFilterCatalog 和 pgyFilterFieldGuide，它们来自蒲公英找博主页面真实筛选项；生成蒲公英前置筛选时必须严格使用这些真实字段、控件和可选项。"
         "然后再输出两个互相独立但可协同使用的结果：第一，面向小红书蒲公英找博主页面的多套筛选方案，必须只使用真实蒲公英筛选字段；"
-        "第二，面向本项目工具的两阶段评分机制：先用找博主列表页数据做数据层分级，再用达人详情页、主页简介、笔记标题/文案做大模型人设内容评分。"
-        "不允许把高知家庭、教师人设、大孩家庭、国际学校、学区房等蒲公英无法精确前置筛选的业务语义伪装成已筛选条件。"
+        "第二，面向本项目工具的两阶段评分机制：先用找博主列表页数据做数据层分级，再用达人详情页、主页简介、笔记标题/文案做人设、内容和卖点承接评分。"
+        "同时必须生成 projectSpecialScoring：这是该项目专属初筛评分逻辑，必须由当前 Brief、briefDecomposition 和 promotionStrategy 推导，保存后由系统解释执行；不要依赖代码里的项目名或历史模板。"
+        "briefDecomposition 必须明确区分蒲公英后台能直接执行的白名单前置筛选、只能宽代理表达的 proxy 条件、采后评分/硬规则、以及人工复核项。"
+        "pgy_required 只代表蒲公英页面可执行的前置条件；scoringCriteria.hard_rules 代表采后判断的合作门槛。蒲公英不能前置，不等于不能成为采后硬性规则。"
+        "无法被蒲公英字段直接筛选的业务语义，不得写成 pgy_required；但如果 Brief 明确将其设为合作门槛，可进入 scoringCriteria.hard_rules 或 manual_review_rules，并说明证据来源和判断方式。"
         "母婴、教育等宽类目若用于表达复杂业务意图，必须标记为 proxy，并说明风险和 quota 上限。"
         "报价不是越低越好，必须结合CPM/CPC/CPE和近30天曝光/阅读/互动判断单个达人预算能买到的效果总量。"
         "粉丝量只用于动态T级和同T级基准，不作为高权重得分项。缺蒲公英链接或缺字段不是达人质量问题，不得作为硬性淘汰项。"
+        "规则落位必须严格分层：hardFilters/scoringCriteria.hard_rules 放当前 Brief 明确要求且能被字段或证据稳定判断的硬性条件；"
+        "post_score_rules/manual_review_rules 放需要采后结合主页、笔记、详情页或人工判断的匹配度、真实性和风险复核项。"
         "只输出 JSON。"
     )
     user_payload = {
@@ -1734,17 +2945,46 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
             "briefType": "simple|complex",
             "briefDecomposition": {
                 "brief_facts": [{"category": "budget|audience|persona|performance|risk", "fact": "从Brief抽取的业务事实"}],
+                "promotion_audience_analysis": {
+                    "actual_users": ["真实使用者/体验者"],
+                    "decision_makers": ["购买/转化决策者"],
+                    "content_influenced_audience": ["内容主要影响谁"],
+                    "inferred_fans_age": [
+                        {
+                            "pgy_field": "粉丝年龄",
+                            "pgy_value": "必须来自 pgyFilterCatalog 中粉丝年龄的真实选项，例如 <18 占比高|18～24 占比高|25～34 占比高|35～44 占比高|>44 占比高；Brief 未明确时写 Brief未明确",
+                            "reason": "根据当前 Brief 正向推导该年龄段的原因",
+                            "confidence": "high|medium|low",
+                            "placement": "pgy_required|pgy_additional|post_score|manual_review|not_used"
+                        }
+                    ],
+                    "not_target_audiences": ["不应默认套用的人群"],
+                    "reasoning": "只描述当前 Brief 的正向依据和未明确项；不要通过反驳某个历史模板、默认人群或固定年龄段来论证"
+                },
+                "rule_placement_matrix": [
+                    {
+                        "brief_requirement": "Brief中的一个要求",
+                        "placement": "pgy_required|pgy_additional|hard_rule|post_score|manual_review|negative_preference",
+                        "reason": "为什么放在这里，是否能被字段直接确认",
+                        "is_one_vote_veto": False,
+                        "evidence_from_brief": "引用 Brief 原文或说明 Brief 未明确",
+                        "confidence": "high|medium|low"
+                    }
+                ],
                 "must_have_requirements": ["必须满足的业务条件；若蒲公英不能前置，则必须进入采后评分或人工复核"],
                 "strong_preferences": ["强偏好条件"],
-                "negative_constraints": ["负向约束，例如不优先孕期/低幼/泛生活方式妈妈等"],
+                "negative_constraints": ["Brief 明确排除或低优先级的人群/内容/风险类型"],
+                "assumptions": ["模型为了生成方案所做的低置信假设；没有则为空数组"],
+                "unknowns": ["Brief 未明确但影响筛选/评分的问题；没有则为空数组"],
                         "backend_mappable_filters": [
                             {
-                                "field": "必须来自 pgyFilterCatalog 的真实字段",
+                                "field": "必须来自 pgyFilterCatalog 的真实字段；粉丝年龄判断必须使用字段名“粉丝年龄”",
                                 "value": "真实可选值或可填写区间",
                                 "sub_value": "博主类目二级类目；仅 field=博主类目 且二级类目真实存在时填写",
                                 "mapping_type": "direct|proxy",
                                 "confidence": "high|medium|low",
                                 "business_requirement": "映射的业务需求",
+                                "evidence_from_brief": "引用 Brief 原文或说明 Brief 未明确",
                     }
                 ],
                 "proxy_filters": [
@@ -1755,6 +2995,7 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
                         "proxy_risk": "会混入什么人群",
                         "confidence": "low|medium",
                         "max_quota_policy": "该代理池最多贡献多少或只能作为补量池",
+                        "evidence_from_brief": "引用 Brief 原文或说明 Brief 未明确",
                     }
                 ],
                 "post_score_rules": [
@@ -1763,13 +3004,83 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
                         "required_evidence": ["需要哪些达人字段/主页/笔记证据"],
                         "fallback_action": "字段缺失或证据不足时如何处理",
                         "score_impact": "high|medium|low",
+                        "evidence_from_brief": "引用 Brief 原文或说明 Brief 未明确",
+                        "confidence": "high|medium|low",
                     }
                 ],
                 "manual_review_rules": ["必须人工确认的事项"],
             },
+            "promotionStrategy": {
+                "product_positioning": "基于Brief推导产品定位，不按固定产品名模板套用",
+                "target_users": ["产品真实使用者"],
+                "decision_makers": ["购买/合作/转化决策者"],
+                "core_selling_points": ["产品核心卖点/痛点解决点"],
+                "conversion_scenes": ["适合达人内容呈现的使用/决策/种草场景"],
+                "content_angles": ["达人可讲的内容角度，例如体验、测评、教程、日常场景、对比"],
+                "creator_fit_hypotheses": ["什么类型的达人理论上更容易讲清产品"],
+                "screening_implications": ["这些策略如何转化为蒲公英前置筛选/代理筛选"],
+                "scoring_implications": ["这些策略如何转化为采后评分维度和证据要求"],
+                "negative_fit_risks": ["不适合承接该产品的内容/人群/表达风险"],
+            },
             "budgetPolicy": {"total_budget": "总达人预算", "target_creator_count": "目标达人数量", "expected_single_cost": "总预算/目标人数", "single_hard_cap": "单达人硬上限", "principle": "报价与效果总量/效率的关系"},
             "tierPolicy": {"principle": "按类目、项目和抓取样本动态生成T级；粉丝量只作为比较坐标", "benchmark_method": "用P25/P50/P75/P90建立同T级基准"},
             "dataLayerScoring": {"purpose": "找博主列表页数据分级", "core_metrics": ["报价", "近30天曝光", "近30天阅读", "近30天互动", "CPM", "CPC", "CPE"], "levels": [{"level": "S|A|B|C", "rule": "分级规则"}]},
+            "projectSpecialScoring": {
+                "enabled": True,
+                "label": "项目专属评分名称，例如产品名/项目名",
+                "source": "llm_brief_decomposition",
+                "identity": {
+                    "name": "该项目最优先识别的身份/人群/背景",
+                    "points": 30,
+                    "fields": ["nickname", "creator_type", "persona_tags", "ip_city", "topic_point", "child_grade", "child_age"],
+                    "keywords": ["从 Brief 提取的身份、人群、背景关键词"],
+                    "evidence_keywords": ["可在主页/笔记/详情里验证该身份或背景的证据词"],
+                },
+                "scene": {
+                    "name": "Brief核心内容/使用/转化场景",
+                    "max_points": 30,
+                    "base_points": 10,
+                    "points_per_hit": 4,
+                    "max_keyword_hits": 5,
+                    "direction_bonus": {"strong": 4, "medium": 2},
+                    "keywords": ["从 Brief 和 promotionStrategy 提取的内容场景、卖点承接、转化场景关键词"],
+                },
+                "data": {
+                    "max_points": 20,
+                    "good_points": 15,
+                    "excellent_points": 20,
+                    "read_ratio_points": [{"min": 0.75, "points": 10}, {"min": 0.5, "points": 6}],
+                    "interaction_bonus": [{"min": 120, "points": 4}, {"min": 60, "points": 2}],
+                },
+                "efficiency": {"max_points": 20, "good_points": 14, "excellent_points": 20, "fallback_points": 6},
+                "tier_rules": {
+                    "s_min_priority_score": 86,
+                    "s_score": 95,
+                    "s_high_priority_score": 93,
+                    "s_high_score": 97,
+                    "a_min_priority_score": 72,
+                    "a_score": 88,
+                    "b_plus_min_priority_score": 55,
+                    "b_plus_score": 80,
+                    "b_min_priority_score": 40,
+                    "b_score": 75,
+                    "require_identity_for_s": True,
+                    "require_scene_for_s": True,
+                    "require_good_data_for_s": True,
+                    "require_good_efficiency_for_s": True,
+                    "no_identity_cap": 89,
+                    "identity_only_s_cap": 94,
+                },
+                "negative": {"keywords": ["Brief明确低优先或不适合的人群/内容/场景"], "cap_without_scene": 84},
+                "project_fit_config_patch": {
+                    "preferred_content_scenes": ["需要注入 projectFitConfig 的专属内容场景"],
+                    "preferred_presentation_styles": ["适合该产品的表达方式"],
+                    "target_grade_keywords": [],
+                    "parent_decision_keywords": [],
+                    "discouraged_keywords": ["负向关键词"],
+                },
+                "ignore_hard_filter_keywords": ["只有当 Brief 明确不应使用某些历史/代理硬筛时填写，例如不适用的年龄画像词"],
+            },
             "hardFilters": [{"field": "只允许明确事实类硬性标准", "condition": ">=|<=|规避|同T级对比|核算", "value": "阈值或规则", "required": True, "feishuField": "匹配到的飞书字段名或空"}],
             "scoringWeights": {"budget": 15, "fans": 5, "cpe": 20, "engagement": 30, "persona": 20, "content": 10},
             "scoringCriteria": {
@@ -1804,8 +3115,10 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
                         "precision_level": "high|medium|low",
                         "target_quota": "建议目标贡献人数",
                         "max_quota": "最大贡献人数；proxy/low 精度方案必须较低",
-                        "precision_warning": "低精度或代理方案必须说明混入风险",
+                        "precision_warning": "低精度、代理或验证方案必须说明混入风险；没有明确业务证据时写 Brief 未明确",
                         "goal": "覆盖的人群/达人类型",
+                        "evidence_from_brief": "引用 Brief 原文或说明 Brief 未明确",
+                        "assumptions": ["低置信假设；没有则为空数组"],
                         "target_count_range": "50-2000",
                         "required_filters": [
                             {
@@ -1820,7 +3133,7 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
                         ],
                         "additional_filters": [
                             {
-                                "field": "预估阅读单价|预估互动单价|阅读中位数|互动中位数|曝光中位数|粉丝地域|常规剔除 等可调整提质条件",
+                                "field": "笔记类型|预估互动单价|曝光中位数|阅读中位数|互动中位数|预估阅读单价 等可调整提质条件",
                                 "value": "筛选值",
                                 "reason": "数量过多或质量不足时才启用",
                                 "control_type": "必须与 pgyFilterCatalog 对应字段的控件类型一致",
@@ -1834,7 +3147,7 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
                 ],
                 "filters": [
                     {
-                        "field": "全局手动添加条件；默认留空，不要自动放入人设/特色背景类低频条件",
+                        "field": "全局手动添加条件；默认留空，需要品牌搜索、剔除品牌、平台推荐等人工输入/确认的条件才放这里",
                         "value": "筛选值或待填写内容",
                         "reason": "为什么由用户手动添加",
                         "control_type": "必须与 pgyFilterCatalog 对应字段的控件类型一致",
@@ -1849,32 +3162,51 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
             "summary": "一句话说明优化依据",
         },
         "pgyFilterCatalog": PGY_FILTER_CATALOG,
+        "pgyFilterFieldGuide": _pgy_filter_field_guide(),
         "constraints": [
-            "必须输出 briefDecomposition；briefDecomposition 要先于 pgyCollectionPlan 表达 Brief 如何被拆成 direct/proxy/post_score/manual_review",
-            "pgyCollectionPlan 只能使用 pgyFilterCatalog 中真实存在的字段和控件类型；白名单外字段不得进入前置筛选",
-            "高知家庭、教师人设、大孩家庭、国际学校、住校生、学区房、中产教育叙事、教育决策强度等，不能作为蒲公英前置筛选；必须进入 post_score_rules 或 manual_review_rules",
+            "必须输出 briefDecomposition 和 promotionStrategy；promotionStrategy 要先于 pgyCollectionPlan/scoringCriteria 表达产品推广策略如何驱动筛选和评分",
+            "必须输出 projectSpecialScoring；它是保存到项目 screening_plan 的专属初筛评分逻辑，系统会解析 identity/scene/data/efficiency/tier_rules/negative/project_fit_config_patch 来给达人评分；不得依赖代码硬编码项目名称",
+            "projectSpecialScoring 的身份关键词、场景关键词、负向关键词、S/A/B+分段和封顶规则都必须从当前 Brief、briefDecomposition 和 promotionStrategy 推导；如果 Brief 证据不足，写低置信关键词或保守阈值，不要套用历史项目",
+            "promotionStrategy 必须基于当前 Brief 逐项推导产品定位、目标用户、决策者、核心卖点、内容场景、转化路径和负向风险；禁止套用固定产品名模板或把某个历史项目方案照搬到新项目",
+            "必须先输出 promotion_audience_analysis：区分当前项目的真实使用者、决策者、内容影响对象和非目标人群；所有判断都必须从当前 Brief、产品场景和转化链路推导，不能套用行业默认人群",
+            "promotion_audience_analysis.reasoning 只描述当前 Brief 的正向依据和未明确项，不要通过反驳某个历史模板、默认人群或固定年龄段来论证",
+            "promotion_audience_analysis 必须输出 inferred_fans_age：从当前 Brief 推导合适的粉丝年龄段，并映射到蒲公英真实字段“粉丝年龄”的真实选项；若适合用于前置筛选，可进入 backend_mappable_filters 或 pgyCollectionPlan，若证据不足则 placement=manual_review/not_used 并说明 Brief未明确",
+            "briefDecomposition 要表达 Brief 如何被拆成 direct/proxy/hard_rule/post_score/manual_review，并输出 assumptions 和 unknowns；Brief 未明确的地方不要自行补全行业默认答案",
+            "必须输出 rule_placement_matrix，并为每条 Brief 要求选择唯一主落位：pgy_required、pgy_additional、hard_rule、post_score、manual_review 或 negative_preference；同时输出 evidence_from_brief 和 confidence",
+            "pgy_required 只代表蒲公英页面可执行的前置条件；scoringCriteria.hard_rules 代表采后判断的合作门槛。蒲公英不能前置，不等于不能成为采后硬性规则",
+            "如果 Brief 使用“必须、硬性、不要、不合作、不推荐、需要达到”等强约束表达，应优先保留其约束强度；只有当无法判断证据来源或无法稳定判断时，才标记为 manual_review，而不是自动降为加减分",
+            "pgyFilterFieldGuide 是模型生成蒲公英筛选条件的字段字典：必须先查字段是否存在、usage_group 是否允许、control_type 怎么填写、options/option_groups/sub_fields 有哪些可选项，再输出筛选条件",
+            "pgyCollectionPlan 只能使用 pgyFilterCatalog/pgyFilterFieldGuide 中真实存在的字段和控件类型；白名单外字段不得进入前置筛选",
+            "无法被蒲公英字段直接筛选的业务语义，不得写成 pgy_required；但如果 Brief 明确将其设为合作门槛，可进入 scoringCriteria.hard_rules 或 manual_review_rules，并说明证据来源和判断方式",
             "母婴、教育、生活记录等宽类目如果用于承接复杂业务意图，必须在 proxy_filters 标记 mapping_type=proxy、confidence=low/medium、proxy_risk，并限制 max_quota",
             "主池必须优先使用 direct 且高置信字段；补量池可以使用 proxy，但不能吞掉全部配额",
             "每套 scheme 必须包含 role、precision_level、target_quota、max_quota；precision_level=low 的补量池 max_quota 不得超过总目标的30%",
-            "负向约束必须进入 negative_constraints，并转化为 post_score_rules 或 manual_review_rules；不得幻想蒲公英已前置排除",
+            "负向约束必须来自 Brief 明确排除或低优先级的人群/内容/风险类型；按可执行性转化为 pgy 条件、post_score_rules、manual_review_rules 或 hard_rules，不得幻想蒲公英已前置排除",
+            "如果 Brief 没有明确说明目标人群、决策者、硬性门槛或负向约束，不要自行补全行业默认答案；请写“Brief未明确”，并把该项放入 manual_review_rules、assumptions 或 unknowns",
             "scoringWeights 六项总和必须为 100",
             "必须把蒲公英筛选方案和采集后评分标准拆开：pgyCollectionPlan 只服务找博主采集，scoringCriteria 只服务采集后评分/推荐/匹配",
-            "hardFilters 只能包含已确认事实类硬性规则；缺蒲公英链接、缺字段、缺近期笔记正文不能作为达人硬性不符",
+            "hardFilters/scoringCriteria.hard_rules 应包含当前 Brief 明确为硬性、且能被已有字段或稳定证据判断的规则；缺蒲公英链接、缺字段、缺近期笔记正文不能自动等同于达人不符合",
+            "学习类内容占比、内容适配、人设适配、主页简介与笔记证据等要求的落位由当前 Brief 的措辞和可验证性决定：可稳定判断的硬性要求可进入 hard_rules，需要采后解释或人工判断的要求进入 post_score_rules/manual_review_rules。",
             "评分机制必须分两阶段：找博主列表页数据先分 S/A/B/C 数据层级；详情页、主页简介、笔记标题/文案只用于高优先级达人的人设内容分析",
             "预算评分必须解释报价、CPM、CPC、CPE和近30天曝光/阅读/互动的关系，输出单个达人预算能换来的效果总量；报价不是越低越好",
             "粉丝量只用于T级坐标和同T级benchmark；T级边界和标准必须根据项目类目、Brief和抓取样本动态生成，不得把粉丝量作为高权重加分",
             "近30天曝光、阅读、互动必须是数据层级的核心指标，和CPM/CPC/CPE一起决定预算效果质量",
-            "蒲公英 schemes 必须且只输出 4 套，分别作为方案一、方案二、方案三、方案四映射到前端卡片；4套要覆盖不同达人来源或人群角度；每套 required_filters 的字段类型必须只来自：博主类目、粉丝量、粉丝年龄、合作报价；其中博主类目允许出现多条",
+            "蒲公英 schemes 必须且只输出 4 套，分别作为方案一、方案二、方案三、方案四映射到前端卡片；4套是前端展示容器要求，不得为了凑满方案编造 Brief 没有依据的人群；每套 required_filters 的字段类型必须只来自：博主类目、粉丝量、粉丝年龄、合作报价；其中博主类目允许出现多条",
+            "4套方案必须有真实筛选差异，不允许只是换名字：方案一是核心高相关主池；方案二若 Brief 提到视频优先/最好视频，必须成为视频优先池，并在 additional_filters 与 enabled_additional_filters 默认放入 {field:'笔记类型', value:'视频笔记为主', control_type:'dropdown_single'}；方案三/四若 Brief 只支持少量真实方向，可以输出保守补量/验证方案，并明确 precision_level、proxy_risk、max_quota、evidence_from_brief 和 assumptions。",
             "博主类目可多选：既可以多选不同一级类目，也可以在同一一级类目下多选多个二级类目；跨一级多二级也必须同时保留，例如 {field:'博主类目', value:'教育', sub_value:'家庭教育'}、{field:'博主类目', value:'教育', sub_value:'学习日常'}、{field:'博主类目', value:'母婴', sub_value:'育儿经验'} 可以同时出现在同一套 required_filters；不能合并成字符串或只留一个",
             "博主类目支持二级类目，二级类目必须来自 pgyFilterCatalog.option_groups；禁止输出不存在或不属于该主类目的二级类目；禁止把多个二级类目写成数组、逗号文本或斜杠文本，必须拆成多条 required_filters",
-            "有道答疑笔这类教育/大孩家庭 Brief 优先多选 教育-家庭教育 与 教育-k12教育；学习效率/工具型可补 教育-学习日常；母婴补量可多选 母婴-育儿经验 与 母婴-早教，并标记 proxy 风险和较低 max_quota",
+            "博主类目选择必须从当前 Brief 的产品定位、目标用户、内容场景和推广策略推导；例如教育、母婴、生活记录等都只是可用召回入口，不得在没有策略证据时默认套用",
+            "粉丝年龄、地域、内容形态、报价区间必须从当前 Brief 的目标用户、决策者、预算和内容要求推导；粉丝年龄必须使用蒲公英字段“粉丝年龄”的真实选项表达，不要默认套用固定年龄段、固定城市或固定报价模板",
+            "评分条件必须显式引用 promotionStrategy：人设分看目标用户/决策者匹配，内容分看核心卖点和转化场景承接，数据分看预算能换来的曝光/阅读/互动效率",
             "一般不要选择笔记类目，只选择博主类目即可；笔记类目不是博主类目，不能用汽车/游戏/母婴/美妆等笔记类目去替代或追加到博主类目",
             "笔记类目在蒲公英真实页面是父级类目下继续展开的二级/三级弹层；除非用户明确要求按笔记内容类目筛选，否则 pgyCollectionPlan 不要输出 笔记类目/内容题材",
             "营销目标是低优先级附加条件，只能放入 additional_filters 或用户手动 filters，不能放入 required_filters；字段结构要用父子指标，如 {field:'营销目标', value:'互动表现', goal:'种草', parent_value:'种草', control_type:'marketing_goal_metric'}",
             "地域/粉丝地域只有 Brief 明确强调地域、IP、城市优先/必须/重点覆盖时才放入筛选条件；仅出现城市案例或品牌叙事时不要自动加入地域",
-            "不要在 required_filters 或自动 filters 中加入 家庭身份、职业身份、特色背景、母婴阶段、行业推荐博主、近期合作品牌、按博主粉丝推荐；这些低频项只有用户在前端手动添加时才允许进入 filters",
-            "预估阅读单价、预估互动单价、阅读/互动/曝光中位数等提质条件放入 additional_filters，默认非必要；如果必备筛选下博主过多，按 additional_filters 数组顺序逐个叠加，越靠上越先启用，一旦数量达标就不再继续加下面的条件",
-            "区间字段必须按字段语义输出：粉丝量、曝光中位数、阅读中位数、互动中位数、合作订单数、传播规模子字段、合作信用度只设下限，写 range_policy='min_only' 和 min；展示 value 也必须写成“1万以上/0.5万以上/500以上/邀约48h回复率：60%以上”这类下限表达，禁止写“1万～10万、0.5万～1万、500～1000、60～100”这类带上限区间；合作报价必须同时设置 min 和 max；预估阅读单价、预估互动单价、预估CPM、外溢进店单价维持只设 max",
+            "家庭身份、职业身份、特色背景、母婴阶段属于高频画像筛选；Brief 明确要求且选项真实存在时，可以放入 additional_filters 或 enabled_additional_filters，但不要放入 required_filters，也不要强行解释为已精准满足业务语义。",
+            "不要在 required_filters 或自动 filters 中加入 行业推荐博主、平台推荐、近期合作品牌、按博主粉丝推荐、笔记类目、内容题材；这些需要人工输入/确认或容易误用的条件只有用户在前端手动添加时才允许进入 filters。",
+            "超出估量时必须按顺序追加能明确缩小范围且提高达人质量的指标条件：预估互动单价(CPE)、曝光中位数、阅读中位数、互动中位数、预估阅读单价(CPC)；不要自动追加预估CPM，也不要用地域、常规剔除来充当自动收紧条件。画像筛选仅在 Brief 明确要求时使用，不能作为泛化收紧手段。",
+            "笔记类型、预估互动单价、曝光中位数、阅读中位数、互动中位数、预估阅读单价等提质条件放入 additional_filters；除视频优先池的“视频笔记为主”可默认启用外，其余默认非必要；如果必备筛选下博主过多，按 additional_filters 数组顺序逐个叠加，越靠上越先启用，一旦数量达标就不再继续加下面的条件；门槛要温和，避免一追加就只剩十几名推荐。",
+            "区间字段必须按字段语义输出：粉丝量、曝光中位数、阅读中位数、互动中位数、合作订单数、传播规模子字段、合作信用度只设下限，写 range_policy='min_only' 和 min；展示 value 也必须写成“3000以上/1000以上/100以上/邀约48h回复率：60%以上”这类下限表达，禁止写“1万～10万、0.5万～1万、500～1000、60～100”这类带上限区间；合作报价必须同时设置 min 和 max；预估阅读单价、预估互动单价、外溢进店单价维持只设 max",
             "每套蒲公英方案需要 target_count_range、expand_if_too_few、narrow_if_too_many，用来根据页面推荐数量动态扩缩条件",
             "当蒲公英页面推荐数量类似 5000+ 时，narrow_if_too_many 必须给出可追加的真实蒲公英附加筛选条件；目标是不超过约 2000",
             "评分硬性条件只使用 Brief 明确要求且能被采集字段确认的事实；人设/内容不能只靠关键词命中，需要详情页、主页简介、笔记标题/文案等证据",
@@ -1883,7 +3215,7 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
             "近期合作品牌是可搜索品牌多选，不是普通标签；若 Brief 提供品牌名要写入 input_values；品牌不足3个时 pending_detail 标注待补足",
             "按博主粉丝推荐不是普通行内筛选项，而是右上角智能推荐博主/合作品牌搜索入口；Brief 中的合作品牌、目标品牌、竞品、对标品牌都可写入 input_values 或 competitor_values",
             "行业推荐博主打开后仍有“我的行业/请选择”下拉，必须标注为 nested_select_popover 和 pending_detail",
-            "合作报价、预估阅读单价、预估互动单价是图文/视频子字段，每个子字段还会打开预设档位和自定义区间",
+            "合作报价、预估阅读单价、预估互动单价是图文/视频子字段，每个子字段还会打开预设档位和自定义区间；预估CPM不作为自动追加收窄条件",
             "粉丝地域是国家/省/城市三级级联；地域是国家/省级联；粉丝量、曝光/阅读/互动中位数、千赞比例、外溢进店单价都有预设档位和自定义区间",
         ],
     }
@@ -2073,6 +3405,67 @@ def _ensure_field_mapping_plan(
     return plan
 
 
+AUDIENCE_PROFILE_IMAGE_FIELD_NAMES = ("粉丝画像", "粉丝画像截图")
+
+
+def _field_name_from_meta(field: dict[str, Any]) -> str:
+    return str(field.get("field_name") or field.get("name") or field.get("title") or "").strip()
+
+
+def _is_audience_profile_image_field(field_name: str) -> bool:
+    normalized = re.sub(r"\s+", "", str(field_name or ""))
+    return normalized in AUDIENCE_PROFILE_IMAGE_FIELD_NAMES
+
+
+def _audience_profile_image_path(row: dict[str, Any]) -> str:
+    for field_name in AUDIENCE_PROFILE_IMAGE_FIELD_NAMES:
+        value = str(row.get(field_name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _find_sheet_audience_profile_image_field(fields: list[dict[str, Any]]) -> dict[str, Any] | None:
+    by_name = {_field_name_from_meta(field): field for field in fields}
+    for field_name in AUDIENCE_PROFILE_IMAGE_FIELD_NAMES:
+        if field_name in by_name:
+            return by_name[field_name]
+    return None
+
+
+def _ensure_sheet_audience_profile_image_field(
+    client: FeishuClient,
+    spreadsheet_token: str,
+    sheet_id: str,
+    fields: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    existing = _find_sheet_audience_profile_image_field(fields)
+    if existing:
+        return fields, {"created": False, "field": existing}
+    return client.ensure_sheet_field(spreadsheet_token, sheet_id, fields, "粉丝画像截图")
+
+
+def _clear_sheet_audience_profile_image_values(
+    rows: list[dict[str, Any]],
+    fields: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    image_field_names = {
+        name
+        for name in (_field_name_from_meta(field) for field in fields)
+        if _is_audience_profile_image_field(name)
+    }
+    if not image_field_names:
+        return rows
+    cleared_rows: list[dict[str, Any]] = []
+    for row in rows:
+        next_row = dict(row)
+        for field_name in image_field_names:
+            if field_name in next_row:
+                next_row[field_name] = ""
+        cleared_rows.append(next_row)
+    return cleared_rows
+
+
 def _write_sheet_audience_profile_images(
     client: FeishuClient,
     spreadsheet_token: str,
@@ -2081,15 +3474,18 @@ def _write_sheet_audience_profile_images(
     rows: list[dict[str, Any]],
     result: dict[str, Any],
 ) -> dict[str, Any]:
-    image_rows = [row for row in rows if row.get("粉丝画像截图")]
+    image_rows = [row for row in rows if _audience_profile_image_path(row)]
     if not image_rows:
         return {"enabled": False, "message": "本次写回没有粉丝画像截图"}
-    fields, field_result = client.ensure_sheet_field(spreadsheet_token, sheet_id, fields, "粉丝画像截图")
-    profile_field = next(field for field in fields if field.get("field_name") == "粉丝画像截图")
+    fields, field_result = _ensure_sheet_audience_profile_image_field(client, spreadsheet_token, sheet_id, fields)
+    profile_field = _find_sheet_audience_profile_image_field(fields)
+    if not profile_field:
+        return {"enabled": False, "message": "未找到可写入的粉丝画像列"}
     profile_column = column_name(int(profile_field["column_index"]) + 1)
     row_lookup: dict[str, str] = {}
     result_items = (result.get("created") or []) + (result.get("updated") or [])
-    for row, item in zip(rows, result_items):
+    for fallback_row, item in zip(rows, result_items):
+        row = item.get("row") if isinstance(item.get("row"), dict) else fallback_row
         record_id = item.get("record_id")
         if record_id:
             for key in ("达人ID", "蒲公英链接", "达人昵称"):
@@ -2109,7 +3505,7 @@ def _write_sheet_audience_profile_images(
             failed.append({"row": row.get("达人昵称") or row.get("达人ID") or "", "message": "未定位到写回后的飞书行号"})
             continue
         cell = f"{profile_column}{record_id}"
-        image_path = str(row.get("粉丝画像截图") or "")
+        image_path = _audience_profile_image_path(row)
         try:
             write_result = client.write_sheet_image(
                 spreadsheet_token,
@@ -2526,9 +3922,10 @@ def create_feishu_records(payload: FeishuRecordsPayload) -> dict[str, Any]:
                 for item in sync_states
                 if item.get("table_id") == sheet_id and item.get("feishu_record_id")
             }
-            fields, image_field_result = client.ensure_sheet_field(target.token, sheet_id, fields, "粉丝画像截图")
+            fields, image_field_result = _ensure_sheet_audience_profile_image_field(client, target.token, sheet_id, fields)
             field_mapping = _ensure_field_mapping_plan(payload.project_id, config, target, selected, fields)
             mapped_rows, field_mapping = apply_field_mapping(rows, fields, mapping_plan=field_mapping)
+            mapped_rows = _clear_sheet_audience_profile_image_values(mapped_rows, fields)
             result = client.upsert_sheet_records(target.token, sheet_id, fields, mapped_rows, known_record_ids)
             image_result = _write_sheet_audience_profile_images(client, target.token, sheet_id, fields, rows, result)
             image_result["field_result"] = image_result.get("field_result") or image_field_result
@@ -2674,7 +4071,92 @@ def api_pgy_collect_list() -> dict[str, Any]:
 @app.post("/api/pgy/collect/detail")
 def api_pgy_collect_detail(payload: DetailCollectPayload) -> dict[str, Any]:
     project_id = payload.project_id or "youdao_001"
+    running_task = _running_detail_collect_task(project_id)
+    if running_task:
+        return {
+            "ok": False,
+            "accepted": True,
+            "error": "detail_collection_already_running",
+            "message": running_task.get("progress_message") or "已有达人详情完善任务正在运行，请等待当前任务结束后再试",
+            "task": running_task,
+            "creators": [],
+            "failed": [],
+        }
+    if _detail_collect_lock(project_id).locked():
+        return {
+            "ok": False,
+            "error": "detail_collection_already_running",
+            "message": "已有达人详情完善任务正在运行，请等待当前任务结束后再试",
+            "creators": [],
+            "failed": [],
+        }
     creators = list_creators(project_id)
+    targets = _detail_collect_targets(project_id, payload, creators)
+    if not targets:
+        message = "当前分段没有可完善详情页的达人" if (payload.manual or payload.creator_ids) else "没有达到详情完善优先级的达人"
+        return {"ok": False, "message": message, "creators": [], "failed": []}
+    limit = _detail_collect_limit(payload, len(targets))
+    targets = targets[:limit]
+    if payload.async_collect:
+        task = _create_detail_collect_task(project_id, targets, payload)
+
+        def runner() -> None:
+            detail_lock = _detail_collect_lock(project_id)
+            detail_lock.acquire()
+            try:
+                result = _run_detail_collect_targets(project_id, targets, payload, task_id=task["task_id"])
+                status = "success" if result.get("ok") else "failed"
+                total = int(task.get("total_count") or len(targets))
+                completed = len(result.get("updated") or result.get("creators") or [])
+                failed = len(result.get("failed") or [])
+                _update_detail_collect_task(
+                    task["task_id"],
+                    status=status,
+                    progress_stage="finished" if result.get("ok") else "failed",
+                    completed_count=completed,
+                    failed_count=failed,
+                    finished_at=result.get("finished_at") or _now_text(),
+                    result=result,
+                    progress_message=result.get("message") or f"详情完善完成：{min(total, completed + failed)}/{total} 达人已完成",
+                )
+            except Exception as error:
+                _update_detail_collect_task(
+                    task["task_id"],
+                    status="failed",
+                    progress_stage="failed",
+                    finished_at=_now_text(),
+                    result={"ok": False, "message": f"详情页完善失败：{error}", "creators": [], "failed": []},
+                    progress_message=f"详情页完善失败：{error}",
+                )
+            finally:
+                detail_lock.release()
+
+        threading.Thread(target=runner, name=f"pgy-detail-{task['task_id'][-8:]}", daemon=True).start()
+        return {"ok": True, "accepted": True, "task": task, "message": task["progress_message"]}
+
+    detail_lock = _detail_collect_lock(project_id)
+    if not detail_lock.acquire(blocking=False):
+        return {
+            "ok": False,
+            "error": "detail_collection_already_running",
+            "message": "已有达人详情完善任务正在运行，请等待当前任务结束后再试",
+            "creators": [],
+            "failed": [],
+        }
+    try:
+        return _run_detail_collect_targets(project_id, targets, payload)
+    finally:
+        detail_lock.release()
+
+
+def _detail_collect_limit(payload: DetailCollectPayload, target_count: int) -> int:
+    explicit_limit = int(payload.limit or 0)
+    if payload.creator_ids:
+        return max(1, min(explicit_limit if explicit_limit > 0 else target_count, target_count, 500))
+    return max(1, min(explicit_limit if explicit_limit > 0 else 500, target_count, 500))
+
+
+def _detail_collect_targets(project_id: str, payload: DetailCollectPayload, creators: list[dict[str, Any]]) -> list[dict[str, Any]]:
     target_ids = set(payload.creator_ids or [])
     if payload.manual or target_ids:
         targets = [creator for creator in creators if creator["creator_id"] in target_ids]
@@ -2684,12 +4166,51 @@ def api_pgy_collect_detail(payload: DetailCollectPayload) -> dict[str, Any]:
             for creator in creators
             if needs_detail_completion(creator)
         ]
+        priority_order = {"最高优先级": 0, "高优先级": 1, "中高优先级": 2, "中优先级": 3, "低优先级": 4}
+        tier_order = {"S": 0, "A": 1, "B+": 2, "B": 3, "C": 4}
+        targets.sort(
+            key=lambda creator: (
+                priority_order.get(str(creator.get("detail_collection_priority") or ""), 99),
+                tier_order.get(str(creator.get("initial_tier") or ""), 99),
+                -(parse_number(creator.get("total_score")) or 0),
+            )
+        )
     for creator in targets:
         creator["detail_completion_needs"] = detail_completion_actionable_needs(creator)
-    if not targets:
-        message = "当前分段没有可完善详情页的达人" if (payload.manual or target_ids) else "没有达到详情完善优先级的达人"
-        return {"ok": False, "message": message, "creators": [], "failed": []}
-    result = collect_details_for_targets(targets, limit=payload.limit)
+    return targets
+
+
+def _run_detail_collect_targets(
+    project_id: str,
+    targets: list[dict[str, Any]],
+    payload: DetailCollectPayload,
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    def progress_callback(event: dict[str, Any]) -> None:
+        if not task_id:
+            return
+        total = int(event.get("total_count") or len(targets))
+        completed = int(event.get("completed_count") or 0)
+        failed = int(event.get("failed_count") or 0)
+        done = min(total, completed + failed)
+        _update_detail_collect_task(
+            task_id,
+            progress_stage=event.get("stage") or "collecting",
+            total_count=total,
+            completed_count=completed,
+            failed_count=failed,
+            current_creator_id=event.get("current_creator_id") or "",
+            current_nickname=event.get("current_nickname") or "",
+            progress_message=f"详情完善中：{done}/{total} 达人已完成",
+        )
+
+    try:
+        result = collect_details_for_targets(targets, limit=len(targets), progress_callback=progress_callback)
+    except TypeError as error:
+        if "progress_callback" not in str(error):
+            raise
+        result = collect_details_for_targets(targets, limit=len(targets))
     if not result.get("ok"):
         return result
     updated = []
@@ -2703,12 +4224,13 @@ def api_pgy_collect_detail(payload: DetailCollectPayload) -> dict[str, Any]:
     timing_suffix = f"；总耗时 {duration_text}" if duration_text else ""
     if average_duration_text:
         timing_suffix += f"，单个约 {average_duration_text}"
+    manual_scope = bool(payload.manual or payload.creator_ids)
     return {
         **result,
         "updated": updated,
         "auto_writeback": auto_writeback,
         "message": (
-            f"详情页完善完成，已更新 {len(updated)} 个{'当前分段达人' if (payload.manual or target_ids) else '通过初筛达人'}"
+            f"详情页完善完成，已更新 {len(updated)} 个{'当前分段达人' if manual_scope else '通过初筛达人'}"
             f"；失败 {len(result.get('failed') or [])} 个{timing_suffix}"
         ),
         "target_needs": [
@@ -2718,9 +4240,17 @@ def api_pgy_collect_detail(payload: DetailCollectPayload) -> dict[str, Any]:
                 "needs": creator.get("detail_completion_needs") or detail_completion_actionable_needs(creator),
                 "missing_fields": detail_completion_actionable_missing_fields(creator),
             }
-            for creator in targets[: payload.limit]
+            for creator in targets
         ],
     }
+
+
+@app.get("/api/pgy/collect/detail/tasks/{task_id}")
+def api_pgy_detail_task(task_id: str) -> dict[str, Any]:
+    task = _detail_collect_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail={"message": "详情完善任务不存在"})
+    return {"task": task}
 
 
 @app.post("/api/xhs/notes/parse")
@@ -2788,13 +4318,27 @@ def _normalize_project_screening_plan(value: Any) -> dict[str, Any]:
 PGY_DEFAULT_BASE_FILTERS = {
     "category": {"field": "博主类目", "value": "教育", "reason": "必备筛选：内容类目匹配项目场景"},
     "followers": {"field": "粉丝量", "value": "1万以上", "reason": "必备筛选：先保证基础粉丝量；只设下限", "control_type": "preset_or_number_range", "min": 10000, "range_policy": "min_only"},
-    "age": {"field": "粉丝年龄", "value": "35～44 占比高", "reason": "必备筛选：家长决策人群优先", "control_type": "dropdown"},
     "quote": {"field": "合作报价", "value": "图文笔记：0.1万～2万", "reason": "必备筛选：控制单达人预算", "control_type": "subfield_preset_or_number_range", "sub_field": "图文笔记", "max": 20000},
 }
 
 PGY_BASE_FILTER_FIELDS = {"博主类目", "粉丝量", "粉丝年龄", "合作报价"}
-PGY_EXTRA_FILTER_FIELDS = {"预估阅读单价", "预估互动单价", "阅读中位数", "互动中位数", "曝光中位数", "合作订单数", "传播规模", "合作信用度", "常规剔除", "地域", "粉丝地域"}
-PGY_MANUAL_ONLY_FILTER_FIELDS = {"职业身份", "特色背景", "家庭身份", "母婴阶段", "行业推荐博主", "平台推荐", "近期合作品牌", "按博主粉丝推荐", "笔记类目", "内容题材"}
+PGY_PROFILE_EXTRA_FILTER_FIELDS = {"家庭身份", "职业身份", "特色背景", "母婴阶段"}
+PGY_EXTRA_FILTER_FIELDS = {
+    "笔记类型",
+    "预估阅读单价",
+    "预估互动单价",
+    "阅读中位数",
+    "互动中位数",
+    "曝光中位数",
+    "合作订单数",
+    "传播规模",
+    "合作信用度",
+    "常规剔除",
+    "地域",
+    "粉丝地域",
+    *PGY_PROFILE_EXTRA_FILTER_FIELDS,
+}
+PGY_MANUAL_ONLY_FILTER_FIELDS = {"行业推荐博主", "平台推荐", "近期合作品牌", "按博主粉丝推荐", "笔记类目", "内容题材"}
 PGY_MANUAL_FLAGS = {"manual", "manual_added", "user_added", "frontend_added"}
 
 
@@ -2872,6 +4416,17 @@ def _saved_min_from_range_text(value: Any) -> float | None:
     return parse_number(parts[0] if parts else text)
 
 
+def _normalize_wan_saved_min(field: str, value: str, min_value: Any) -> Any:
+    if field not in PGY_WAN_UNIT_SAVED_FIELDS or min_value in (None, ""):
+        return min_value
+    parsed = parse_number(min_value)
+    if parsed is None:
+        return min_value
+    if parsed < 1000 and "万" in str(value or ""):
+        return parsed * 10000
+    return min_value
+
+
 def _format_saved_min_only_value(value: Any, *, percent: bool = False, wan_unit: bool = False) -> str:
     if value in (None, ""):
         return ""
@@ -2899,6 +4454,7 @@ def _standardize_min_only_saved_range(item: dict[str, Any]) -> dict[str, Any]:
     min_value = item.get("min")
     if min_value in (None, ""):
         min_value = _saved_min_from_range_text(value)
+    min_value = _normalize_wan_saved_min(field, value, min_value)
     normalized_value = _format_saved_min_only_value(min_value, wan_unit=field in PGY_WAN_UNIT_SAVED_FIELDS) or value
     return {
         **item,
@@ -2932,6 +4488,69 @@ def _standardize_min_only_saved_subfield_range(item: dict[str, Any]) -> dict[str
         "max": "",
         "range_policy": "min_only",
     }
+
+
+def _parse_money_amount(text: Any, default_unit: str = "") -> float | None:
+    source = str(text or "").strip()
+    if not source:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(万|千|k|K|元)?", source)
+    if not match:
+        return None
+    amount = parse_number(match.group(1))
+    if amount is None:
+        return None
+    unit = match.group(2) or default_unit
+    if unit == "万":
+        amount *= 10000
+    elif unit in {"千", "k", "K"}:
+        amount *= 1000
+    return float(amount)
+
+
+def _standardize_quote_filter(item: dict[str, Any]) -> list[dict[str, Any]]:
+    value = str(item.get("value") or "").strip()
+    sub_field = str(item.get("sub_field") or item.get("subField") or "").strip()
+    min_value = item.get("min")
+    max_value = item.get("max")
+    if sub_field:
+        return [
+            {
+                **item,
+                "field": "合作报价",
+                "control_type": item.get("control_type") or "subfield_preset_or_number_range",
+                "sub_field": sub_field,
+                "min": min_value if min_value not in (None, "") else "",
+                "max": max_value if max_value not in (None, "") else "",
+            }
+        ]
+
+    segments = [part.strip() for part in re.split(r"[；;]+", value) if part.strip()]
+    result: list[dict[str, Any]] = []
+    for segment in segments:
+        if "图文" in segment:
+            next_sub_field = "图文笔记"
+        elif "视频" in segment:
+            next_sub_field = "视频笔记"
+        else:
+            continue
+        range_text = re.split(r"[：:]", segment, maxsplit=1)[-1]
+        parts = [part.strip() for part in re.split(r"～|~|至|到|-", range_text) if part.strip()]
+        default_unit = "万" if "万" in range_text else ("千" if "千" in range_text else "")
+        next_min = _parse_money_amount(parts[0], default_unit) if parts else None
+        next_max = _parse_money_amount(parts[-1], default_unit) if len(parts) >= 2 else _parse_money_amount(range_text, default_unit)
+        result.append(
+            {
+                **{key: val for key, val in item.items() if key not in {"sub_fields", "subFields", "sub_field", "subField", "min", "max"}},
+                "field": "合作报价",
+                "value": f"{next_sub_field}：{(next_min if next_min not in (None, '') else 0):g}～{next_max:g}" if next_max is not None else segment,
+                "control_type": item.get("control_type") or "subfield_preset_or_number_range",
+                "sub_field": next_sub_field,
+                "min": next_min if next_min is not None else "",
+                "max": next_max if next_max is not None else "",
+            }
+        )
+    return result
 
 
 def _standardize_saved_pgy_filter(item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2985,6 +4604,10 @@ def _standardize_saved_pgy_filter(item: dict[str, Any]) -> list[dict[str, Any]]:
                 "priority": item.get("priority") or "low",
             }
         ]
+    if field == "合作报价":
+        quote_items = _standardize_quote_filter(item)
+        if quote_items:
+            return quote_items
     if field in PGY_MIN_ONLY_SAVED_RANGE_FIELDS:
         return [_standardize_min_only_saved_range(item)]
     if field in PGY_MIN_ONLY_SAVED_SUBFIELD_RANGE_FIELDS:
@@ -3013,10 +4636,16 @@ def _clean_scheme_filters(filters: Any, allowed_fields: set[str] | None = None, 
     return _dedupe_filters(cleaned)
 
 
-def _manual_filters_for_scheme(screening_plan: dict[str, Any]) -> list[dict[str, Any]]:
+def _global_filters_for_scheme(screening_plan: dict[str, Any]) -> list[dict[str, Any]]:
     pgy_plan = screening_plan.get("pgyCollectionPlan") if isinstance(screening_plan.get("pgyCollectionPlan"), dict) else {}
+    allowed_global_fields = {*PGY_BASE_FILTER_FIELDS, *PGY_EXTRA_FILTER_FIELDS}
     return _clean_scheme_filters(
-        [item for item in (pgy_plan.get("filters") or []) if isinstance(item, dict) and _is_manual_pgy_filter(item)],
+        [
+            item
+            for item in (pgy_plan.get("filters") or [])
+            if isinstance(item, dict)
+            and (_is_manual_pgy_filter(item) or str(item.get("field") or "") in allowed_global_fields)
+        ],
         allowed_fields=None,
         allow_manual_only=True,
     )
@@ -3069,7 +4698,7 @@ def _base_filters_for_scheme(screening_plan: dict[str, Any], scheme: dict[str, A
     base_candidates = _dedupe_filters(base_candidates)
     category_filters = [item for item in base_candidates if str(item.get("field") or "") == "博主类目"] or [{**PGY_DEFAULT_BASE_FILTERS["category"]}]
     follower_filters = [item for item in base_candidates if str(item.get("field") or "") == "粉丝量"] or [{**PGY_DEFAULT_BASE_FILTERS["followers"]}]
-    age_filters = [item for item in base_candidates if str(item.get("field") or "") == "粉丝年龄"] or [{**PGY_DEFAULT_BASE_FILTERS["age"]}]
+    age_filters = [item for item in base_candidates if str(item.get("field") or "") == "粉丝年龄"]
     quote_filters = [item for item in base_candidates if str(item.get("field") or "") == "合作报价"] or [{**PGY_DEFAULT_BASE_FILTERS["quote"]}]
     return _clean_scheme_filters(
         _dedupe_filters([*category_filters, *follower_filters, *age_filters, *quote_filters]),
@@ -3095,7 +4724,13 @@ def _scheme_plan(screening_plan: dict[str, Any], scheme: dict[str, Any], active_
     active_additional_filters = _clean_scheme_filters(active_additional_filters, allowed_fields=PGY_EXTRA_FILTER_FIELDS)
     enabled_extra_keys = {_filter_key(item) for item in active_additional_filters if isinstance(item, dict)}
     enabled_extra_filters = [item for item in extra_filters if _filter_key(item) in enabled_extra_keys]
-    manual_filters = _manual_filters_for_scheme(screening_plan)
+    existing_enabled_keys = {_filter_key(item) for item in enabled_extra_filters}
+    enabled_extra_filters.extend(
+        item
+        for item in active_additional_filters
+        if _filter_key(item) not in existing_enabled_keys
+    )
+    global_filters = _global_filters_for_scheme(screening_plan)
     pgy_plan["active_scheme_id"] = scheme.get("scheme_id") or scheme.get("id") or scheme.get("name") or "scheme"
     pgy_plan["active_scheme_name"] = scheme.get("name") or pgy_plan["active_scheme_id"]
     pgy_plan["active_scheme_goal"] = scheme.get("goal") or ""
@@ -3105,8 +4740,9 @@ def _scheme_plan(screening_plan: dict[str, Any], scheme: dict[str, Any], active_
     pgy_plan["base_filters"] = base_filters
     pgy_plan["extra_filters"] = extra_filters
     pgy_plan["enabled_extra_filters"] = enabled_extra_filters
-    pgy_plan["manual_filters"] = manual_filters
-    pgy_plan["filters"] = _dedupe_filters([*base_filters, *enabled_extra_filters, *manual_filters])
+    pgy_plan["manual_filters"] = [item for item in global_filters if _is_manual_pgy_filter(item)]
+    pgy_plan["global_filters"] = global_filters
+    pgy_plan["filters"] = _dedupe_filters([*base_filters, *enabled_extra_filters, *global_filters])
     pgy_plan["target_count_range"] = scheme.get("target_count_range") or pgy_plan.get("target_count_range") or ""
     pgy_plan["expand_if_too_few"] = scheme.get("expand_if_too_few") or []
     pgy_plan["narrow_if_too_many"] = scheme.get("narrow_if_too_many") or []
@@ -3120,6 +4756,48 @@ def _creator_dedupe_key(creator: dict[str, Any]) -> str:
         if value:
             return f"{key}:{value}"
     return str(id(creator))
+
+
+def _creator_identity_missing_fields(creator: dict[str, Any]) -> list[str]:
+    identity_fields = (
+        ("pgy_url", "蒲公英达人主页"),
+        ("pgy_blogger_id", "蒲公英达人ID"),
+        ("xiaohongshu_id", "小红书号"),
+        ("creator_id", "采集达人ID"),
+        ("nickname", "达人昵称"),
+    )
+    if any(str(creator.get(field) or "").strip() for field, _ in identity_fields):
+        return []
+    return ["可用于入库的达人身份"]
+
+
+def _split_identity_ready_creators(creators: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ready: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for creator in creators:
+        if not isinstance(creator, dict):
+            continue
+        missing = _creator_identity_missing_fields(creator)
+        if not missing:
+            ready.append(creator)
+            continue
+        skipped.append({**creator, "identity_missing_fields": missing})
+    return ready, skipped
+
+
+def _identity_skip_records(creators: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records = []
+    for creator in creators:
+        missing = creator.get("identity_missing_fields") or _creator_identity_missing_fields(creator)
+        records.append(
+            {
+                "field": "必填身份字段",
+                "value": creator.get("nickname") or creator.get("creator_id") or "",
+                "message": f"缺少{ '、'.join(missing) }，已跳过入库",
+                "creator_id": creator.get("creator_id"),
+            }
+        )
+    return records
 
 
 def _merge_raw_payload(*payloads: Any) -> dict[str, Any]:
@@ -3242,13 +4920,37 @@ def _scheme_expected_collect_count(preflight_result: dict[str, Any], collect_lim
     return max(1, min(int(collect_limit), actual_count))
 
 
-def _scheme_collection_shortfall(preflight_result: dict[str, Any], collected_count: int, collect_limit: int) -> dict[str, Any]:
+def _scheme_collection_shortfall(
+    preflight_result: dict[str, Any],
+    collected_count: int,
+    collect_limit: int,
+    *,
+    has_next_scheme: bool = True,
+) -> dict[str, Any]:
     expected_count = _scheme_expected_collect_count(preflight_result, collect_limit)
     if expected_count is None:
         return {"ok": True, "expected_count": None, "collected_count": int(collected_count)}
     collected = int(collected_count)
     if collected >= expected_count:
         return {"ok": True, "expected_count": expected_count, "collected_count": collected}
+    if collected > 0:
+        ratio = collected / max(1, expected_count)
+        if ratio >= 0.8:
+            return {
+                "ok": True,
+                "warning": True,
+                "expected_count": expected_count,
+                "collected_count": collected,
+                "message": f"本方案预检{preflight_result.get('actual_count_text') or f'推荐 {expected_count} 位博主'}，正式采集读取到 {collected} 个；短缺在可接受范围内，已按已读取结果继续入库",
+            }
+        if not has_next_scheme:
+            return {
+                "ok": True,
+                "warning": True,
+                "expected_count": expected_count,
+                "collected_count": collected,
+                "message": f"本方案预检{preflight_result.get('actual_count_text') or f'推荐 {expected_count} 位博主'}，正式采集读取到 {collected} 个；当前已是最后一套方案，已按已读取结果继续入库",
+            }
     return {
         "ok": False,
         "expected_count": expected_count,
@@ -3263,7 +4965,7 @@ def _scheme_expected_count(scheme: dict[str, Any], base_target: Any = None, hist
     enabled_additional = scheme.get("enabled_additional_filters") or scheme.get("enabled_extra_filters") or []
     if enabled_additional:
         filters = [*filters, *enabled_additional]
-    strong_fields = {"合作报价", "预估阅读单价", "预估互动单价", "合作订单数", "外溢进店单价", "近期合作品牌", "按博主粉丝推荐"}
+    strong_fields = {"合作报价", "预估CPM", "预估阅读单价", "预估互动单价", "合作订单数", "外溢进店单价", "近期合作品牌", "按博主粉丝推荐"}
     medium_fields = {"粉丝年龄", "粉丝地域", "地域", "家庭身份", "职业身份", "特色背景", "母婴阶段", "平台推荐", "行业推荐博主"}
     broad_fields = {"营销目标", "博主类目"}
     strong = sum(1 for item in filters if item.get("field") in strong_fields)
@@ -3325,7 +5027,7 @@ def _evaluate_scheme_count(expected: dict[str, Any], actual: Any, lower_bound: b
     expected_min = int(expected["expected_min"])
     expected_max = int(expected["expected_max"])
     target_max = int(expected.get("target_max") or expected_max)
-    allowed_max = max(expected_max, target_max)
+    allowed_max = max(expected_max, target_max, PGY_DYNAMIC_RECOMMEND_TARGET_MAX)
     if actual_count <= 0:
         return {"status": "too_few", "should_collect": False, "message": f"实际推荐 {actual_count}，当前方案无可采集达人，切换下一套方案"}
     if actual_count < expected_min:
@@ -3340,7 +5042,7 @@ def api_pgy_collect_batch(payload: BatchCollectPayload) -> dict[str, Any]:
     project_id = payload.project_id or "youdao_001"
     lock = _collect_lock(project_id)
     if not lock.acquire(blocking=False):
-        running_batch = next((batch for batch in list_batches(project_id) if batch.get("status") == "running"), None)
+        running_batch = next(iter(list_batches(project_id, status="running", limit=1)), None)
         return {
             "ok": False,
             "message": "当前项目已有采集任务在运行，请等待完成后再启动新的采集",
@@ -3349,6 +5051,35 @@ def api_pgy_collect_batch(payload: BatchCollectPayload) -> dict[str, Any]:
         }
     cancel_event = _collect_cancel_event(project_id)
     cancel_event.clear()
+    if payload.async_collect:
+        batch_id = create_batch(project_id, payload.source_url)
+        batch = update_batch_progress(batch_id, stage="starting", message="采集任务已进入后台队列，正在启动")
+
+        def run_background_collect() -> None:
+            try:
+                _api_pgy_collect_batch_locked(payload, project_id, cancel_event, batch_id=batch_id)
+            except Exception as exc:  # pragma: no cover - defensive guard for long-running browser work
+                current_batch = get_batch(batch_id)
+                finish_batch(
+                    batch_id,
+                    "failed",
+                    int(current_batch.get("total_count") or 0),
+                    int(current_batch.get("success_count") or 0),
+                    max(1, int(current_batch.get("failed_count") or 0)),
+                    f"后台采集异常：{exc}",
+                    collection_plan=current_batch.get("collection_plan") if isinstance(current_batch.get("collection_plan"), dict) else {},
+                    applied_filters=current_batch.get("applied_filters") if isinstance(current_batch.get("applied_filters"), list) else [],
+                    skipped_filters=current_batch.get("skipped_filters") if isinstance(current_batch.get("skipped_filters"), list) else [],
+                    selected_metrics=current_batch.get("selected_metrics") if isinstance(current_batch.get("selected_metrics"), list) else [],
+                    skipped_metrics=current_batch.get("skipped_metrics") if isinstance(current_batch.get("skipped_metrics"), list) else [],
+                    detail_collection=str(current_batch.get("detail_collection") or ""),
+                )
+            finally:
+                lock.release()
+
+        thread = threading.Thread(target=run_background_collect, name=f"pgy-collect-{project_id}", daemon=True)
+        thread.start()
+        return {"ok": True, "accepted": True, "async": True, "batch": batch, "message": "采集已在后台启动，可在页面查看实时进度"}
     try:
         return _api_pgy_collect_batch_locked(payload, project_id, cancel_event)
     finally:
@@ -3360,7 +5091,7 @@ def api_pgy_collect_stop(payload: BatchCollectStopPayload) -> dict[str, Any]:
     project_id = payload.project_id or "youdao_001"
     event = _collect_cancel_event(project_id)
     event.set()
-    running_batch = next((batch for batch in list_batches(project_id) if batch.get("status") == "running"), None)
+    running_batch = next(iter(list_batches(project_id, status="running", limit=1)), None)
     if running_batch:
         batch = update_batch_progress(
             running_batch["batch_id"],
@@ -3371,13 +5102,22 @@ def api_pgy_collect_stop(payload: BatchCollectStopPayload) -> dict[str, Any]:
     return {"ok": True, "batch": {}, "message": "当前没有运行中的采集任务"}
 
 
-def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str, cancel_event: threading.Event) -> dict[str, Any]:
+def _api_pgy_collect_batch_locked(
+    payload: BatchCollectPayload,
+    project_id: str,
+    cancel_event: threading.Event,
+    *,
+    batch_id: str | None = None,
+) -> dict[str, Any]:
     project = get_project(project_id) or {}
     brief = project.get("brief") or ""
     screening_plan = payload.screening_plan or _normalize_project_screening_plan(project.get("screening_plan")) or {}
+    if isinstance(screening_plan, dict):
+        screening_plan = _hydrate_screening_plan_project_defaults(screening_plan, brief)
     pgy_plan = screening_plan.get("pgyCollectionPlan") if isinstance(screening_plan, dict) else {}
     if isinstance(pgy_plan, dict):
         pgy_plan = _normalize_scheme_filter_structure(pgy_plan)
+        pgy_plan = _refresh_auto_quality_narrowing_filters(pgy_plan, brief)
         screening_plan = {**screening_plan, "pgyCollectionPlan": pgy_plan}
     all_schemes = pgy_plan.get("schemes") if isinstance(pgy_plan, dict) else []
     saved_scheme_ids = pgy_plan.get("enabled_scheme_ids") if isinstance(pgy_plan, dict) else []
@@ -3390,7 +5130,7 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
         if isinstance(scheme, dict) and (not selected_ids or str(scheme.get("scheme_id") or scheme.get("id") or scheme.get("name")) in selected_ids)
     ]
     use_multi_scheme = bool(payload.multi_scheme and payload.apply_filters and schemes)
-    batch_id = create_batch(project_id, payload.source_url)
+    batch_id = batch_id or create_batch(project_id, payload.source_url)
     update_batch_progress(batch_id, stage="preflight", message="正在应用采集条件并预检推荐数量")
 
     def stop_if_requested(
@@ -3434,6 +5174,13 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
     collection_plan: dict[str, Any] | None = None
     detail_collection = ""
     last_error = ""
+    collected_creators: list[dict[str, Any]] = []
+    creators: list[dict[str, Any]] = []
+    creator_ids: list[str] = []
+    rejected_by_hard_filters: list[dict[str, Any]] = []
+    hard_filter_skips: list[dict[str, Any]] = []
+    ingested_by_scheme: dict[str, int] = {}
+    ingested_creator_keys: set[str] = set()
 
     def run_once(
         plan: dict[str, Any],
@@ -3442,7 +5189,61 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
         preflight_only: bool = False,
         apply_filters: bool | None = None,
         limit_override: int | None = None,
+        kol_request_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        scheme_id = str((scheme or {}).get("scheme_id") or (scheme or {}).get("id") or (scheme or {}).get("name") or "default")
+        scheme_name = str((scheme or {}).get("name") or scheme_id)
+
+        def progress_callback(event: dict[str, Any]) -> None:
+            if preflight_only or not isinstance(event, dict):
+                return
+            mode = str(event.get("mode") or "")
+            collected = int(event.get("collected_count") or 0)
+            target = int(event.get("limit") or limit_override or payload.limit or 0)
+            page_number = event.get("page_number")
+            api_labels = {
+                "api_snapshot": "预检快照 API",
+                "api_browser_capture": "浏览器补抓 API",
+                "api_template": "接口模板 API",
+            }
+            base_mode = mode
+            suffix = ""
+            for prefix in api_labels:
+                if mode == prefix or mode.startswith(f"{prefix}_"):
+                    base_mode = prefix
+                    suffix = mode[len(prefix):]
+                    break
+            if base_mode in api_labels and suffix == "_start":
+                message = f"方案 {scheme_name} 正在尝试{api_labels[base_mode]}"
+            elif base_mode in api_labels and suffix == "_failed":
+                message = f"方案 {scheme_name} {api_labels[base_mode]}未命中，继续下一采集方案"
+            elif base_mode in api_labels and suffix == "_done":
+                message = f"方案 {scheme_name} {api_labels[base_mode]}采集完成：已读取 {collected}/{target} 个"
+            elif base_mode in api_labels:
+                page_text = f"第 {page_number} 页，" if page_number else ""
+                message = f"方案 {scheme_name} 正在通过{api_labels[base_mode]}采集：{page_text}已读取 {collected}/{target} 个"
+            elif mode == "api":
+                page_text = f"第 {page_number} 页，" if page_number else ""
+                message = f"方案 {scheme_name} 正在接口采集：{page_text}已读取 {collected}/{target} 个"
+            elif mode == "api_done":
+                message = f"方案 {scheme_name} 接口采集完成：已读取 {collected}/{target} 个"
+            elif mode == "dom_fallback":
+                message = f"方案 {scheme_name} API 未命中，切换页面翻页采集"
+            elif mode in {"dom", "dom_no_change"}:
+                page_text = f"第 {page_number} 页，" if page_number else ""
+                message = f"方案 {scheme_name} 正在页面翻页采集：{page_text}已读取 {collected}/{target} 个"
+            elif mode == "dom_done":
+                message = f"方案 {scheme_name} 页面翻页采集完成：已读取 {collected}/{target} 个"
+            else:
+                return
+            update_batch_progress(
+                batch_id,
+                stage="collecting",
+                message=message,
+                total_count=len(raw_creators_by_key) + collected,
+                success_count=len(creator_ids),
+            )
+
         result = collect_visible_list(
             brief=brief,
             screening_plan=plan,
@@ -3453,12 +5254,123 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
             limit=limit_override or payload.limit,
             reset_filters=reset_filters,
             preflight_only=preflight_only,
+            kol_request_snapshot=kol_request_snapshot,
+            progress_callback=progress_callback,
         )
-        scheme_id = str((scheme or {}).get("scheme_id") or (scheme or {}).get("id") or (scheme or {}).get("name") or "default")
-        scheme_name = str((scheme or {}).get("name") or scheme_id)
         result["scheme_id"] = scheme_id
         result["scheme_name"] = scheme_name
         return result
+
+    def sync_scheme_ingested_counts() -> None:
+        if not ingested_by_scheme:
+            return
+        for item in scheme_results:
+            scheme_id = str(item.get("scheme_id") or "")
+            item["ingested_count"] = ingested_by_scheme.get(scheme_id, 0)
+
+    def ingest_scheme_creators(scheme_result: dict[str, Any], scheme_creators_arg: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal collected_creators, creators, creator_ids, rejected_by_hard_filters, hard_filter_skips
+        scheme_id = str(scheme_result.get("scheme_id") or "")
+        scheme_name = str(scheme_result.get("scheme_name") or scheme_id)
+        tagged_creators = [
+            {**creator, "collection_scheme_id": scheme_id, "collection_scheme_name": scheme_name}
+            for creator in (scheme_creators_arg or [])
+            if isinstance(creator, dict)
+        ]
+        merged_creators = _merge_export_creators(tagged_creators, scheme_result.get("export_result"))
+        unique_creators = []
+        for creator in merged_creators:
+            creator = {**creator, "collection_scheme_id": scheme_id, "collection_scheme_name": scheme_name}
+            key = _creator_dedupe_key(creator)
+            raw_creators_by_key.setdefault(key, creator)
+            if key in ingested_creator_keys:
+                continue
+            ingested_creator_keys.add(key)
+            unique_creators.append(creator)
+        if not unique_creators:
+            return {"collected_count": len(merged_creators), "ingested_count": 0, "creator_ids": []}
+        unique_creators, identity_skipped = _split_identity_ready_creators(unique_creators)
+        if identity_skipped:
+            hard_filter_skips.extend(_identity_skip_records(identity_skipped))
+            update_batch_progress(
+                batch_id,
+                stage="collecting",
+                message=f"方案 {scheme_name} 跳过 {len(identity_skipped)} 个缺达人主页/小红书号的候选达人",
+                total_count=len(raw_creators_by_key),
+                success_count=len(creator_ids),
+            )
+        if not unique_creators:
+            return {"collected_count": len(merged_creators), "ingested_count": 0, "creator_ids": [], "identity_skipped_count": len(identity_skipped)}
+
+        hard_filters = screening_plan.get("collectionHardFilters") or (screening_plan.get("pgyCollectionPlan") or {}).get("hard_filters") or screening_plan.get("hardFilters") or []
+        _, scheme_rejected = _filter_creators_by_hard_filters(project_id, unique_creators, hard_filters)
+        issue_by_key = {
+            _creator_dedupe_key(item): item.get("issues") or []
+            for item in scheme_rejected
+        }
+        rejected_by_hard_filters.extend(scheme_rejected)
+        hard_filter_skips.extend(
+            {
+                "field": "筛选工作台标记",
+                "value": item.get("nickname") or item.get("creator_id") or "",
+                "message": "；".join(item.get("issues") or []),
+                "creator_id": item.get("creator_id"),
+            }
+            for item in scheme_rejected
+        )
+
+        prepared_creators = []
+        total_after_scheme = len(creator_ids) + len(unique_creators)
+        stopped_result = stop_if_requested(
+            total=total_after_scheme,
+            success=len(creator_ids),
+            collection_plan={"multi_scheme": True, "schemes": scheme_results, "base_plan": pgy_plan},
+            applied_filters_arg=applied_filters,
+            skipped_filters_arg=[*skipped_filters_base, *hard_filter_skips],
+            selected_metrics_arg=selected_metrics,
+            skipped_metrics_arg=skipped_metrics,
+            detail_collection_arg=detail_collection,
+        )
+        if stopped_result:
+            return {"stopped_result": stopped_result}
+        for creator in unique_creators:
+            issues = issue_by_key.get(_creator_dedupe_key(creator), [])
+            raw_payload = creator.get("raw_payload") if isinstance(creator.get("raw_payload"), dict) else {}
+            prepared_creators.append(
+                {
+                    **creator,
+                    "collection_hard_filter_passed": not bool(issues),
+                    "collection_hard_filter_issues": issues,
+                    "raw_payload": {
+                        **raw_payload,
+                        "collection_hard_filter_passed": not bool(issues),
+                        "collection_hard_filter_issues": issues,
+                    },
+                }
+            )
+        update_batch_progress(
+            batch_id,
+            stage="ingesting",
+            message=f"方案 {scheme_name} 正在批量写入筛选工作台 {len(prepared_creators)} 个达人；累计 {len(creator_ids)} 个",
+            total_count=total_after_scheme,
+            success_count=len(creator_ids),
+        )
+        saved_items = bulk_upsert_creators(project_id, prepared_creators, score=False)
+        saved_ids = [str(item["creator_id"]) for item in saved_items if item.get("creator_id")]
+        creator_ids.extend(saved_ids)
+        collected_creators.extend(prepared_creators)
+        creators.extend(prepared_creators)
+        if scheme_id:
+            ingested_by_scheme[scheme_id] = ingested_by_scheme.get(scheme_id, 0) + len(saved_ids)
+        update_batch_progress(
+            batch_id,
+            stage="ingesting",
+            message=f"方案 {scheme_name} 已写入筛选工作台 {len(saved_ids)}/{len(prepared_creators)} 个达人；累计 {len(creator_ids)} 个",
+            total_count=total_after_scheme,
+            success_count=len(creator_ids),
+        )
+        sync_scheme_ingested_counts()
+        return {"collected_count": len(merged_creators), "ingested_count": len(saved_ids), "creator_ids": saved_ids}
 
     if use_multi_scheme:
         for index, scheme in enumerate(schemes):
@@ -3527,21 +5439,26 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
                     "actual_recommend_count": preflight_result.get("actual_recommend_count"),
                     "actual_count_text": preflight_result.get("actual_count_text"),
                     "actual_count_is_lower_bound": bool(preflight_result.get("actual_count_is_lower_bound")),
+                    "api_request_captured": bool(preflight_result.get("kol_request_snapshot")),
                     "evaluation": evaluation,
                     "filters": plan_filters,
                 }
             ]
             if payload.preflight and evaluation.get("status") == "too_many" and not payload.collect_out_of_range:
-                active_filter_keys = {_filter_key(item) for item in active_additional_filters if isinstance(item, dict)}
-                for additional_filter in _extra_filters_for_scheme(scheme):
-                    if _filter_key(additional_filter) in active_filter_keys:
+                initial_active_filter_keys = {_active_filter_replace_key(item) for item in active_additional_filters if isinstance(item, dict)}
+                active_filter_keys = {_active_filter_replace_key(item) for item in active_additional_filters if isinstance(item, dict)}
+                adaptive_filters = _extra_filters_for_scheme(scheme)
+                newly_added_adaptive_filters: list[dict[str, Any]] = []
+                for additional_filter in adaptive_filters:
+                    if _active_filter_replace_key(additional_filter) in active_filter_keys:
                         continue
-                    active_additional_filters = [*active_additional_filters, additional_filter]
-                    active_filter_keys.add(_filter_key(additional_filter))
-                    plan_for_scheme = _scheme_plan(screening_plan, scheme, active_additional_filters)
+                    variants = _adaptive_filter_variants(additional_filter)
+                    trial_filter = variants[0]
+                    trial_active_filters = _replace_active_additional_filter(active_additional_filters, trial_filter)
+                    plan_for_scheme = _scheme_plan(screening_plan, scheme, trial_active_filters)
                     plan_filters = (plan_for_scheme.get("pgyCollectionPlan") or {}).get("filters") or []
                     expected_count = _scheme_expected_count(
-                        {**scheme, "filters": plan_filters, "enabled_additional_filters": active_additional_filters},
+                        {**scheme, "filters": plan_filters, "enabled_additional_filters": trial_active_filters},
                         pgy_plan.get("target_count_range") if isinstance(pgy_plan, dict) else None,
                         history,
                     )
@@ -3551,21 +5468,99 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
                         preflight_result.get("actual_recommend_count"),
                         bool(preflight_result.get("actual_count_is_lower_bound")),
                     )
+                    active_additional_filters = trial_active_filters
+                    newly_added_adaptive_filters.append(trial_filter)
                     preflight_steps.append(
                         {
                             "stage": "additional",
                             "label": "附加筛选条件",
-                            "added_filter": additional_filter,
+                            "added_filter": trial_filter,
                             "active_additional_filters": active_additional_filters,
                             "actual_recommend_count": preflight_result.get("actual_recommend_count"),
                             "actual_count_text": preflight_result.get("actual_count_text"),
                             "actual_count_is_lower_bound": bool(preflight_result.get("actual_count_is_lower_bound")),
+                            "api_request_captured": bool(preflight_result.get("kol_request_snapshot")),
                             "evaluation": evaluation,
                             "filters": plan_filters,
+                            "adaptive": len(variants) > 1,
+                            "adaptive_candidate_index": 0,
                         }
                     )
+                    active_filter_keys.add(_active_filter_replace_key(additional_filter))
                     if evaluation.get("status") != "too_many":
                         break
+                if evaluation.get("status") == "too_many":
+                    for additional_filter in reversed(newly_added_adaptive_filters):
+                        if _active_filter_replace_key(additional_filter) in initial_active_filter_keys:
+                            continue
+                        variants = _adaptive_filter_variants(additional_filter)
+                        if len(variants) <= 1:
+                            continue
+                        previous_viable_state: dict[str, Any] | None = None
+                        for variant_index, trial_filter in enumerate(variants[1:], start=1):
+                            trial_active_filters = _replace_active_additional_filter(active_additional_filters, trial_filter)
+                            trial_plan_for_scheme = _scheme_plan(screening_plan, scheme, trial_active_filters)
+                            trial_plan_filters = (trial_plan_for_scheme.get("pgyCollectionPlan") or {}).get("filters") or []
+                            trial_expected_count = _scheme_expected_count(
+                                {**scheme, "filters": trial_plan_filters, "enabled_additional_filters": trial_active_filters},
+                                pgy_plan.get("target_count_range") if isinstance(pgy_plan, dict) else None,
+                                history,
+                            )
+                            trial_preflight_result = run_once(trial_plan_for_scheme, scheme, reset_filters=False, preflight_only=True)
+                            trial_evaluation = _evaluate_scheme_count(
+                                trial_expected_count,
+                                trial_preflight_result.get("actual_recommend_count"),
+                                bool(trial_preflight_result.get("actual_count_is_lower_bound")),
+                            )
+                            actual_count = _parse_positive_int(trial_preflight_result.get("actual_recommend_count"))
+                            too_narrow = bool(
+                                actual_count is not None
+                                and actual_count < PGY_DYNAMIC_RECOMMEND_TARGET_MIN
+                                and previous_viable_state is not None
+                            )
+                            preflight_steps.append(
+                                {
+                                    "stage": "additional_adjustment",
+                                    "label": "附加筛选参数调整",
+                                    "added_filter": trial_filter,
+                                    "active_additional_filters": trial_active_filters,
+                                    "actual_recommend_count": trial_preflight_result.get("actual_recommend_count"),
+                                    "actual_count_text": trial_preflight_result.get("actual_count_text"),
+                                    "actual_count_is_lower_bound": bool(trial_preflight_result.get("actual_count_is_lower_bound")),
+                                    "api_request_captured": bool(trial_preflight_result.get("kol_request_snapshot")),
+                                    "evaluation": trial_evaluation,
+                                    "filters": trial_plan_filters,
+                                    "adaptive": True,
+                                    "adaptive_candidate_index": variant_index,
+                                    "adaptive_too_narrow": too_narrow,
+                                }
+                            )
+                            if too_narrow:
+                                active_additional_filters = previous_viable_state["active_additional_filters"]
+                                plan_for_scheme = previous_viable_state["plan_for_scheme"]
+                                plan_filters = previous_viable_state["plan_filters"]
+                                expected_count = previous_viable_state["expected_count"]
+                                preflight_result = previous_viable_state["preflight_result"]
+                                evaluation = previous_viable_state["evaluation"]
+                                break
+                            active_additional_filters = trial_active_filters
+                            plan_for_scheme = trial_plan_for_scheme
+                            plan_filters = trial_plan_filters
+                            expected_count = trial_expected_count
+                            preflight_result = trial_preflight_result
+                            evaluation = trial_evaluation
+                            previous_viable_state = {
+                                "active_additional_filters": active_additional_filters,
+                                "plan_for_scheme": plan_for_scheme,
+                                "plan_filters": plan_filters,
+                                "expected_count": expected_count,
+                                "preflight_result": preflight_result,
+                                "evaluation": evaluation,
+                            }
+                            if evaluation.get("status") != "too_many":
+                                break
+                        if evaluation.get("status") != "too_many":
+                            break
             should_collect = bool(evaluation.get("should_collect") or payload.collect_out_of_range)
             if should_collect:
                 update_batch_progress(
@@ -3603,6 +5598,7 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
                     preflight_only=False,
                     apply_filters=not payload.preflight,
                     limit_override=collect_limit_for_scheme,
+                    kol_request_snapshot=preflight_result.get("kol_request_snapshot") if payload.preflight else None,
                 )
                 if should_collect
                 else {
@@ -3650,13 +5646,28 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
                 "actual_count_text": preflight_result.get("actual_count_text"),
                 "actual_count_error": preflight_result.get("actual_count_error"),
                 "actual_count_is_lower_bound": bool(preflight_result.get("actual_count_is_lower_bound")),
+                "api_request_captured": bool(preflight_result.get("kol_request_snapshot")),
                 "evaluation": evaluation,
                 "collected_after_preflight": should_collect,
                 "forced_collect": bool(payload.collect_out_of_range and not evaluation.get("should_collect")),
             }
             scheme_creators = scheme_result.get("creators") or []
-            shortfall = _scheme_collection_shortfall(preflight_result, len(scheme_creators), collect_limit_for_scheme) if should_collect else {"ok": True}
-            if not shortfall.get("ok"):
+            shortfall = (
+                _scheme_collection_shortfall(
+                    preflight_result,
+                    len(scheme_creators),
+                    collect_limit_for_scheme,
+                    has_next_scheme=index < len(schemes) - 1,
+                )
+                if should_collect
+                else {"ok": True}
+            )
+            if shortfall.get("warning"):
+                scheme_result["collection_shortfall"] = shortfall
+                scheme_result["message"] = scheme_result.get("message") or shortfall.get("message")
+                scheme_result["preflight"]["expected_collect_count"] = shortfall.get("expected_count")
+                scheme_result["preflight"]["actual_collected_count"] = shortfall.get("collected_count")
+            elif not shortfall.get("ok"):
                 scheme_result["ok"] = False
                 scheme_result["message"] = shortfall.get("message") or scheme_result.get("message")
                 scheme_result["collection_shortfall"] = shortfall
@@ -3691,9 +5702,6 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
                 rejected_count=0,
             )
             memory_ids_by_scheme[scheme_result["scheme_id"]] = memory["memory_id"]
-            for creator in scheme_creators:
-                creator = {**creator, "collection_scheme_id": scheme_result["scheme_id"], "collection_scheme_name": scheme_result["scheme_name"]}
-                raw_creators_by_key.setdefault(_creator_dedupe_key(creator), creator)
             applied_filters.extend(scheme_result.get("applied_filters") or [])
             skipped_filters_base.extend(scheme_result.get("skipped_filters") or [])
             selected_metrics.extend(scheme_result.get("selected_metrics") or [])
@@ -3729,6 +5737,25 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
                     "export_result": scheme_result.get("export_result"),
                 }
             )
+            if scheme_creators:
+                ingest_result = ingest_scheme_creators(scheme_result, scheme_creators)
+                if ingest_result.get("stopped_result"):
+                    return ingest_result["stopped_result"]
+                scheme_results[-1]["ingested_count"] = int(ingest_result.get("ingested_count") or 0)
+                if memory_ids_by_scheme.get(scheme_result["scheme_id"]):
+                    update_scheme_count_memory(
+                        memory_ids_by_scheme[scheme_result["scheme_id"]],
+                        accepted_count=int(ingest_result.get("ingested_count") or 0),
+                        rejected_count=0,
+                        collected_count=int(ingest_result.get("collected_count") or len(scheme_creators)),
+                    )
+                update_batch_progress(
+                    batch_id,
+                    stage="ingested",
+                    message=f"方案 {index + 1}/{len(schemes)} 已入库 {scheme_results[-1]['ingested_count']} 个达人；累计 {len(creator_ids)} 个",
+                    total_count=len(raw_creators_by_key),
+                    success_count=len(creator_ids),
+                )
             if len(raw_creators_by_key) >= payload.limit:
                 break
             if should_collect and not shortfall.get("ok"):
@@ -3766,16 +5793,129 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
 
     stopped_result = stop_if_requested(
         total=len(result.get("creators") or []),
-        success=0,
+        success=len(creator_ids) if use_multi_scheme else 0,
         collection_plan=result.get("collection_plan"),
         applied_filters_arg=result.get("applied_filters") or [],
-        skipped_filters_arg=result.get("skipped_filters") or [],
+        skipped_filters_arg=[*(result.get("skipped_filters") or []), *hard_filter_skips],
         selected_metrics_arg=result.get("selected_metrics") or [],
         skipped_metrics_arg=result.get("skipped_metrics") or [],
         detail_collection_arg=result.get("detail_collection") or "",
     )
     if stopped_result:
         return stopped_result
+
+    if use_multi_scheme:
+        sync_scheme_ingested_counts()
+        collection_plan = result.get("collection_plan")
+        if isinstance(collection_plan, dict):
+            collection_plan["schemes"] = scheme_results
+        skipped_filters = [*(result.get("skipped_filters") or []), *hard_filter_skips]
+        if not result.get("ok"):
+            batch = finish_batch(
+                batch_id,
+                "failed",
+                len(collected_creators),
+                len(creator_ids),
+                1,
+                result.get("message", "采集失败"),
+                collection_plan=collection_plan,
+                applied_filters=result.get("applied_filters") or [],
+                skipped_filters=skipped_filters,
+                selected_metrics=result.get("selected_metrics") or [],
+                skipped_metrics=result.get("skipped_metrics") or [],
+                detail_collection=result.get("detail_collection") or "",
+            )
+            return {
+                "ok": False,
+                "batch": batch,
+                "message": result.get("message"),
+                "creators": creators,
+                "rejected_by_hard_filters": rejected_by_hard_filters,
+                "collection_plan": collection_plan,
+                "export_result": result.get("export_result"),
+                "scheme_results": scheme_results,
+                "applied_filters": result.get("applied_filters") or [],
+                "skipped_filters": skipped_filters,
+                "selected_metrics": result.get("selected_metrics") or [],
+                "skipped_metrics": result.get("skipped_metrics") or [],
+            }
+        if not creator_ids:
+            batch = finish_batch(
+                batch_id,
+                "failed",
+                len(collected_creators),
+                0,
+                1,
+                "未采集到有效达人",
+                collection_plan=collection_plan,
+                applied_filters=result.get("applied_filters") or [],
+                skipped_filters=skipped_filters,
+                selected_metrics=result.get("selected_metrics") or [],
+                skipped_metrics=result.get("skipped_metrics") or [],
+                detail_collection=result.get("detail_collection") or "",
+            )
+            return {
+                "ok": False,
+                "batch": batch,
+                "message": batch.get("error_message") or "未采集到有效达人",
+                "rejected_by_hard_filters": rejected_by_hard_filters,
+                "collection_plan": collection_plan,
+                "export_result": result.get("export_result"),
+                "scheme_results": scheme_results,
+                "applied_filters": result.get("applied_filters") or [],
+                "skipped_filters": skipped_filters,
+                "selected_metrics": result.get("selected_metrics") or [],
+                "skipped_metrics": result.get("skipped_metrics") or [],
+            }
+        update_batch_progress(
+            batch_id,
+            stage="score_queued",
+            message=f"已进入筛选工作台 {len(creator_ids)} 个达人，评分将后台执行",
+            total_count=len(collected_creators),
+            success_count=len(creator_ids),
+        )
+        stopped_result = stop_if_requested(
+            total=len(collected_creators),
+            success=len(creator_ids),
+            collection_plan=collection_plan,
+            applied_filters_arg=result.get("applied_filters") or [],
+            skipped_filters_arg=skipped_filters,
+            selected_metrics_arg=result.get("selected_metrics") or [],
+            skipped_metrics_arg=result.get("skipped_metrics") or [],
+            detail_collection_arg=result.get("detail_collection") or "",
+        )
+        if stopped_result:
+            return stopped_result
+        batch = finish_batch(
+            batch_id,
+            "success",
+            len(collected_creators),
+            len(creator_ids),
+            0,
+            collection_plan=collection_plan,
+            applied_filters=result.get("applied_filters") or [],
+            skipped_filters=skipped_filters,
+            selected_metrics=result.get("selected_metrics") or [],
+            skipped_metrics=result.get("skipped_metrics") or [],
+            detail_collection=result.get("detail_collection") or "",
+        )
+        scoring = _queue_collect_scoring(project_id, creator_ids, batch_id)
+        batch = get_batch(batch_id) or batch
+        return {
+            "ok": True,
+            "batch": batch,
+            "creators": creators,
+            "scoring": scoring,
+            "message": f"蒲公英采集完成，采到 {len(collected_creators)} 个，已按方案分批进入筛选工作台，规则评分后台执行；{len(rejected_by_hard_filters)} 个将在筛选工作台标记为条件不符并按档位区分",
+            "collection_plan": collection_plan,
+            "export_result": result.get("export_result"),
+            "scheme_results": scheme_results,
+            "rejected_by_hard_filters": rejected_by_hard_filters,
+            "applied_filters": result.get("applied_filters") or [],
+            "skipped_filters": skipped_filters,
+            "selected_metrics": result.get("selected_metrics") or [],
+            "skipped_metrics": result.get("skipped_metrics") or [],
+        }
 
     if not result.get("ok"):
         batch = finish_batch(
@@ -3823,7 +5963,13 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
     )
     if stopped_result:
         return stopped_result
-    hard_filters = screening_plan.get("collectionHardFilters") or (screening_plan.get("pgyCollectionPlan") or {}).get("hard_filters") or screening_plan.get("hardFilters") or []
+    pgy_collection_plan = screening_plan.get("pgyCollectionPlan") if isinstance(screening_plan.get("pgyCollectionPlan"), dict) else {}
+    if "collectionHardFilters" in screening_plan:
+        hard_filters = screening_plan.get("collectionHardFilters") or []
+    elif "hard_filters" in pgy_collection_plan or "hardFilters" in pgy_collection_plan:
+        hard_filters = pgy_collection_plan.get("hard_filters") or pgy_collection_plan.get("hardFilters") or []
+    else:
+        hard_filters = screening_plan.get("hardFilters") or []
     _, rejected_by_hard_filters = _filter_creators_by_hard_filters(project_id, collected_creators, hard_filters)
     hard_filter_issue_by_key = {
         _creator_dedupe_key(item): item.get("issues") or []
@@ -3886,6 +6032,16 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
         }
         for item in rejected_by_hard_filters
     ]
+    creators, identity_skipped = _split_identity_ready_creators(creators)
+    if identity_skipped:
+        hard_filter_skips.extend(_identity_skip_records(identity_skipped))
+        update_batch_progress(
+            batch_id,
+            stage="collected",
+            message=f"已跳过 {len(identity_skipped)} 个缺达人主页/小红书号的候选达人，剩余 {len(creators)} 个待入库",
+            total_count=len(collected_creators),
+            success_count=0,
+        )
     skipped_filters = [*(result.get("skipped_filters") or []), *hard_filter_skips]
     if not creators:
         batch = finish_batch(
@@ -3918,32 +6074,38 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
     creator_ids = []
     total_creators = len(creators)
     ingested_by_scheme: dict[str, int] = {}
-    for index, creator in enumerate(creators, start=1):
-        stopped_result = stop_if_requested(
-            total=len(collected_creators),
-            success=len(creator_ids),
-            collection_plan=result.get("collection_plan"),
-            applied_filters_arg=result.get("applied_filters") or [],
-            skipped_filters_arg=skipped_filters,
-            selected_metrics_arg=result.get("selected_metrics") or [],
-            skipped_metrics_arg=result.get("skipped_metrics") or [],
-            detail_collection_arg=result.get("detail_collection") or "",
-        )
-        if stopped_result:
-            return stopped_result
-        saved = upsert_creator(project_id, creator, score=False)
-        creator_ids.append(saved["creator_id"])
+    stopped_result = stop_if_requested(
+        total=len(collected_creators),
+        success=0,
+        collection_plan=result.get("collection_plan"),
+        applied_filters_arg=result.get("applied_filters") or [],
+        skipped_filters_arg=skipped_filters,
+        selected_metrics_arg=result.get("selected_metrics") or [],
+        skipped_metrics_arg=result.get("skipped_metrics") or [],
+        detail_collection_arg=result.get("detail_collection") or "",
+    )
+    if stopped_result:
+        return stopped_result
+    update_batch_progress(
+        batch_id,
+        stage="ingesting",
+        message=f"正在批量写入筛选工作台 {total_creators} 个达人",
+        total_count=len(collected_creators),
+        success_count=0,
+    )
+    saved_items = bulk_upsert_creators(project_id, creators, score=False)
+    creator_ids = [str(item["creator_id"]) for item in saved_items if item.get("creator_id")]
+    for creator in creators:
         scheme_id = str(creator.get("collection_scheme_id") or "")
         if scheme_id:
             ingested_by_scheme[scheme_id] = ingested_by_scheme.get(scheme_id, 0) + 1
-        if index == 1 or index == total_creators or index % 20 == 0:
-            update_batch_progress(
-                batch_id,
-                stage="ingesting",
-                message=f"正在写入筛选工作台 {index}/{total_creators} 个达人",
-                total_count=len(collected_creators),
-                success_count=index,
-            )
+    update_batch_progress(
+        batch_id,
+        stage="ingesting",
+        message=f"已批量写入筛选工作台 {len(creator_ids)}/{total_creators} 个达人",
+        total_count=len(collected_creators),
+        success_count=len(creator_ids),
+    )
     if ingested_by_scheme:
         for item in scheme_results:
             scheme_id = str(item.get("scheme_id") or "")
@@ -3956,8 +6118,8 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
                     item["ingested_count"] = ingested_by_scheme.get(scheme_id, 0)
     update_batch_progress(
         batch_id,
-        stage="scoring",
-        message=f"已进入筛选工作台 {len(creator_ids)} 个达人，正在评分匹配",
+        stage="score_queued",
+        message=f"已进入筛选工作台 {len(creator_ids)} 个达人，评分将后台执行",
         total_count=len(collected_creators),
         success_count=len(creator_ids),
     )
@@ -3973,8 +6135,6 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
     )
     if stopped_result:
         return stopped_result
-    scoring_use_llm = len(creator_ids) <= 200
-    scoring = score_project(project_id, use_llm=scoring_use_llm, creator_ids=creator_ids, trigger_source="pgy_collect")
     batch = finish_batch(
         batch_id,
         "success",
@@ -3988,13 +6148,15 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
         skipped_metrics=result.get("skipped_metrics") or [],
         detail_collection=result.get("detail_collection") or "",
     )
+    scoring = _queue_collect_scoring(project_id, creator_ids, batch_id)
+    batch = get_batch(batch_id) or batch
     rejected_count = len(rejected_by_hard_filters)
     return {
         "ok": True,
         "batch": batch,
         "creators": creators,
         "scoring": scoring,
-        "message": f"蒲公英采集完成，采到 {len(collected_creators)} 个，已进入筛选工作台评分匹配；{rejected_count} 个将在筛选工作台标记为条件不符并按档位区分",
+        "message": f"蒲公英采集完成，采到 {len(collected_creators)} 个，已进入筛选工作台，规则评分后台执行；{rejected_count} 个将在筛选工作台标记为条件不符并按档位区分",
         "collection_plan": result.get("collection_plan"),
         "export_result": result.get("export_result"),
         "scheme_results": scheme_results,
@@ -4009,10 +6171,15 @@ def _api_pgy_collect_batch_locked(payload: BatchCollectPayload, project_id: str,
 
 
 @app.get("/api/pgy/collect/batches/{batch_id}")
-def api_pgy_batch(batch_id: str) -> dict[str, Any]:
-    for batch in list_batches("youdao_001"):
-        if batch["batch_id"] == batch_id:
-            return {"batch": batch}
+def api_pgy_batch(batch_id: str, project_id: str = Query(default="")) -> dict[str, Any]:
+    project_ids = [project_id] if project_id else [
+        project["project_id"]
+        for project in list_projects(include_test_projects=True, include_archived=True)
+    ]
+    for target_project_id in project_ids:
+        for batch in list_batches(target_project_id):
+            if batch["batch_id"] == batch_id:
+                return {"batch": batch}
     raise HTTPException(status_code=404, detail={"message": "采集批次不存在"})
 
 

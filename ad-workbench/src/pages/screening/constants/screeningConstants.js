@@ -23,8 +23,8 @@ export const HARD_FILTER_OPTIONS = [
   { field: '合作报价', condition: '<=', value: '图文笔记：0.1万～2万', required: true, feishuField: '平台报价', label: '蒲公英：合作报价', valueControl: 'range', presets: PGY_PRICE_RANGE_OPTIONS, subField: '图文笔记', pgyField: '合作报价' },
   { field: '粉丝量', condition: '>=', value: '1万以上', required: false, feishuField: '粉丝数', label: '蒲公英：粉丝量下限', valueControl: 'range', options: PGY_FOLLOWER_RANGE_OPTIONS, pgyField: '粉丝量' },
   { field: '家庭身份', condition: '包含', value: '妈妈', required: false, feishuField: '家庭身份', label: '蒲公英：家庭身份', valueControl: 'multi', options: PGY_FAMILY_IDENTITY_OPTIONS, pgyField: '家庭身份' },
-  { field: '职业身份', condition: '包含', value: '教育科研', required: false, feishuField: '职业身份', label: '蒲公英：职业身份', valueControl: 'multi', options: PGY_CAREER_IDENTITY_OPTIONS, pgyField: '职业身份' },
-  { field: '特色背景', condition: '包含', value: '备考经验', required: false, feishuField: '特色背景', label: '蒲公英：特色背景', valueControl: 'multi', options: PGY_SPECIAL_BACKGROUND_OPTIONS, pgyField: '特色背景' },
+  { field: '职业身份', condition: '包含', value: '学生', required: false, feishuField: '职业身份', label: '蒲公英：职业身份', valueControl: 'multi', options: PGY_CAREER_IDENTITY_OPTIONS, pgyField: '职业身份' },
+  { field: '特色背景', condition: '包含', value: '留学背景', required: false, feishuField: '特色背景', label: '蒲公英：特色背景', valueControl: 'multi', options: PGY_SPECIAL_BACKGROUND_OPTIONS, pgyField: '特色背景' },
   { field: '母婴阶段', condition: '包含', value: '7-12岁', required: false, feishuField: '孩子年级', label: '蒲公英：母婴阶段', valueControl: 'multi', options: PGY_MATERNAL_STAGE_OPTIONS, pgyField: '母婴阶段' },
   { field: '粉丝地域', condition: '匹配', value: '北京、上海', required: false, feishuField: '粉丝地域', label: '蒲公英：粉丝地域', valueControl: 'multi', options: PGY_REGION_OPTIONS, pgyField: '粉丝地域' },
   { field: '预估阅读单价', condition: '<=', value: '图文笔记阅读单价≤2', required: false, feishuField: '合作笔记自然CPC', label: '蒲公英：预估阅读单价', valueControl: 'number', presets: PGY_UNIT_PRICE_OPTIONS, unit: '元', subField: '图文笔记阅读单价', pgyField: '预估阅读单价' },
@@ -66,7 +66,6 @@ export const PGY_ADDITIONAL_FILTER_FIELDS = new Set(['预估阅读单价', '预�
 export const DEFAULT_COLLECTION_HARD_FILTER_FIELDS = new Set(['博主类目', '粉丝量', '粉丝年龄', '合作报价']);
 export const DEFAULT_SCORING_HARD_FILTER_FIELDS = new Set([
   '合作报价',
-  '粉丝年龄',
   '预估阅读单价',
   '预估互动单价',
   '详情页证据',

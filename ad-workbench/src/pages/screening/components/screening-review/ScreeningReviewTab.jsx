@@ -20,14 +20,21 @@ import { getProjectCreators, getCreatorStatus, getDefaultCreatorStatus } from '.
 import { getReviewVariant, getScoreColor, getScoreTier } from '../../utils/creatorScoring';
 import { mergeOptionItems } from '../../utils/pgyFilters';
 import { hardFilterOptionsFor, normalizeWorkbenchPlan, syncScreeningCriteria } from '../../utils/screeningPlan';
-import { getCreatorAvatarUrl, getCreatorDisplayId, getCreatorRealNoteCases, getPgyUrl } from '../../utils/creatorMappers';
-import { getCreatorAdRecommendation, getCreatorLightProfile } from '../../utils/creatorScoring';
+import { getCreatorAvatarUrl, getCreatorDetailStatus, getCreatorDisplayId, getCreatorRealNoteCases, getPgyUrl, normalizeScoreTierKey } from '../../utils/creatorMappers';
+import { getCreatorAdRecommendation, getCreatorDisplayTier, getCreatorLightProfile } from '../../utils/creatorScoring';
 import { SelectedChips } from '../filters/SelectedChips';
 import { HardFilterCheckPanel } from '../filters/HardFilterCheckPanel';
 import { CreatorDetailModal } from './CreatorDetailModal';
 import { PgyInviteModal } from '../pgy-invite/PgyInviteModal';
+import { api } from '../../api/screeningApi';
+
+function getInitialTier(creator) {
+  if (creator.scorePending) return { key: '未评分', label: '未评分', variant: 'default', text: '待完成评分', color: '#64748B' };
+  return getCreatorDisplayTier(creator);
+}
 
 export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatus, onReview, onRefresh, onScore, onImport, onCollect, onCollectDetails, onPgyInvite, onSavePlan, onTabChange }) {
+  const pageSize = 50;
   const creators = useMemo(() => getProjectCreators(project).map(c => ({
     ...getDefaultCreatorStatus(), ...c, ...(getCreatorStatus(project.id, c.id, screeningStatus) || {})
   })), [project, screeningStatus]);
@@ -42,9 +49,11 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   const [searchTerm, setSearchTerm] = useState('');
   const [sortField, setSortField] = useState('baseScore');
   const [sortDir, setSortDir] = useState('desc');
+  const [page, setPage] = useState(1);
   const [selectedIds, setSelectedIds] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [detailModalCreator, setDetailModalCreator] = useState(null);
+  const [detailLoadStatus, setDetailLoadStatus] = useState('');
   const [reviewModal, setReviewModal] = useState(null); // { creator, action }
   const [batchModal, setBatchModal] = useState(null); // { action, creators }
   const [inviteModal, setInviteModal] = useState(null); // { creators, source }
@@ -61,16 +70,18 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
 
   useEffect(() => {
     setSelectedIds([]);
+    setPage(1);
   }, [statusFilter, tierFilter, typeFilter, searchTerm]);
 
   const filtered = useMemo(() => {
     let list = [...screeningCandidates];
     if (statusFilter !== '全部') list = list.filter(c => c.review === statusFilter);
-    if (tierFilter !== '全部') list = list.filter(c => getScoreTier(c.baseScore).key === tierFilter);
+    if (tierFilter !== '全部') list = list.filter(c => getInitialTier(c).key === tierFilter);
     if (typeFilter !== '全部') list = list.filter(c => c.type === typeFilter);
     if (searchTerm) list = list.filter(c => `${c.name} ${getCreatorDisplayId(c)} ${c.id}`.includes(searchTerm));
     list.sort((a, b) => {
-      const av = a[sortField], bv = b[sortField];
+      const av = sortField === 'baseScore' ? (a.ruleGroupScore ?? a.baseScore) : a[sortField];
+      const bv = sortField === 'baseScore' ? (b.ruleGroupScore ?? b.baseScore) : b[sortField];
       if (typeof av === 'number' && typeof bv === 'number') return sortDir === 'desc' ? bv - av : av - bv;
       return sortDir === 'desc' ? String(bv).localeCompare(String(av)) : String(av).localeCompare(String(bv));
     });
@@ -78,6 +89,16 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   }, [screeningCandidates, statusFilter, tierFilter, typeFilter, searchTerm, sortField, sortDir]);
 
   const stats = useMemo(() => {
+    if (project.stats?.tiers) {
+      return {
+        total: project.stats.total || 0,
+        passed: project.stats.passed || 0,
+        rejected: project.stats.rejected || 0,
+        backup: project.stats.backup || 0,
+        review: project.stats.review || 0,
+        pending: project.stats.pending || 0,
+      };
+    }
     const s = {
       total: screeningCandidates.length,
       passed: creators.filter(c => ['已通过', '已写回飞书'].includes(c.review)).length,
@@ -92,23 +113,30 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
       else s.pending++;
     });
     return s;
-  }, [creators.length, screeningCandidates]);
+  }, [creators.length, project.stats, screeningCandidates]);
 
   const tierStats = useMemo(() => {
     const tiers = {
-      S: { label: 'S档', desc: '100分以上，最高优先级', count: 0, variant: 'green', color: '#10B981' },
-      A: { label: 'A档', desc: '90-99分，高优先级', count: 0, variant: 'blue', color: '#3B82F6' },
-      'B+': { label: 'B+档', desc: '80-89分，中高优先级', count: 0, variant: 'amber', color: '#F59E0B' },
-      B: { label: 'B档', desc: '70-79分，中优先级', count: 0, variant: 'amber', color: '#D97706' },
+      S: { label: 'S档', desc: '95分以上，最高优先级', count: 0, variant: 'green', color: '#10B981' },
+      A: { label: 'A档', desc: '80-94分，高优先级', count: 0, variant: 'blue', color: '#3B82F6' },
+      'B+': { label: 'B+档', desc: '75-79分，中高优先级', count: 0, variant: 'amber', color: '#F59E0B' },
+      B: { label: 'B档', desc: '70-74分，中优先级', count: 0, variant: 'amber', color: '#D97706' },
       C: { label: 'C档', desc: '70分以下，低优先级', count: 0, variant: 'red', color: '#EF4444' },
       未评分: { label: '未评分', desc: '待完成评分，不计入低优先级', count: 0, variant: 'default', color: '#64748B' },
     };
-    screeningCandidates.forEach(creator => {
-      const tier = getScoreTier(creator.baseScore).key;
-      tiers[tier].count += 1;
-    });
+    if (project.stats?.tiers) {
+      Object.entries(project.stats.tiers).forEach(([key, count]) => {
+        const tierKey = normalizeScoreTierKey(key);
+        if (tiers[tierKey]) tiers[tierKey].count = Number(count || 0);
+      });
+    } else {
+      screeningCandidates.forEach(creator => {
+        const tier = getInitialTier(creator).key;
+        tiers[tier].count += 1;
+      });
+    }
     return tiers;
-  }, [screeningCandidates]);
+  }, [project.stats, screeningCandidates]);
   const activeTier = tierFilter === '全部' ? null : tierStats[tierFilter] || null;
   const savedPlan = useMemo(() => normalizeWorkbenchPlan(project.screeningPlan || {}), [project.screeningPlan]);
   const planDirty = JSON.stringify(planDraft.scoringHardFilters || []) !== JSON.stringify(savedPlan.scoringHardFilters || []);
@@ -136,6 +164,24 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
     });
   };
 
+  const openCreatorDetail = async (creator) => {
+    setDetailModalCreator(creator);
+    setDetailLoadStatus('loading');
+    try {
+      const payload = await api(`/api/projects/${encodeURIComponent(project.id)}/creators/${encodeURIComponent(creator.id)}`);
+      if (payload.creator) {
+        setDetailModalCreator({
+          ...creator,
+          raw: payload.creator,
+        });
+      }
+      setDetailLoadStatus('');
+    } catch (error) {
+      console.warn('[ScreeningReviewTab] load creator detail failed', error);
+      setDetailLoadStatus('error');
+    }
+  };
+
   const handleReview = async (creator, action) => {
     const status = action === 'pass' ? '已通过' : action === 'reject' ? '已驳回' : action === 'backup' ? '备选' : '待审核';
     const variant = action === 'pass' ? 'green' : action === 'reject' ? 'red' : 'amber';
@@ -152,7 +198,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   };
 
   const handleBatchPass = async () => {
-    const selectedCreators = creators.filter(c => selectedIds.includes(c.id));
+    const selectedCreators = batchModal?.creators || filtered.filter(c => selectedIds.includes(c.id));
     if (!selectedCreators.length) return;
     const reason = reviewComment || '批量通过，进入项目达人池';
     applyLocalReviewStatus(selectedCreators, '已通过', 'green', reason);
@@ -169,7 +215,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   };
 
   const handleBatchReject = async () => {
-    const selectedCreators = creators.filter(c => selectedIds.includes(c.id));
+    const selectedCreators = batchModal?.creators || filtered.filter(c => selectedIds.includes(c.id));
     if (!selectedCreators.length) return;
     const reason = reviewComment || '批量淘汰，进入观察暂缓池';
     applyLocalReviewStatus(selectedCreators, '已驳回', 'red', reason);
@@ -186,7 +232,9 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   };
 
   const openBatchModal = (action) => {
-    const selectedCreators = creators.filter(c => selectedIds.includes(c.id));
+    const selectedCreators = selectedIds.length
+      ? filtered.filter(c => selectedIds.includes(c.id))
+      : filtered;
     if (!selectedCreators.length) return;
     setBatchModal({ action, creators: selectedCreators });
     setReviewComment(action === 'pass' ? '批量通过，进入项目达人池' : '批量淘汰，进入观察暂缓池');
@@ -228,9 +276,17 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   const handleCollectCurrentTierDetails = async () => {
     if (!filtered.length || !onCollectDetails) return;
     const segmentLabel = activeTier?.label || '全部档位';
-    setPlanStatus(`正在完善${segmentLabel} ${filtered.length} 位达人详情...`);
+    const detailTargets = filtered.filter(creator => {
+      const url = getPgyUrl(creator);
+      return url && url.includes('/blogger-detail/');
+    });
+    if (!detailTargets.length) {
+      setPlanStatus(`${segmentLabel}暂无可打开蒲公英详情页的达人`);
+      return;
+    }
+    setPlanStatus(`正在完善${segmentLabel} ${detailTargets.length} 位达人详情...`);
     const result = await onCollectDetails({
-      creatorIds: filtered.map(creator => creator.id),
+      creatorIds: detailTargets.map(creator => creator.id),
       segment: tierFilter,
       segmentLabel,
     });
@@ -243,24 +299,27 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
       setScoreRun({ status: 'error', message: '当前项目未接入 AI 评分接口' });
       return null;
     }
-    if (!screeningCandidates.length) {
+    const targetCreators = filtered.length ? filtered : screeningCandidates;
+    const targetIds = targetCreators.map(creator => creator.id).filter(Boolean);
+    if (!targetIds.length) {
       setScoreRun({ status: 'error', message: '暂无可评分达人，请先完成采集或导入候选达人' });
       return null;
     }
+    const segmentLabel = activeTier?.label || '当前筛选';
     const startedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     setScoreRun({
       status: 'running',
-      message: `AI 评分进行中：正在核算 ${screeningCandidates.length} 位达人投流效果、合作笔记、人设优势和风险...`,
+      message: `AI 评分进行中：正在核算${segmentLabel} ${targetIds.length} 位达人投流效果、合作笔记、人设优势和风险...`,
     });
     try {
-      const result = await onScore({ source });
+      const result = await onScore({ source, creatorIds: targetIds, segment: tierFilter, segmentLabel });
       if (result?.ok === false) {
         throw new Error(result.message || result.error || 'AI 评分失败');
       }
-      const scored = result?.scored ?? result?.refreshed?.creators?.length ?? screeningCandidates.length;
+      const scored = result?.scored ?? targetIds.length;
       setScoreRun({
         status: 'success',
-        message: `AI 评分完成：${scored} 位达人已更新评分和推荐理由 · ${startedAt}`,
+        message: `AI 评分完成：${segmentLabel} ${scored} 位达人已更新评分和推荐理由 · ${startedAt}`,
       });
       return result;
     } catch (error) {
@@ -291,7 +350,27 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
   };
 
   const filteredIds = filtered.map(creator => creator.id);
+  const selectedFilteredCreators = filtered.filter(creator => selectedIds.includes(creator.id));
+  const batchTargetCreators = selectedFilteredCreators.length ? selectedFilteredCreators : filtered;
+  const batchTargetCount = batchTargetCreators.length;
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const visibleCreators = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const visibleIds = visibleCreators.map(creator => creator.id);
   const allFilteredSelected = filteredIds.length > 0 && filteredIds.every(id => selectedIds.includes(id));
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.includes(id));
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+
+  const toggleSelectVisible = () => {
+    setSelectedIds(ids => {
+      if (allVisibleSelected) return ids.filter(id => !visibleIds.includes(id));
+      return Array.from(new Set([...ids, ...visibleIds]));
+    });
+  };
+
   const toggleSelectFiltered = () => {
     setSelectedIds(ids => {
       if (allFilteredSelected) return ids.filter(id => !filteredIds.includes(id));
@@ -410,6 +489,13 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
             {recommendation.weaknesses.map(item => <p key={item}>{item}</p>)}
           </div>
         </div>
+
+        {recommendation.manualReviewItems?.length ? (
+          <div className="screening-ai-note-metrics">
+            <div className="screening-ai-section-title">待人工复核</div>
+            {recommendation.manualReviewItems.map(item => <p key={item}>{item}</p>)}
+          </div>
+        ) : null}
       </div>
     );
   };
@@ -563,11 +649,11 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
           </button>
           <button
             className="btn btn-sm btn-primary"
-            onClick={() => openInviteModal(creators.filter(c => selectedIds.includes(c.id)), '初筛找博主批量邀约')}
-            disabled={!selectedIds.length || !onPgyInvite}
+            onClick={() => openInviteModal(batchTargetCreators, '初筛找博主批量邀约')}
+            disabled={!batchTargetCount || !onPgyInvite}
             title="通过蒲公英邀约通道批量发起合作"
           >
-            <Send size={14} style={{ marginRight: 4 }} />批量邀约{selectedIds.length ? ` ${selectedIds.length}` : ''}
+            <Send size={14} style={{ marginRight: 4 }} />批量邀约{batchTargetCount ? ` ${batchTargetCount}` : ''}
           </button>
           <button
             className="btn btn-sm btn-primary"
@@ -578,8 +664,8 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
             <FileText size={14} style={{ marginRight: 4 }} />完善{activeTier?.label || '全部档位'}{filtered.length ? ` ${filtered.length}` : ''}
           </button>
           <button className="btn btn-sm btn-ghost" onClick={onRefresh}><RefreshCw size={14} /></button>
-          <button className="btn btn-sm btn-secondary" onClick={() => openBatchModal('pass')} disabled={!selectedIds.length} title="批量通过当前勾选达人"><UserCheck size={14} style={{ marginRight: 4 }} />批量通过{selectedIds.length ? ` ${selectedIds.length}` : ''}</button>
-          <button className="btn btn-sm btn-danger" onClick={() => openBatchModal('reject')} disabled={!selectedIds.length} title="批量淘汰当前勾选达人"><UserX size={14} style={{ marginRight: 4 }} />批量淘汰{selectedIds.length ? ` ${selectedIds.length}` : ''}</button>
+          <button className="btn btn-sm btn-secondary" onClick={() => openBatchModal('pass')} disabled={!batchTargetCount} title="批量通过当前筛选达人"><UserCheck size={14} style={{ marginRight: 4 }} />批量通过{batchTargetCount ? ` ${batchTargetCount}` : ''}</button>
+          <button className="btn btn-sm btn-danger" onClick={() => openBatchModal('reject')} disabled={!batchTargetCount} title="批量淘汰当前筛选达人"><UserX size={14} style={{ marginRight: 4 }} />批量淘汰{batchTargetCount ? ` ${batchTargetCount}` : ''}</button>
         </div>
       </div>
 
@@ -595,7 +681,8 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
                     checked={allFilteredSelected}
                     disabled={!filtered.length}
                     onChange={toggleSelectFiltered}
-                    aria-label="选择当前列表达人"
+                    aria-label="选择全部筛选结果达人"
+                    title="选择全部筛选结果达人"
                   />
                 </th>
                 <th className="screening-review-col-creator" style={{ padding: '12px 16px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>达人</th>
@@ -605,14 +692,14 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
                 <th className="screening-review-col-score" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }} onClick={() => toggleSort('baseScore')}>初筛总分 <SortIcon field="baseScore" /></th>
                 <th className="screening-review-col-model" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>内容建模</th>
                 <th className="screening-review-col-tier" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>档位</th>
-                <th className="screening-review-col-risk" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>风险</th>
+                <th className="screening-review-col-risk" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>优势项</th>
                 <th className="screening-review-col-status" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>审核状态</th>
                 <th className="screening-review-col-comment" style={{ padding: '12px 12px', textAlign: 'left', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>审核意见</th>
                 <th className="screening-review-col-actions" style={{ padding: '12px 16px', textAlign: 'center', color: 'var(--text-secondary)', fontWeight: 600, fontSize: 12 }}>操作</th>
               </tr>
             </thead>
             <tbody>
-              {filtered.map(creator => (
+              {visibleCreators.map(creator => (
                 <React.Fragment key={creator.id}>
                   <tr style={{ borderBottom: '1px solid var(--border-primary)', cursor: 'pointer', transition: 'background 0.15s' }}
                     onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
@@ -639,9 +726,11 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
                     <td className="screening-review-col-followers" style={{ padding: '12px', color: 'var(--text-secondary)', fontWeight: 500 }}>{creator.followers}</td>
                     <td className="screening-review-col-quote" style={{ padding: '12px', color: 'var(--text-secondary)', fontWeight: 500 }}>{creator.quote}</td>
                     <td className="screening-review-col-score screening-review-cell-score" style={{ padding: '12px' }}>
-                      <span style={{ fontWeight: 700, fontSize: 15, color: getScoreColor(creator.baseScore) }}>{creator.scorePending ? '待评分' : creator.baseScore}</span>
+                      <span style={{ fontWeight: 700, fontSize: 15, color: getScoreColor(creator.ruleGroupScore ?? creator.baseScore) }}>
+                        {creator.scorePending ? '待评分' : (creator.ruleGroupScore ?? creator.baseScore)}
+                      </span>
                       <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
-                        基础 {creator.baseOnlyScore || 0} + 加成 {creator.bonusScore || 0} · 完整度 {creator.informationCompletenessLabel}
+                        规则初筛 · 推荐分 {creator.baseScore ?? '-'} · 完整度 {creator.informationCompletenessLabel}
                       </span>
                     </td>
                     <td className="screening-review-col-model screening-review-cell-model" style={{ padding: '12px' }}>
@@ -649,14 +738,18 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
                     </td>
                     <td className="screening-review-col-tier" style={{ padding: '12px' }}>
                       {(() => {
-                        const tier = getScoreTier(creator.baseScore);
+                        const tier = getInitialTier(creator);
                         return <Badge variant={tier.variant}>{tier.label} · {tier.text}</Badge>;
                       })()}
                       {creator.detailCollectionPriority && <Badge variant="default">{creator.detailCollectionPriority}</Badge>}
+                      {(() => {
+                        const detailStatus = getCreatorDetailStatus(creator);
+                        return <Badge variant={detailStatus.variant}>{detailStatus.label}</Badge>;
+                      })()}
                     </td>
                     <td className="screening-review-col-risk screening-review-cell-risk" style={{ padding: '12px' }}>
                       <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                        {(creator.risk || []).map((t, i) => <span key={i} className="tag" style={{ fontSize: 10, color: t.includes('无') || t.includes('低') || t.includes('过多') || t.includes('低') ? '#EF4444' : '#F59E0B' }}>{t}</span>)}
+                        {(creator.risk || []).map((t, i) => <span key={i} className="tag" style={{ fontSize: 10, color: '#0F766E' }}>{t}</span>)}
                       </div>
                     </td>
                     <td className="screening-review-col-status" style={{ padding: '12px' }}><Badge variant={getReviewVariant(creator.review)}>{creator.review}</Badge></td>
@@ -677,7 +770,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
                         )}
                         <button
                           className="btn btn-sm btn-secondary"
-                          onClick={(e) => { e.stopPropagation(); setDetailModalCreator(creator); }}
+                          onClick={(e) => { e.stopPropagation(); openCreatorDetail(creator); }}
                           title="查看详情"
                         >
                           详情
@@ -743,8 +836,16 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
             </div>
           )}
           <div style={{ padding: '12px 16px', borderTop: '1px solid var(--border-primary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, color: 'var(--text-secondary)' }}>
-            <span>共 {filtered.length} 位达人，已勾选 {selectedIds.length} 位</span>
-            <span>筛选自 {screeningCandidates.length} 位待筛候选，已入池 {stats.passed} 位</span>
+            <span>共 {filtered.length} 位达人，当前显示 {visibleCreators.length} 位，已勾选 {selectedIds.length} 位</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+              <button className="btn btn-sm btn-secondary" disabled={!filteredIds.length} onClick={toggleSelectFiltered}>
+                {allFilteredSelected ? '取消全部筛选结果' : `选择全部筛选结果 ${filteredIds.length}`}
+              </button>
+              <button className="btn btn-sm btn-secondary" disabled={currentPage <= 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button>
+              第 {currentPage} / {totalPages} 页
+              <button className="btn btn-sm btn-secondary" disabled={currentPage >= totalPages} onClick={() => setPage(value => Math.min(totalPages, value + 1))}>下一页</button>
+              筛选自 {screeningCandidates.length} 位待筛候选，已入池 {stats.passed} 位
+            </span>
           </div>
         </div>
       </div>
@@ -766,7 +867,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
               </div>
               <div className="batch-review-list">
                 {batchModal.creators.map(creator => {
-                  const tier = getScoreTier(creator.baseScore);
+                  const tier = getCreatorDisplayTier(creator);
                   return (
                     <div key={creator.id} className="batch-review-item">
                       <div className="batch-review-avatar">{getCreatorAvatarUrl(creator) ? <img src={getCreatorAvatarUrl(creator)} alt={creator.name} /> : creator.name[0]}</div>
@@ -846,6 +947,7 @@ export function ScreeningReviewTab({ project, screeningStatus, setScreeningStatu
           onClose={() => setDetailModalCreator(null)}
           onCollectDetails={onCollectDetails}
           onInvite={(creator) => openInviteModal([creator], '达人详情邀约')}
+          loadStatus={detailLoadStatus}
         />
       )}
       {inviteModal && (

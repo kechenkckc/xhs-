@@ -212,15 +212,16 @@ export function useProjectWorkspace(selectedProjectId, onSelectedProjectIdChange
     setLoading(true);
     setError('');
     try {
-      const [project, nextLogs, nextHandoffs, nextTasks, nextAssets, nextMetrics] = await Promise.all([
-        projectWorkspaceApi.getProject(nextProjectId),
-        projectWorkspaceApi.listLogs(nextProjectId),
-        projectWorkspaceApi.listHandoffs(nextProjectId),
-        projectWorkspaceApi.listTasks(nextProjectId),
-        projectWorkspaceApi.listAssets(nextProjectId),
-        projectWorkspaceApi.getMetrics(nextProjectId),
-      ]);
+      const project = await projectWorkspaceApi.getProject(nextProjectId);
       setCurrentProject(project);
+      setLoading(false);
+      const [nextLogs, nextHandoffs, nextTasks, nextAssets, nextMetrics] = await Promise.all([
+        projectWorkspaceApi.listLogs(nextProjectId).catch(() => []),
+        projectWorkspaceApi.listHandoffs(nextProjectId).catch(() => []),
+        projectWorkspaceApi.listTasks(nextProjectId).catch(() => []),
+        projectWorkspaceApi.listAssets(nextProjectId).catch(() => []),
+        projectWorkspaceApi.getMetrics(nextProjectId).catch(() => null),
+      ]);
       setLogs(nextLogs);
       setHandoffs(nextHandoffs);
       setTasks(nextTasks);
@@ -228,7 +229,6 @@ export function useProjectWorkspace(selectedProjectId, onSelectedProjectIdChange
       setMetrics(nextMetrics);
     } catch (nextError) {
       setError(nextError.message || '项目数据加载失败');
-    } finally {
       setLoading(false);
     }
   }, [projectId]);

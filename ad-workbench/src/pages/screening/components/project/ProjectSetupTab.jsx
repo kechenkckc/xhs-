@@ -20,11 +20,8 @@ import {
   pgyFilterLabel,
 } from '../../constants/screeningConstants';
 import {
-  collectionHardFiltersToPgyFilters,
-  markManualPgyFilters,
   mergeOptionItems,
   pgyFilterKey,
-  syncCollectionHardFiltersFromPgyFilters,
 } from '../../utils/pgyFilters';
 import { getSchemeAdditionalFilters, getSchemeRequiredFilters, hardFilterOptionsFor, normalizeWorkbenchPlan, syncScreeningCriteria } from '../../utils/screeningPlan';
 import { PgyFindBloggerFilterPanel } from '../filters/PgyFindBloggerFilterPanel';
@@ -142,6 +139,7 @@ export function ProjectSetupTab({
   const [feishuStatus, setFeishuStatus] = useState('');
   const [feishuSaved, setFeishuSaved] = useState(false);
   const [feishuTestResult, setFeishuTestResult] = useState(null);
+  const [writebackBusy, setWritebackBusy] = useState(false);
   const [optimizingStandard, setOptimizingStandard] = useState(false);
   const [form, setForm] = useState({
     name: project.name, product: project.product, budget: project.budget,
@@ -242,6 +240,26 @@ export function ProjectSetupTab({
     }
   };
 
+  const runWriteBack = async () => {
+    if (!onWriteBack) return;
+    setWritebackBusy(true);
+    setFeishuStatus('正在写回飞书，请稍等...');
+    try {
+      const result = await onWriteBack(feishuForm.table_id);
+      if (result?.ok === false) {
+        setFeishuStatus(result.message || result.error || '写回飞书失败，请检查飞书权限或字段映射');
+        return result;
+      }
+      setFeishuStatus(`写回完成：${result?.written_count || 0} 位达人`);
+      return result;
+    } catch (error) {
+      setFeishuStatus(error.message || '写回飞书失败，请检查飞书权限或网络');
+      return null;
+    } finally {
+      setWritebackBusy(false);
+    }
+  };
+
   const goToSection = (section) => {
     if (section.disabled) return;
     setActiveSection(section.key);
@@ -250,6 +268,12 @@ export function ProjectSetupTab({
   const saveProjectInfo = async () => {
     if (onSaveProject) await onSaveProject({
       project_name: form.name,
+      product: form.product,
+      budget: Number(form.budget || 0),
+      singleBudget: Number(form.singleBudget || 0),
+      poolType: project.poolType,
+      sharedPoolId: project.sharedPoolId,
+      cooperationType: form.cooperationType,
       target_qualified_creator_count: Number(form.creatorCount || 10),
       period_start: form.periodStart,
       period_end: form.periodEnd,
@@ -285,6 +309,12 @@ export function ProjectSetupTab({
       if (onSaveProject) {
         await onSaveProject({
           project_name: form.name,
+          product: form.product,
+          budget: Number(form.budget || 0),
+          singleBudget: Number(form.singleBudget || 0),
+          poolType: project.poolType,
+          sharedPoolId: project.sharedPoolId,
+          cooperationType: form.cooperationType,
           target_qualified_creator_count: Number(form.creatorCount || 10),
           period_start: form.periodStart,
           period_end: form.periodEnd,
@@ -342,6 +372,12 @@ export function ProjectSetupTab({
       });
       await onSaveScreeningPlan(nextPlan, {
         project_name: form.name,
+        product: form.product,
+        budget: Number(form.budget || 0),
+        singleBudget: Number(form.singleBudget || 0),
+        poolType: project.poolType,
+        sharedPoolId: project.sharedPoolId,
+        cooperationType: form.cooperationType,
         target_qualified_creator_count: Number(form.creatorCount || 10),
         period_start: form.periodStart,
         period_end: form.periodEnd,
@@ -368,33 +404,8 @@ export function ProjectSetupTab({
     [screeningPlan.scoringHardFilters]
   );
 
-  const activeCollectionPgyFilters = useMemo(
-    () => mergeOptionItems(
-      collectionHardFiltersToPgyFilters(screeningPlan.collectionHardFilters || []),
-      screeningPlan.pgyCollectionPlan?.filters || [],
-      pgyFilterKey
-    ),
-    [screeningPlan.collectionHardFilters, screeningPlan.pgyCollectionPlan?.filters]
-  );
   const pgyPlan = screeningPlan.pgyCollectionPlan || {};
   const schemes = Array.isArray(pgyPlan.schemes) ? pgyPlan.schemes : [];
-
-  const updateCollectionPgyFilters = (filters = []) => {
-    const normalizedFilters = markManualPgyFilters(filters);
-    setCollectionFilterStatus('');
-    setScreeningPlan(old => {
-      const collectionHardFilters = syncCollectionHardFiltersFromPgyFilters(normalizedFilters, old.collectionHardFilters || []);
-      return syncScreeningCriteria({
-        ...old,
-        collectionHardFilters,
-        pgyCollectionPlan: {
-          ...(old.pgyCollectionPlan || {}),
-          filters: normalizedFilters,
-          hard_filters: collectionHardFilters,
-        },
-      });
-    });
-  };
 
   const patchScheme = (targetIndex, patcher) => {
     setCollectionFilterStatus('');
@@ -471,13 +482,19 @@ export function ProjectSetupTab({
       });
       await onSaveScreeningPlan?.(nextPlan, {
         project_name: form.name,
+        product: form.product,
+        budget: Number(form.budget || 0),
+        singleBudget: Number(form.singleBudget || 0),
+        poolType: project.poolType,
+        sharedPoolId: project.sharedPoolId,
+        cooperationType: form.cooperationType,
         target_qualified_creator_count: Number(form.creatorCount || 10),
         period_start: form.periodStart,
         period_end: form.periodEnd,
         brief: form.description,
       });
       setScreeningPlan(normalizeWorkbenchPlan(nextPlan));
-      setStatus(part === 'collection' ? '采集前筛选条件已保存，并同步到采集工作台' : '评分筛选条件已保存，并同步到初筛评分工作台');
+      setStatus(part === 'collection' ? '方案采集条件已保存，并同步到采集工作台' : '评分筛选条件已保存，并同步到初筛评分工作台');
     } catch (error) {
       setStatus(error.message || '保存失败');
     }
@@ -495,6 +512,12 @@ export function ProjectSetupTab({
       });
       await onSaveScreeningPlan?.(nextPlan, {
         project_name: form.name,
+        product: form.product,
+        budget: Number(form.budget || 0),
+        singleBudget: Number(form.singleBudget || 0),
+        poolType: project.poolType,
+        sharedPoolId: project.sharedPoolId,
+        cooperationType: form.cooperationType,
         target_qualified_creator_count: Number(form.creatorCount || 10),
         period_start: form.periodStart,
         period_end: form.periodEnd,
@@ -631,12 +654,12 @@ export function ProjectSetupTab({
                     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                       <Shield size={14} style={{ color: '#EF4444' }} /> 硬性筛选条件
                     </span>
-                    <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>已拆分为采集前筛选条件与评分筛选条件，保存后分别应用到采集/评分</span>
+                    <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>采集条件按方案维护，评分条件用于采后初筛</span>
                   </div>
                   <div className="standard-hard-filter-group">
                     <div className="standard-hard-filter-group-title">
-                      <span><Download size={14} />采集前筛选条件</span>
-                      <small>按蒲公英「找博主」方案展示，勾选的方案会同步到采集工作台</small>
+                      <span><Download size={14} />方案采集条件</span>
+                      <small>地域、报价、粉丝量等采集约束在各方案内维护，勾选的方案会同步到采集工作台</small>
                     </div>
                     {schemes.length > 0 ? (
                       <div className="collection-scheme-card-grid">
@@ -746,15 +769,12 @@ export function ProjectSetupTab({
                         })}
                       </div>
                     ) : (
-                      <PgyFindBloggerFilterPanel
-                        filters={activeCollectionPgyFilters}
-                        onChange={updateCollectionPgyFilters}
-                      />
+                      <div className="collection-empty-text">暂无采集方案，请先解析 Brief 生成标准。</div>
                     )}
                     <div className="standard-filter-save-row">
-                      <span className={collectionFilterStatus.includes('失败') ? 'is-error' : ''}>{collectionFilterStatus || '保存后采集工作台会同步使用当前条件。'}</span>
+                      <span className={collectionFilterStatus.includes('失败') ? 'is-error' : ''}>{collectionFilterStatus || '保存后采集工作台会同步使用各方案条件。'}</span>
                       <button type="button" className="btn btn-primary btn-sm" onClick={() => saveScreeningPlanPart('collection')}>
-                        <Save size={14} />保存采集前条件
+                        <Save size={14} />保存方案采集条件
                       </button>
                     </div>
                   </div>
@@ -887,7 +907,9 @@ export function ProjectSetupTab({
                 <button className="btn btn-primary" onClick={saveFeishuBinding}><Save size={14} style={{ marginRight: 4 }} />保存绑定</button>
                 <button className="btn btn-secondary" onClick={runFeishuTest}><CheckCircle2 size={14} style={{ marginRight: 4 }} />测试连接</button>
                 <button className="btn btn-secondary" onClick={onLoadTables}><Database size={14} style={{ marginRight: 4 }} />读取子表</button>
-                <button className="btn btn-primary" onClick={() => onWriteBack?.(feishuForm.table_id)}><Send size={14} style={{ marginRight: 4 }} />写回飞书</button>
+                <button className="btn btn-primary" onClick={runWriteBack} disabled={writebackBusy}>
+                  <Send size={14} style={{ marginRight: 4 }} />{writebackBusy ? '写回中...' : '写回飞书'}
+                </button>
               </div>
               {feishuStatus && (
                 <div style={{ marginBottom: 16, color: feishuStatus.includes('失败') ? '#FCA5A5' : 'var(--text-secondary)', fontSize: 12 }}>

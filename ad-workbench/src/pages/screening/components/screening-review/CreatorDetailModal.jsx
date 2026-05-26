@@ -21,20 +21,36 @@ import {
   getCreatorLocation,
   getCreatorRealNoteCases,
   getPgyUrl,
+  parseStructuredList,
 } from '../../utils/creatorMappers';
-import { getCreatorDeepAuditReason, getCreatorMatchProfile, getCreatorModelProfile, getScoreColor } from '../../utils/creatorScoring';
+import { getCreatorAdRecommendation, getCreatorDeepAuditReason, getCreatorMatchProfile, getCreatorModelProfile, getScoreColor } from '../../utils/creatorScoring';
 import { CreatorRecentNotesPanel } from './CreatorRecentNotesPanel';
 
-export function CreatorDetailModal({ creator, project, onClose, onCollectDetails, onInvite }) {
+export function CreatorDetailModal({ creator, project, onClose, onCollectDetails, onInvite, loadStatus = '' }) {
   const realNotes = useMemo(() => getCreatorRealNoteCases(creator), [creator]);
   const match = useMemo(() => getCreatorMatchProfile(creator, project), [creator, project]);
   const reasonDetail = useMemo(() => getCreatorDeepAuditReason(creator, realNotes), [creator, realNotes]);
   const modelProfile = useMemo(() => getCreatorModelProfile(creator, project), [creator, project]);
+  const recommendation = useMemo(() => getCreatorAdRecommendation(creator, realNotes, project), [creator, realNotes, project]);
   const noteSourceText = realNotes.length ? '来自蒲公英详情页采集' : '未采集到真实近期笔记';
   const pgyUrl = getPgyUrl(creator);
-  const scoreDimLabels = { budget: '预算匹配', fans: '粉丝量级', cpe: 'CPE效率', engagement: '互动质量', persona: '人设匹配', content: '内容风格' };
+  const scoreDimLabels = { budget: '执行确定性', fans: '目标人群匹配', cpe: '成本效率', engagement: '真实流量质量', persona: '产品场景匹配', content: '内容证据加成' };
   const lightProfile = modelProfile.lightProfile;
   const contentModel = modelProfile.contentValueModel;
+  const projectFitConfig = project?.screeningPlan?.projectFitConfig || {};
+  const projectSceneTags = parseStructuredList(projectFitConfig.preferred_content_scenes).slice(0, 5);
+  const projectStyleTags = parseStructuredList(projectFitConfig.preferred_presentation_styles).slice(0, 4);
+  const projectGradeTags = parseStructuredList(projectFitConfig.target_grade_keywords).slice(0, 5);
+  const projectNegativeTags = parseStructuredList(projectFitConfig.discouraged_keywords).slice(0, 4);
+  const evidenceRules = projectFitConfig.evidence_rules || {};
+  const llmManualReviewItems = creator.llmManualReviewItems?.length
+    ? creator.llmManualReviewItems
+    : parseStructuredList(creator.raw?.manual_review_items);
+  const llmEvidenceQuotes = creator.llmEvidenceQuotes?.length
+    ? creator.llmEvidenceQuotes
+    : parseStructuredList(creator.raw?.evidence_quotes);
+  const llmConfidence = Number(creator.llmConfidence ?? creator.raw?.llm_confidence);
+  const confidenceLabel = Number.isFinite(llmConfidence) ? `${Math.round(llmConfidence * 100)}%` : '待生成';
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -54,6 +70,16 @@ export function CreatorDetailModal({ creator, project, onClose, onCollectDetails
           <button className="btn btn-ghost btn-sm modal-close" onClick={onClose}><X size={16} /></button>
         </div>
         <div className="modal-body creator-detail-modal-body">
+          {loadStatus === 'loading' && (
+            <div className="creator-detail-section" style={{ marginTop: 0 }}>
+              <div className="creator-detail-empty">正在加载完整达人证据...</div>
+            </div>
+          )}
+          {loadStatus === 'error' && (
+            <div className="creator-detail-section" style={{ marginTop: 0 }}>
+              <div className="creator-detail-empty">完整达人证据加载失败，当前展示列表摘要。</div>
+            </div>
+          )}
           {onInvite && (
             <div className="creator-detail-section" style={{ marginTop: 0 }}>
               <div className="creator-detail-section-head">
@@ -109,6 +135,43 @@ export function CreatorDetailModal({ creator, project, onClose, onCollectDetails
                 <span>风险模型</span>
                 <strong>{modelProfile.riskModel.riskLevel === 'high' ? '高风险' : modelProfile.riskModel.riskLevel === 'medium' ? '中风险' : '低风险'}</strong>
                 <p>{modelProfile.riskModel.risks.length ? modelProfile.riskModel.risks.slice(0, 2).join('、') : modelProfile.riskModel.mitigation}</p>
+              </div>
+            </div>
+          </section>
+
+          <section className="creator-detail-section">
+            <div className="creator-detail-section-head">
+              <h4>项目评分口径</h4>
+              <Badge variant={projectFitConfig.product_name ? 'blue' : 'default'}>{projectFitConfig.product_name || '按当前 Brief'}</Badge>
+            </div>
+            <div className="creator-project-fit">
+              <div className="creator-project-fit-main">
+                <span>本轮产品适配</span>
+                <strong>{projectFitConfig.product_category || '项目化评分配置'}</strong>
+                <p>{projectFitConfig.target_audience_summary || projectFitConfig.summary || '围绕 Brief 判断达人是否匹配目标人群、产品场景、内容调性和证据充分度。'}</p>
+              </div>
+              <div className="creator-project-fit-rule">
+                <span>高分证据门槛</span>
+                <strong>{evidenceRules.require_scene_evidence_for_a_tier ? '需产品场景证据' : '按通用证据'}</strong>
+                <p>场景弱相关最高 {evidenceRules.weak_scene_match_max_score || 79} 分；证据不足最高 {evidenceRules.insufficient_evidence_max_score || 84} 分。</p>
+              </div>
+            </div>
+            <div className="creator-project-fit-tags">
+              <div>
+                <span>优先场景</span>
+                <div>{projectSceneTags.length ? projectSceneTags.map(item => <em key={item}>{item}</em>) : <small>待配置</small>}</div>
+              </div>
+              <div>
+                <span>内容调性</span>
+                <div>{projectStyleTags.length ? projectStyleTags.map(item => <em key={item}>{item}</em>) : <small>待配置</small>}</div>
+              </div>
+              <div>
+                <span>目标学段</span>
+                <div>{projectGradeTags.length ? projectGradeTags.map(item => <em key={item}>{item}</em>) : <small>待配置</small>}</div>
+              </div>
+              <div>
+                <span>降权内容</span>
+                <div>{projectNegativeTags.length ? projectNegativeTags.map(item => <em key={item}>{item}</em>) : <small>无明确降权项</small>}</div>
               </div>
             </div>
           </section>
@@ -197,6 +260,46 @@ export function CreatorDetailModal({ creator, project, onClose, onCollectDetails
                   <p>{item.text}</p>
                 </div>
               ))}
+            </div>
+          </section>
+
+          <section className="creator-detail-section">
+            <div className="creator-detail-section-head">
+              <h4>待人工复核</h4>
+              <Badge variant={recommendation.manualReviewItems?.length ? 'amber' : 'green'}>
+                {recommendation.manualReviewItems?.length ? '需复核' : '已清晰'}
+              </Badge>
+            </div>
+            <div className="creator-audit-deep-reason">
+              {((llmManualReviewItems.length ? llmManualReviewItems : recommendation.manualReviewItems)?.length ? (llmManualReviewItems.length ? llmManualReviewItems : recommendation.manualReviewItems) : ['当前无额外人工复核项']).map(item => (
+                <div key={item}>
+                  <strong>{item.split('：')[0] || '复核项'}</strong>
+                  <p>{item}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="creator-detail-section">
+            <div className="creator-detail-section-head">
+              <h4>模型结构化输出</h4>
+              <Badge variant={Number.isFinite(llmConfidence) && llmConfidence >= 0.8 ? 'green' : Number.isFinite(llmConfidence) ? 'amber' : 'default'}>
+                置信度 {confidenceLabel}
+              </Badge>
+            </div>
+            <div className="creator-llm-output">
+              <div>
+                <strong>证据摘要</strong>
+                {llmEvidenceQuotes.length ? (
+                  <ul>{llmEvidenceQuotes.map(item => <li key={item}>{item}</li>)}</ul>
+                ) : (
+                  <p>当前还没有结构化证据摘要，下一次大模型评分后会自动落库。</p>
+                )}
+              </div>
+              <div>
+                <strong>协议版本</strong>
+                <p>{creator.llmPromptVersion || creator.raw?.llm_prompt_version || 'prompt 待记录'} · {creator.llmSchemaVersion || creator.raw?.llm_schema_version || 'schema 待记录'}</p>
+              </div>
             </div>
           </section>
 

@@ -19,6 +19,7 @@ import { compactNumber, formatCompleteness } from '../../utils/formatters';
 import { getCreatorStatus, getDefaultCreatorStatus, getProjectCreators } from '../../utils/projectMappers';
 import {
   getCreatorAvatarUrl,
+  getCreatorDetailStatus,
   getCreatorIntro,
   getCreatorLocation,
   getCreatorRealNoteCases,
@@ -56,6 +57,7 @@ function normalizeTextForTone(value) {
 
 function fallbackXhsLink(note, creator) {
   if (note.link) return note.link;
+  if (note.noteId) return `https://www.xiaohongshu.com/explore/${note.noteId}`;
   const noteSeed = note.index ?? note.title ?? 'note';
   const seed = encodeURIComponent(`${creator.id || creator.name}-${noteSeed}`);
   return `https://www.xiaohongshu.com/explore/${seed}`;
@@ -181,6 +183,7 @@ function getNoteEvidence(note) {
     coverText: String(note.coverText || note.cover_text || '').trim(),
     coverUrl: note.coverUrl || note.cover_url || '',
     content: String(note.content || note.summary || note.description || '').trim(),
+    commentSummary: String(note.commentSummary || note.comment_summary || '').trim(),
     comments,
     metricsText: [
       note.readCount ? `阅读${note.readCount}` : '',
@@ -196,6 +199,8 @@ function analyzeNoteTone(note, project) {
   const text = normalizeTextForTone([
     evidence.title,
     evidence.coverText,
+    evidence.content,
+    evidence.commentSummary,
     evidence.comments.join(' '),
   ].join(' '));
   const projectText = normalizeTextForTone(`${project.description || ''} ${project.brief?.description || ''} ${project.name || project.project_name || ''}`);
@@ -205,6 +210,8 @@ function analyzeNoteTone(note, project) {
 
   if (evidence.title) evidenceSources.push('标题');
   if (evidence.coverUrl || evidence.coverText) evidenceSources.push(evidence.coverText ? '封面文字' : '封面图');
+  if (evidence.content) evidenceSources.push('正文');
+  if (evidence.commentSummary) evidenceSources.push('评论摘要');
   if (evidence.comments.length) evidenceSources.push(`评论区${evidence.comments.length}条`);
   if (evidence.metricsText) evidenceSources.push('互动数');
 
@@ -251,11 +258,13 @@ async function parseXhsNoteLink({ link, note, creator, project }) {
     url: link,
     note: {
       title: note.title,
+      note_id: note.noteId || '',
       cover_url: note.coverUrl || '',
       cover_text: note.coverText || note.cover_text || '',
       published_at: note.publishedAt || '',
       content: note.content || note.summary || note.description || '',
       topics: deriveNoteTopics(note),
+      comment_summary: note.commentSummary || note.comment_summary || '',
       comments: normalizeNoteComments(note),
       metrics: {
         read_count: note.readCount || '',
@@ -263,6 +272,8 @@ async function parseXhsNoteLink({ link, note, creator, project }) {
         save_count: note.saveCount || '',
         comment_count: note.commentCount || '',
         share_count: note.shareCount || '',
+        exposure_count: note.exposureCount || '',
+        follow_count: note.followCount || '',
       },
     },
     creator: { id: creator.id, name: creator.name },
@@ -274,7 +285,34 @@ async function parseXhsNoteLink({ link, note, creator, project }) {
   });
 }
 
+function getAuditNoteCases(creator, match = {}) {
+  const realCases = getCreatorRealNoteCases(creator);
+  return realCases.length ? realCases : (Array.isArray(match.noteCases) ? match.noteCases : []);
+}
+
+function noteDisplayTitle(note) {
+  return String(note?.title || '').trim() || (note?.noteId ? `笔记 ${String(note.noteId).slice(-6)}` : '标题待解析');
+}
+
+function noteDisplayBrand(note) {
+  return String(note?.brand || note?.contentCategory || note?.noteType || '近期笔记').trim();
+}
+
+function notePreviewText(note) {
+  const comments = normalizeNoteComments(note);
+  return String(
+    note?.content
+    || note?.summary
+    || note?.description
+    || note?.commentSummary
+    || note?.comment_summary
+    || comments[0]
+    || ''
+  ).trim();
+}
+
 export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, onCollectDetails, onPgyInvite, onScore, onReview, onRefresh, onTabChange }) {
+  const pageSize = 40;
   const creators = useMemo(() => getProjectCreators(project).map(c => ({
     ...getDefaultCreatorStatus(),
     ...c,
@@ -287,6 +325,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
   const [activeId, setActiveId] = useState(() => rows[0]?.creator.id || null);
   const [searchTerm, setSearchTerm] = useState('');
   const [matchFilter, setMatchFilter] = useState('全部');
+  const [page, setPage] = useState(1);
   const [busy, setBusy] = useState(false);
   const [reviewingIds, setReviewingIds] = useState([]);
   const [inviteModal, setInviteModal] = useState(null);
@@ -300,7 +339,12 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
   useEffect(() => {
     setSelectedIds([]);
     setActiveId(rows[0]?.creator.id || null);
+    setPage(1);
   }, [project.id]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [matchFilter, searchTerm]);
 
   const filteredRows = useMemo(() => {
     let list = rows;
@@ -315,8 +359,19 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
 
   const activeRow = rows.find(({ creator }) => creator.id === activeId) || filteredRows[0] || rows[0];
   const selectedCreators = rows.filter(({ creator }) => selectedIds.includes(creator.id)).map(({ creator }) => creator);
-  const visibleIds = filteredRows.map(({ creator }) => creator.id);
+  const filteredIds = filteredRows.map(({ creator }) => creator.id);
+  const allFilteredSelected = filteredIds.length > 0 && filteredIds.every(id => selectedIds.includes(id));
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const visibleRows = filteredRows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const visibleIds = visibleRows.map(({ creator }) => creator.id);
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.includes(id));
+  const activeNoteCases = activeRow ? getAuditNoteCases(activeRow.creator, activeRow.match) : [];
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+
   const criteria = getProjectScoringCriteria(project);
   const avgMatch = rows.length
     ? Math.round(rows.reduce((sum, item) => sum + item.match.matchScore, 0) / rows.length)
@@ -326,12 +381,22 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
     return completeness === '待补' || !hasCompleteNoteCaseEvidence(creator) || !getPgyUrl(creator);
   }).length;
   const strongCount = rows.filter(({ match }) => match.tier === '强匹配').length;
-  const selectedNoteCount = selectedCreators.reduce((sum, creator) => sum + getCreatorMatchProfile(creator, project).noteCases.length, 0);
+  const selectedNoteCount = selectedCreators.reduce((sum, creator) => {
+    const match = getCreatorMatchProfile(creator, project);
+    return sum + getAuditNoteCases(creator, match).length;
+  }, 0);
 
   const toggleVisible = () => {
     setSelectedIds(ids => {
       if (allVisibleSelected) return ids.filter(id => !visibleIds.includes(id));
       return Array.from(new Set([...ids, ...visibleIds]));
+    });
+  };
+
+  const toggleFiltered = () => {
+    setSelectedIds(ids => {
+      if (allFilteredSelected) return ids.filter(id => !filteredIds.includes(id));
+      return Array.from(new Set([...ids, ...filteredIds]));
     });
   };
 
@@ -376,7 +441,10 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
       createdAt: now,
       creatorIds: targetCreators.map(creator => creator.id),
       creatorCount: targetCreators.length,
-      noteCount: targetCreators.reduce((sum, creator) => sum + getCreatorMatchProfile(creator, project).noteCases.length, 0),
+      noteCount: targetCreators.reduce((sum, creator) => {
+        const match = getCreatorMatchProfile(creator, project);
+        return sum + getAuditNoteCases(creator, match).length;
+      }, 0),
     };
     setAuditTask(task);
     setLocalMessage(`已提交审号任务：${task.creatorCount} 位达人，待采集/分析 ${task.noteCount} 篇笔记`);
@@ -567,8 +635,8 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
         <section className="creator-audit-table-card">
           <div className="creator-audit-table-head">
             <label className="creator-audit-check">
-              <input type="checkbox" checked={allVisibleSelected} disabled={!visibleIds.length} onChange={toggleVisible} />
-              <span>全选</span>
+              <input type="checkbox" checked={allFilteredSelected} disabled={!filteredIds.length} onChange={toggleFiltered} />
+              <span>全部</span>
             </label>
             <span>达人</span>
             <span>匹配度</span>
@@ -576,12 +644,13 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
             <span>状态/操作</span>
           </div>
           <div className="creator-audit-table-body">
-            {filteredRows.map(({ creator, match }) => {
+            {visibleRows.map(({ creator, match }) => {
               const tier = getScoreTier(creator.baseScore);
               const avatarUrl = getCreatorAvatarUrl(creator);
               const isActive = activeRow?.creator.id === creator.id;
               const isReviewing = reviewingIds.includes(creator.id);
               const reviewStatus = creator.review || '待审核';
+              const detailStatus = getCreatorDetailStatus(creator);
               return (
                 <article
                   key={creator.id}
@@ -608,6 +677,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                   <div className="creator-audit-match">
                     <strong style={{ color: getScoreColor(match.matchScore) }}>{match.matchScore}%</strong>
                     <Badge variant={match.matchScore >= 85 ? 'green' : match.matchScore >= 70 ? 'blue' : match.matchScore >= 55 ? 'amber' : 'red'}>{match.tier}</Badge>
+                    <Badge variant={detailStatus.variant}>{detailStatus.label}</Badge>
                     <span>{tier.label} · {creator.baseScore}分</span>
                   </div>
                   <div className="creator-audit-reason">
@@ -660,6 +730,17 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
               );
             })}
           </div>
+          <div style={{ padding: '12px 16px', borderTop: '1px solid var(--border-primary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, color: 'var(--text-secondary)' }}>
+            <span>共 {filteredRows.length} 位达人，当前显示 {visibleRows.length} 位</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+              <button className="btn btn-sm btn-secondary" disabled={!filteredIds.length} onClick={toggleFiltered}>
+                {allFilteredSelected ? '取消全部筛选结果' : `选择全部筛选结果 ${filteredIds.length}`}
+              </button>
+              <button className="btn btn-sm btn-secondary" disabled={currentPage <= 1} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</button>
+              第 {currentPage} / {totalPages} 页
+              <button className="btn btn-sm btn-secondary" disabled={currentPage >= totalPages} onClick={() => setPage(value => Math.min(totalPages, value + 1))}>下一页</button>
+            </span>
+          </div>
         </section>
 
         <aside className="creator-audit-detail">
@@ -683,29 +764,36 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
               </div>
 
               <div className="creator-audit-note-grid">
-                {activeRow.match.noteCases.slice(0, 6).map((note, index) => {
+                {activeNoteCases.slice(0, 6).map((note, index) => {
                   const tone = analyzeNoteTone(note, project, activeRow.creator);
+                  const title = noteDisplayTitle(note);
+                  const brand = noteDisplayBrand(note);
+                  const previewText = notePreviewText(note);
+                  const comments = normalizeNoteComments(note);
                   return (
                   <button
                     type="button"
                     className="creator-audit-note"
-                    key={`${note.title}-${index}`}
+                    key={`${note.noteId || note.link || title}-${index}`}
                     onClick={() => openNoteModal(note, activeRow.creator, activeRow.match)}
                     title="打开笔记详情并解析小红书链接"
                   >
                     <div className="creator-audit-note-cover">
-                      {note.coverUrl ? <img src={note.coverUrl} alt={note.title} /> : <span>{note.brand.slice(0, 2)}</span>}
+                      {note.coverUrl ? <img src={note.coverUrl} alt={title} /> : <span>{brand.slice(0, 2)}</span>}
                       {note.promoted && <Badge variant="green">投流</Badge>}
                       <i><MousePointerClick size={13} />详情</i>
                     </div>
                     <div className="creator-audit-note-body">
-                      <strong>{note.title}</strong>
-                      <span>{note.brand} · {note.publishedAt || '时间待补'}</span>
+                      <strong>{title}</strong>
+                      <span>{brand} · {note.publishedAt || (note.source === 'list_api' ? '列表采集' : '时间待补')}</span>
                       <div>
                         {note.readCount && <em>读 {compactNumber(note.readCount)}</em>}
                         {note.likeCount && <em>赞 {compactNumber(note.likeCount)}</em>}
                         {note.saveCount && <em>藏 {compactNumber(note.saveCount)}</em>}
+                        {note.commentCount && <em>评 {compactNumber(note.commentCount)}</em>}
                       </div>
+                      {previewText && <p className="creator-audit-note-snippet">{previewText}</p>}
+                      {comments.length > 0 && <p className="creator-audit-note-comment">评论：{comments[0]}</p>}
                       {noteMedianComparisonText(note) && (
                         <small className={note.hasClearMedianContrast ? 'is-strong' : ''}>{noteMedianComparisonText(note)}</small>
                       )}
@@ -716,6 +804,9 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                   </button>
                   );
                 })}
+                {!activeNoteCases.length && (
+                  <div className="creator-audit-note-empty">暂无真实笔记数据，请先完善达人详情。</div>
+                )}
               </div>
 
               <div className="creator-audit-analysis">
@@ -790,8 +881,8 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
             <div className="creator-audit-note-panel-head">
               <div>
                 <span className="creator-audit-eyebrow">笔记详情</span>
-                <h3>{noteModal.note.title}</h3>
-                <p>{noteModal.creator.name} · {noteModal.note.brand} · {noteModal.note.publishedAt || '发布时间待补'}</p>
+                <h3>{noteDisplayTitle(noteModal.note)}</h3>
+                <p>{noteModal.creator.name} · {noteDisplayBrand(noteModal.note)} · {noteModal.note.publishedAt || '发布时间待补'}</p>
               </div>
               <button className="creator-audit-back" type="button" onClick={() => setNoteModal(null)} title="关闭">
                 <X size={17} />
@@ -801,7 +892,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
               <div className="creator-audit-note-main">
                 <div className="creator-audit-note-preview">
                   <div className="creator-audit-note-cover-frame">
-                    {noteDetail.coverUrl ? <img src={noteDetail.coverUrl} alt={noteDetail.title || noteModal.note.title} /> : <span>{noteModal.note.brand.slice(0, 2)}</span>}
+                    {noteDetail.coverUrl ? <img src={noteDetail.coverUrl} alt={noteDetail.title || noteDisplayTitle(noteModal.note)} /> : <span>{noteDisplayBrand(noteModal.note).slice(0, 2)}</span>}
                     {noteDetail.topics.length > 0 && (
                       <div className="creator-audit-note-cover-tags">
                         {noteDetail.topics.slice(0, 3).map(item => <span key={item}>{item}</span>)}
@@ -811,13 +902,31 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                 </div>
                 <div className="creator-audit-note-copy">
                   <div className="creator-audit-note-title-row">
-                    <strong>{noteDetail.title || noteModal.note.title || '标题待补'}</strong>
+                    <strong>{noteDetail.title || noteDisplayTitle(noteModal.note)}</strong>
                     {noteModal.note.noteType && <Badge variant="blue">{noteModal.note.noteType}</Badge>}
                   </div>
-                  <p>{noteDetail.content || noteModal.match.reason || '正文待补。当前先接入封面、标题和基础数据，真实正文解析后会在这里直接展示。'}</p>
+                  <p>{noteDetail.content || '正文待补。当前已有真实封面、标题或基础数据；补全笔记详情后会在这里展示正文。'}</p>
                   <div className="creator-audit-note-topic-row">
                     {noteDetail.topics.length ? noteDetail.topics.map(item => <span className="tag" key={item}>{item}</span>) : <span className="tag creator-audit-risk">话题待补</span>}
                   </div>
+                </div>
+                <div className="creator-audit-note-comments-card">
+                  <div className="creator-audit-note-data-head">
+                    <div><MessageSquare size={14} /><strong>精选评论</strong></div>
+                    <span>{noteDetail.comments.length ? `${noteDetail.comments.length} 条样本` : '暂无样本'}</span>
+                  </div>
+                  {noteDetail.comments.length ? (
+                    <div className="creator-audit-note-comment-list">
+                      {noteDetail.comments.map((comment, index) => (
+                        <p key={`${comment}-${index}`}>{comment}</p>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="creator-audit-note-comment-empty">暂无评论样本，补全笔记详情后会展示真实评论。</p>
+                  )}
+                  {(noteModal.note.commentSummary || noteModal.note.comment_summary) && (
+                    <p className="creator-audit-note-comment-summary">{noteModal.note.commentSummary || noteModal.note.comment_summary}</p>
+                  )}
                 </div>
                 <div className="creator-audit-note-data-card">
                   <div className="creator-audit-note-data-head">

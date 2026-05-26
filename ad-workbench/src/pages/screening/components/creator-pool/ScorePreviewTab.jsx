@@ -24,11 +24,13 @@ import {
   getCreatorCategory,
   getCreatorCollectedAt,
   getCreatorDetailStatus,
+  getCreatorDisplayTier,
   getCreatorFollowupInfo,
   getCreatorIntro,
   getCreatorLocation,
   getCreatorRecommendation,
   getCreatorTagGroups,
+  getCreatorPrioritySignals,
   getCreatorTags,
   getCreatorUpdateLog,
   getCreatorXhsId,
@@ -37,10 +39,11 @@ import {
   pickCreatorValue,
   uniqueCompactItems,
 } from '../../utils/creatorMappers';
-import { getPoolStage, getReviewVariant, getScoreColor, getScoreTier } from '../../utils/creatorScoring';
+import { getPoolStage, getReviewVariant, getScoreColor } from '../../utils/creatorScoring';
 import { PgyInviteModal } from '../pgy-invite/PgyInviteModal';
 
 export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, onPgyInvite }) {
+  const pageSize = 60;
   const [poolData, setPoolData] = useState(null);
   const [poolMessage, setPoolMessage] = useState('');
   const creators = useMemo(() => {
@@ -59,6 +62,7 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
   const [activeStage, setActiveStage] = useState('合格达人待合作');
   const [collectionDateFilter, setCollectionDateFilter] = useState('全部');
   const [activeTagFilter, setActiveTagFilter] = useState('');
+  const [page, setPage] = useState(1);
   const [expandedId, setExpandedId] = useState(null);
   const [updateLogs, setUpdateLogs] = useState({});
   const [writebackSettings, setWritebackSettings] = useState({ auto_writeback_enabled: false });
@@ -86,6 +90,37 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
     if (collectionDateFilter === '全部') return creators;
     return creators.filter(creator => getDateKey(getCreatorCollectedAt(creator)) === collectionDateFilter);
   }, [collectionDateFilter, creators]);
+
+  const stageCreatorsForTagStats = useMemo(() => {
+    const result = Object.fromEntries(Object.keys(stageConfig).map(stage => [stage, []]));
+    if (poolData?.groups) {
+      Object.entries(poolData.groups).forEach(([stage, items]) => {
+        if (!stageConfig[stage]) return;
+        result[stage] = (items || [])
+          .map(mapBackendCreator)
+          .filter(creator => collectionDateFilter === '全部' || getDateKey(getCreatorCollectedAt(creator)) === collectionDateFilter);
+      });
+      return result;
+    }
+    dateFilteredCreators.forEach((creator, index) => {
+      const stage = getPoolStage(creator, index);
+      if (!result[stage]) result[stage] = [];
+      result[stage].push(creator);
+    });
+    return result;
+  }, [collectionDateFilter, dateFilteredCreators, poolData]);
+
+  const commonTagStatsByStage = useMemo(() => {
+    return Object.fromEntries(Object.entries(stageCreatorsForTagStats).map(([stage, items]) => {
+      const counts = new Map();
+      items.forEach(creator => {
+        getCreatorTags(creator).forEach(tag => {
+          counts.set(tag, (counts.get(tag) || 0) + 1);
+        });
+      });
+      return [stage, counts];
+    }));
+  }, [stageCreatorsForTagStats]);
 
   useEffect(() => {
     if (collectionDateFilter !== '全部' && !collectionDateOptions.some(([date]) => date === collectionDateFilter)) {
@@ -117,6 +152,10 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
 
   const visibleStages = [activeStage];
   const activeStageCreators = grouped[activeStage] || [];
+  const activeTagIsCommon = !activeTagFilter || (commonTagStatsByStage[activeStage]?.get(activeTagFilter) || 0) >= 2;
+  const visibleLimit = page * pageSize;
+  const visibleStageCreators = activeStageCreators.slice(0, visibleLimit);
+  const hasMoreStageCreators = visibleStageCreators.length < activeStageCreators.length;
   const activeStageTotal = useMemo(() => {
     if (poolData?.groups) {
       return (poolData.groups[activeStage] || [])
@@ -127,6 +166,29 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
     return dateFilteredCreators.filter(creator => getPoolStage(creator) === activeStage).length;
   }, [activeStage, collectionDateFilter, dateFilteredCreators, poolData]);
   const avgScore = poolData?.stats?.avg_score ?? (creators.length ? (creators.reduce((sum, creator) => sum + Number(creator.baseScore || 0), 0) / creators.length).toFixed(1) : '0.0');
+
+  useEffect(() => {
+    setPage(1);
+    setExpandedId(null);
+  }, [activeStage, activeTagFilter, collectionDateFilter]);
+
+  useEffect(() => {
+    if (!activeTagIsCommon) setActiveTagFilter('');
+  }, [activeTagIsCommon]);
+
+  useEffect(() => {
+    if (!hasMoreStageCreators) return undefined;
+    const handleScroll = () => {
+      const scrollBottom = window.innerHeight + window.scrollY;
+      const documentHeight = document.documentElement.scrollHeight;
+      if (documentHeight - scrollBottom < 520) {
+        setPage(value => value + 1);
+      }
+    };
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    handleScroll();
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, [hasMoreStageCreators]);
 
   const loadCreatorPool = useCallback(async () => {
     setPoolMessage('读取达人池中...');
@@ -177,6 +239,8 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
       const payload = await api('/api/projects/feishu/writeback', {
         method: 'POST',
         body: JSON.stringify({ project_id: project.id, quality_only: true, rows: [] }),
+        timeoutMs: 90000,
+        timeoutMessage: '写回飞书超过 90 秒未返回，已停止等待。请检查飞书权限、字段映射或网络后重试。',
       });
       await loadCreatorPool();
       setPoolMessage(`已写回 ${payload.written_count || 0} 位合格达人`);
@@ -328,6 +392,7 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
         {visibleStages.map(stage => {
           const cfg = stageConfig[stage];
           const stageCreators = grouped[stage] || [];
+          const displayCreators = stage === activeStage ? visibleStageCreators : stageCreators.slice(0, pageSize);
           return (
             <section key={stage} className="creator-pool-section">
               <div className="creator-pool-section-head">
@@ -347,20 +412,27 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
               {stageCreators.length === 0 ? (
                 <div className="creator-pool-empty">{activeTagFilter ? `暂无「${activeTagFilter}」标签达人` : '暂无达人'}</div>
               ) : (
+                <>
                 <div className="creator-pool-grid">
-                  {stageCreators.map((creator, index) => {
-                    const tier = getScoreTier(creator.baseScore);
+                  {displayCreators.map((creator, index) => {
+                    const tier = getCreatorDisplayTier(creator);
                     const logs = updateLogs[creator.id] || (stage === '已合作跟进中' ? [{ time: '2026-05-09 10:00:00', metrics: getCreatorUpdateLog(creator, index), operator: '系统同步' }] : []);
                     const avatarUrl = getCreatorAvatarUrl(creator);
                     const location = getCreatorLocation(creator);
                     const category = getCreatorCategory(creator);
                     const xhsId = getCreatorXhsId(creator);
                     const intro = getCreatorIntro(creator);
-                    const tags = getCreatorTags(creator);
                     const tagGroups = getCreatorTagGroups(creator);
+                    const commonTagCounts = commonTagStatsByStage[stage] || new Map();
+                    const commonTagGroups = Object.fromEntries(Object.entries(tagGroups).map(([group, items]) => [
+                      group,
+                      items.filter(item => (commonTagCounts.get(item) || 0) >= 2),
+                    ]));
+                    const hasCommonTags = Object.values(commonTagGroups).some(items => items.length);
                     const followup = getCreatorFollowupInfo(creator, stage);
                     const recommendation = getCreatorRecommendation(creator, stage);
                     const detailStatus = getCreatorDetailStatus(creator);
+                    const prioritySignals = getCreatorPrioritySignals(creator);
                     const platformMark = String(creator.type || '达').replace(/[\/\s].*$/, '').slice(0, 2);
                     const pgyUrl = getPgyUrl(creator);
                     const collectedAt = getCreatorCollectedAt(creator);
@@ -423,6 +495,9 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
 
                         <div className="creator-pool-card-meta">
                           <Badge variant={tier.variant}>{tier.label}</Badge>
+                          {prioritySignals.map(signal => (
+                            <span key={signal.label} className={`creator-pool-priority-signal creator-pool-priority-signal-${signal.tone}`}>{signal.label}</span>
+                          ))}
                           <Badge variant={detailStatus.variant}>{detailStatus.label}</Badge>
                           <Badge variant={getReviewVariant(creator.review)}>{creator.review || '待审核'}</Badge>
                           <span className="creator-pool-followup-pill">{followup.status}</span>
@@ -433,20 +508,20 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
                         <div className="creator-pool-tag-groups">
                           <div>
                             <span>人设</span>
-                            <div>{tagGroups.persona.length ? tagGroups.persona.map(item => renderTag(item, 'persona')) : <em>待补人设</em>}</div>
+                            <div>{commonTagGroups.persona.length ? commonTagGroups.persona.map(item => renderTag(item, 'persona')) : <em>暂无共性标签</em>}</div>
                           </div>
                           <div>
                             <span>内容</span>
-                            <div>{tagGroups.content.length ? tagGroups.content.map(item => renderTag(item, 'content')) : <em>待补内容</em>}</div>
+                            <div>{commonTagGroups.content.length ? commonTagGroups.content.map(item => renderTag(item, 'content')) : <em>暂无共性标签</em>}</div>
                           </div>
                           <div>
                             <span>数据</span>
-                            <div>{tagGroups.metric.length ? tagGroups.metric.map(item => renderTag(item, 'metric')) : <em>待补数据</em>}</div>
+                            <div>{commonTagGroups.metric.length ? commonTagGroups.metric.map(item => renderTag(item, 'metric')) : <em>暂无共性标签</em>}</div>
                           </div>
-                          {(tagGroups.risk.length || !tags.length) && (
+                          {(commonTagGroups.risk.length || !hasCommonTags) && (
                             <div className="creator-pool-risk-group">
-                              <span>风险</span>
-                              <div>{tagGroups.risk.length ? tagGroups.risk.map(item => renderTag(item, 'risk')) : <em className="creator-pool-safe">暂无明显风险</em>}</div>
+                              <span>优势</span>
+                              <div>{commonTagGroups.risk.length ? commonTagGroups.risk.map(item => renderTag(item, 'advantage')) : <em className="creator-pool-safe">暂无共性优势</em>}</div>
                             </div>
                           )}
                         </div>
@@ -510,6 +585,15 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
                     );
                   })}
                 </div>
+                <div style={{ padding: '12px 4px 0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, color: 'var(--text-secondary)' }}>
+                  <span>当前显示 {displayCreators.length} / {stageCreators.length} 位达人</span>
+                  {hasMoreStageCreators ? (
+                    <button className="btn btn-sm btn-secondary" onClick={() => setPage(value => value + 1)}>加载更多 60</button>
+                  ) : (
+                    <span>已显示全部</span>
+                  )}
+                </div>
+                </>
               )}
             </section>
           );

@@ -423,7 +423,6 @@ export default function WorkbenchLayout() {
             fontSize: '14px'
           }}>加载面板中...</div>}>
             <DashboardComponent
-              key={currentPath}
               selectedProjectId={selectedProjectId}
               onSelectedProjectIdChange={setSelectedProjectId}
             />
