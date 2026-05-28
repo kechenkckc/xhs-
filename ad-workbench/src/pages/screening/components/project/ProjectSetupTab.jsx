@@ -260,6 +260,19 @@ export function ProjectSetupTab({
     }
   };
 
+  const runAiFieldMapping = async () => {
+    if (!onLoadFields) return;
+    setFeishuStatus('正在使用大模型分析飞书字段映射...');
+    try {
+      const result = await onLoadFields(feishuForm.table_id, true);
+      setFeishuStatus(result?.message || '大模型字段映射分析完成');
+      return result;
+    } catch (error) {
+      setFeishuStatus(error.message || '大模型字段映射失败，请检查模型配置或飞书权限');
+      return null;
+    }
+  };
+
   const goToSection = (section) => {
     if (section.disabled) return;
     setActiveSection(section.key);
@@ -981,6 +994,11 @@ export function ProjectSetupTab({
                       return <option key={id} value={id}>{table.name || table.title || id}</option>;
                     })}
                   </select>
+                  <div style={{ marginTop: 10, display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <button type="button" className="btn btn-sm btn-secondary" onClick={runAiFieldMapping} title="使用大模型重新分析字段映射">
+                      AI 分析字段映射
+                    </button>
+                  </div>
                 </div>
               )}
 

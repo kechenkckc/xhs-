@@ -26,6 +26,24 @@ import {
 import { getCreatorAdRecommendation, getCreatorDeepAuditReason, getCreatorMatchProfile, getCreatorModelProfile, getScoreColor } from '../../utils/creatorScoring';
 import { CreatorRecentNotesPanel } from './CreatorRecentNotesPanel';
 
+function verdictVariant(value) {
+  if (['强推荐', '推荐'].includes(value)) return value === '强推荐' ? 'green' : 'blue';
+  if (['备选', '待人工确认'].includes(value)) return 'amber';
+  if (['不推荐', 'Pass'].includes(value)) return 'red';
+  return 'default';
+}
+
+function percentText(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '待补';
+  return `${Math.round(number * 100)}%`;
+}
+
+function listText(value, fallback = '暂无') {
+  const items = parseStructuredList(value);
+  return items.length ? items.join('、') : fallback;
+}
+
 export function CreatorDetailModal({ creator, project, onClose, onCollectDetails, onInvite, loadStatus = '' }) {
   const realNotes = useMemo(() => getCreatorRealNoteCases(creator), [creator]);
   const match = useMemo(() => getCreatorMatchProfile(creator, project), [creator, project]);
@@ -51,6 +69,10 @@ export function CreatorDetailModal({ creator, project, onClose, onCollectDetails
     : parseStructuredList(creator.raw?.evidence_quotes);
   const llmConfidence = Number(creator.llmConfidence ?? creator.raw?.llm_confidence);
   const confidenceLabel = Number.isFinite(llmConfidence) ? `${Math.round(llmConfidence * 100)}%` : '待生成';
+  const kocVerdict = creator.finalRecommendLevel || creator.projectMatchStatus || '';
+  const riskControl = creator.riskControlResult && typeof creator.riskControlResult === 'object' ? creator.riskControlResult : {};
+  const riskHardItems = Array.isArray(riskControl.hard) ? riskControl.hard : [];
+  const riskMissingItems = Array.isArray(riskControl.missing) ? riskControl.missing : [];
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -108,7 +130,52 @@ export function CreatorDetailModal({ creator, project, onClose, onCollectDetails
               <span>近期笔记</span>
               <strong>{realNotes.length}</strong>
             </div>
+            <div>
+              <span>KOC结论</span>
+              <strong>{kocVerdict || '待生成'}</strong>
+            </div>
           </div>
+
+          {(kocVerdict || creator.stage1Priority || creator.targetContentRatio !== undefined || creator.productSceneRatio !== undefined) && (
+            <section className="creator-detail-section">
+              <div className="creator-detail-section-head">
+                <h4>KOC二阶段评分</h4>
+                <Badge variant={verdictVariant(kocVerdict)}>{kocVerdict || '待二阶段'}</Badge>
+              </div>
+              <div className="creator-koc-score-grid">
+                <div>
+                  <span>一阶段优先级</span>
+                  <strong>{creator.stage1Priority || '待补'}</strong>
+                  <p>{creator.stage1Reason || '入库/补详情优先级待生成'}</p>
+                </div>
+                <div>
+                  <span>项目匹配置信度</span>
+                  <strong>{percentText(creator.projectMatchConfidence)}</strong>
+                  <p>{creator.projectMatchStatus || '二阶段结论待生成'}</p>
+                </div>
+                <div>
+                  <span>目标内容占比</span>
+                  <strong>{percentText(creator.targetContentRatio)}</strong>
+                  <p>{listText(creator.targetContentEvidence, '学习/留学内容证据待补')}</p>
+                </div>
+                <div>
+                  <span>产品场景占比</span>
+                  <strong>{percentText(creator.productSceneRatio)}</strong>
+                  <p>{listText(creator.productSceneEvidence, '听课/笔记/复盘场景证据待补')}</p>
+                </div>
+                <div>
+                  <span>冲突内容占比</span>
+                  <strong>{percentText(creator.conflictContentRatio)}</strong>
+                  <p>{listText(creator.conflictContentCategories, '暂无明显冲突类目')}</p>
+                </div>
+                <div>
+                  <span>推荐形态</span>
+                  <strong>{creator.recommendedFormat || '待补'}</strong>
+                  <p>{riskHardItems.length ? `硬风险：${riskHardItems.join('、')}` : riskMissingItems.length ? `待补：${riskMissingItems.join('、')}` : '无明显硬风险'}</p>
+                </div>
+              </div>
+            </section>
+          )}
 
           <section className="creator-detail-section">
             <div className="creator-detail-section-head">

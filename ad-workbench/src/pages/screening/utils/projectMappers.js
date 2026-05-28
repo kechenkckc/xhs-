@@ -74,6 +74,7 @@ export function mapBackendProject(item, creators = [], feishuConfig = null, crea
       passed: creatorStats?.passed ?? item.qualified_creator_count ?? 0,
       ratio: item.qualified_ratio || 0,
       rejected: creatorStats?.rejected ?? 0,
+      discarded: creatorStats?.discarded ?? 0,
       backup: creatorStats?.backup ?? 0,
       review: creatorStats?.review ?? 0,
       pending: creatorStats?.pending ?? 0,
@@ -124,17 +125,19 @@ export function getProjectStats(project, statusMap) {
   if (project.stats) {
     const backup = creators.filter(c => c.review === '备选').length;
     const rejected = creators.filter(c => c.review === '已驳回').length;
+    const discarded = creators.filter(c => c.review === '已废弃').length;
     const review = creators.filter(c => c.review === '待审核').length;
     const pending = creators.filter(c => c.review === '待补数据').length;
-    return { total: project.stats.total, passed: project.stats.passed, rejected, backup, review, pending };
+    return { total: project.stats.total, passed: project.stats.passed, rejected, discarded, backup, review, pending };
   }
   const sm = (statusMap || initialScreeningStatus)[project.id] || {};
   const passed = Object.values(sm).filter(s => s.review === '已通过').length;
   const rejected = Object.values(sm).filter(s => s.review === '已驳回' || s.review === '默认淘汰').length;
+  const discarded = Object.values(sm).filter(s => s.review === '已废弃').length;
   const backup = Object.values(sm).filter(s => s.review === '备选').length;
   const review = Object.values(sm).filter(s => s.review === '人工复核').length;
-  const pending = creators.length - passed - rejected - backup - review;
-  return { total: creators.length, passed, rejected, backup, review, pending };
+  const pending = creators.length - passed - rejected - discarded - backup - review;
+  return { total: creators.length, passed, rejected, discarded, backup, review, pending };
 }
 
 export function briefTextFromProject(project) {

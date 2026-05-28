@@ -161,6 +161,53 @@ def test_creators_endpoint_normalizes_display_tier_for_filtering():
     client.delete(f"/api/projects/{project_id}")
 
 
+def test_creator_stats_use_final_score_tier_not_rule_group_score():
+    project_id = "pytest_creator_stats_final_tier"
+    creator_id = "pytest-tier-final-bplus"
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO projects(project_id, project_name, target_qualified_creator_count, period_start, period_end, brief, screening_plan, created_at, updated_at)
+            VALUES (?, ?, 10, '2026-05-07', '2026-05-19', '', '{}', '2026-05-09 12:00:00', '2026-05-09 12:00:00')
+            """,
+            (project_id, project_id),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO creators_global(
+                creator_id, source, pgy_url, nickname, creator_type, persona_tags, ip_city, raw_payload, created_at, updated_at
+            )
+            VALUES (?, 'pgy', 'https://pgy.xiaohongshu.com/creator/final-bplus', '最终B+达人', 'KOC', '教育', '上海', '{}', '2026-05-09 12:00:00', '2026-05-09 12:00:00')
+            """,
+            (creator_id,),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO project_creators(project_id, creator_id, review_status, total_score, tier, created_at, updated_at)
+            VALUES (?, ?, '待审核', 78, 'B+', '2026-05-09 12:00:00', '2026-05-09 12:00:00')
+            """,
+            (project_id, creator_id),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO creator_scores(creator_id, total_score, rule_group_score, initial_tier, scored_at)
+            VALUES (?, 78, 98, 'S', '2026-05-09 12:00:00')
+            """,
+            (creator_id,),
+        )
+
+    light = client.get(f"/api/projects/{project_id}/creators")
+    assert light.status_code == 200
+    assert light.json()["creators"][0]["initial_tier"] == "B+"
+
+    stats = client.get(f"/api/projects/{project_id}/creators/stats")
+    assert stats.status_code == 200
+    assert stats.json()["tiers"]["S"] == 0
+    assert stats.json()["tiers"]["B+"] == 1
+
+    client.delete(f"/api/projects/{project_id}")
+
+
 def test_default_project_delete_does_not_recreate():
     project_id = "youdao_001"
     with connect() as conn:
@@ -422,7 +469,7 @@ def test_pgy_collect_batch_ingests_each_scheme_before_next_preflight(monkeypatch
 
     def fake_bulk_upsert_creators(project_id_arg, creators, score=False):
         ids = [creator["creator_id"] for creator in creators]
-        events.append("bulk:" + ",".join(ids))
+        events.append(f"bulk:{','.join(ids)}:score={score}")
         return [{"creator_id": creator_id, "action": "新增达人"} for creator_id in ids]
 
     def fake_queue_collect_scoring(project_id_arg, creator_ids, batch_id):
@@ -440,11 +487,10 @@ def test_pgy_collect_batch_ingests_each_scheme_before_next_preflight(monkeypatch
     assert events == [
         "preflight:first",
         "collect:first",
-        "bulk:first-creator",
+        "bulk:first-creator:score=True",
         "preflight:second",
         "collect:second",
-        "bulk:second-creator",
-        "score:first-creator,second-creator",
+        "bulk:second-creator:score=True",
     ]
     client.delete(f"/api/projects/{project_id}")
 
@@ -782,7 +828,8 @@ def test_pgy_collect_batch_adjusts_additional_filter_parameter_before_next_filte
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
-    assert [step["actual_recommend_count"] for step in payload["scheme_results"][0]["preflight"]["steps"]] == [5000, 2500, 2600, 2700, 2800, 2900, 1800]
+    steps = payload["scheme_results"][0]["preflight"]["steps"]
+    assert [step["actual_recommend_count"] for step in steps] == [5000, 2500, 2600, 2700, 2800, 2900, 1800]
     active_filters = payload["scheme_results"][0]["preflight"]["active_additional_filters"]
     active_pairs = [(item["field"], item["value"]) for item in active_filters]
     assert ("预估互动单价", "图文笔记互动单价/视频笔记互动单价≤30") in active_pairs
@@ -1937,6 +1984,110 @@ def test_normalize_scheme_filters_preserves_wan_units_and_splits_quote_subfields
     assert followers["value"] == "0.1万以上"
     assert followers["min"] == 1000
     assert [(item["sub_field"], item["max"]) for item in quotes] == [("图文笔记", 1000), ("视频笔记", 1000)]
+    assert scheme["expected_request_constraints"]["notePriceUpper"] == 1000
+    assert scheme["expected_request_constraints"]["videoPriceUpper"] == 1000
+    assert scheme["application_validation"]["on_mismatch"] == "repair_then_validate"
+    assert scheme["application_validation"]["stop_on_repair_failed"] is True
+
+
+def test_normalize_scheme_filters_parses_separate_video_quote_subfield():
+    from rpa_mcp_sync.web import _normalize_scheme_filter_structure
+
+    plan = {
+        "schemes": [
+            {
+                "required_filters": [
+                    {"field": "合作报价", "value": "图文笔记：0-1000", "sub_field": "图文笔记"},
+                    {"field": "合作报价", "value": "视频笔记：0-1000", "sub_field": "视频笔记"},
+                ]
+            }
+        ]
+    }
+
+    scheme = _normalize_scheme_filter_structure(plan)["schemes"][0]
+    quotes = [item for item in scheme["required_filters"] if item["field"] == "合作报价"]
+
+    assert [(item["sub_field"], item["min"], item["max"]) for item in quotes] == [("图文笔记", 0.0, 1000.0), ("视频笔记", 0.0, 1000.0)]
+    assert scheme["expected_request_constraints"]["notePriceUpper"] == 1000
+    assert scheme["expected_request_constraints"]["videoPriceUpper"] == 1000
+
+
+def test_scheme_plan_exposes_expected_request_constraints():
+    from rpa_mcp_sync.web import _scheme_plan
+
+    screening_plan = {"pgyCollectionPlan": {"filters": []}}
+    scheme = {
+        "required_filters": [
+            {"field": "博主类目", "value": "教育", "sub_value": "留学教育"},
+            {"field": "合作报价", "value": "图文笔记：0-1000；视频笔记：0-1000"},
+        ],
+        "enabled_additional_filters": [
+            {"field": "笔记类型", "value": "视频笔记为主"},
+            {"field": "阅读中位数", "value": "1000以上", "min": 1000},
+            {"field": "互动中位数", "value": "100以上", "min": 100},
+        ],
+    }
+
+    plan = _scheme_plan(screening_plan, scheme)
+    constraints = plan["pgyCollectionPlan"]["expected_request_constraints"]
+
+    assert constraints["contentTag"] == ["留学教育"]
+    assert constraints["notePriceUpper"] == 1000
+    assert constraints["videoPriceUpper"] == 1000
+    assert constraints["noteType"] == 2
+    assert constraints["readMidNor30_min"] == 1000
+    assert constraints["interMidNor30_min"] == 100
+
+
+def test_study_abroad_primary_schemes_enable_profile_filters():
+    from rpa_mcp_sync.web import ScreeningStandardPayload, _normalize_screening_standard
+
+    payload = ScreeningStandardPayload(
+        brief="有道留学听课宝，图文和视频都可，最好是视频，单达人预算1000以下koc；留学背景/海外留学生，内容需要50%以上学习类。",
+        fields=[],
+        samples=[],
+    )
+    result = {
+        "pgyCollectionPlan": {
+            "filters": [],
+            "schemes": [
+                {
+                    "scheme_id": "study_main",
+                    "name": "方案一：留学学习主池",
+                    "role": "primary",
+                    "required_filters": [
+                        {"field": "博主类目", "value": "教育", "sub_value": "留学教育"},
+                        {"field": "粉丝量", "value": "0.1万以上"},
+                        {"field": "合作报价", "value": "图文笔记：0-1000；视频笔记：0-1000"},
+                    ],
+                },
+                {
+                    "scheme_id": "video_focus",
+                    "name": "方案二：视频优先池",
+                    "role": "primary",
+                    "required_filters": [
+                        {"field": "博主类目", "value": "教育", "sub_value": "留学教育"},
+                        {"field": "粉丝量", "value": "0.1万以上"},
+                        {"field": "合作报价", "value": "图文笔记：0-1000；视频笔记：0-1000"},
+                    ],
+                },
+                {"scheme_id": "overseas_proxy", "name": "方案三：海外生活补量池", "required_filters": [{"field": "博主类目", "value": "生活记录", "sub_value": "中外生活"}]},
+                {"scheme_id": "edu_broad_proxy", "name": "方案四：广教育补量池", "required_filters": [{"field": "博主类目", "value": "教育", "sub_value": "语言教育"}]},
+            ],
+        }
+    }
+
+    plan = _normalize_screening_standard(result, payload)
+    schemes = plan["pgyCollectionPlan"]["schemes"]
+    main_enabled = {(item["field"], item["value"]) for item in schemes[0]["enabled_additional_filters"]}
+    video_enabled = {(item["field"], item["value"]) for item in schemes[1]["enabled_additional_filters"]}
+
+    assert ("职业身份", "学生") in main_enabled
+    assert ("特色背景", "留学背景") in main_enabled
+    assert ("职业身份", "学生") in video_enabled
+    assert ("特色背景", "留学背景") in video_enabled
+    assert schemes[0]["expected_request_constraints"]["personalTags"] == ["学生", "留学背景"]
+    assert schemes[1]["expected_request_constraints"]["noteType"] == 2
 
 
 def test_scheme_plan_does_not_treat_note_category_as_blogger_category():
@@ -2394,6 +2545,113 @@ def test_save_feishu_connection_precomputes_hidden_field_mapping(monkeypatch):
         path.unlink()
 
 
+def test_feishu_fields_uses_rule_mapping_by_default(monkeypatch):
+    from rpa_mcp_sync.feishu import FeishuTarget
+
+    project_id = "pytest_feishu_fields_rule_mapping"
+    path = feishu_connection_path(project_id)
+    if path.exists():
+        path.unlink()
+
+    class FakeFeishuClient:
+        def list_sheet_tabs(self, token):
+            return [{"sheet_id": "sheet123", "title": "达人表"}]
+
+        def list_sheet_fields(self, token, sheet_id):
+            return [{"field_name": "达人昵称", "column_index": 1}]
+
+    def fake_load_feishu_client(target_project_id):
+        assert target_project_id == project_id
+        return (
+            {"project_id": project_id, "feishu_url": "https://example.feishu.cn/sheets/token?sheet=sheet123", "field_mapping_cache": {}},
+            FakeFeishuClient(),
+            FeishuTarget("sheet", "token", "sheet123", "sheet_url"),
+        )
+
+    def fail_chat_json(*args, **kwargs):
+        raise AssertionError("field mapping should not call LLM unless use_ai_mapping=true")
+
+    monkeypatch.setattr("rpa_mcp_sync.web._load_feishu_client", fake_load_feishu_client)
+    monkeypatch.setattr("rpa_mcp_sync.feishu_field_agent.chat_json", fail_chat_json)
+
+    response = client.get(f"/api/projects/feishu/fields?project_id={project_id}&table_id=sheet123")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["field_mapping"]["source"] == "fallback"
+    assert payload["field_mapping"]["llm_count"] == 0
+    assert "本地规则" in payload["message"]
+    if path.exists():
+        path.unlink()
+
+
+def test_feishu_fields_ai_mapping_requires_explicit_query_and_refreshes_cache(monkeypatch):
+    from rpa_mcp_sync.feishu import FeishuTarget
+
+    project_id = "pytest_feishu_fields_ai_mapping"
+    path = feishu_connection_path(project_id)
+    if path.exists():
+        path.unlink()
+
+    fields = [{"field_name": "粉丝年龄25~44占比", "column_index": 1}]
+
+    class FakeFeishuClient:
+        def list_sheet_tabs(self, token):
+            return [{"sheet_id": "sheet123", "title": "达人表"}]
+
+        def list_sheet_fields(self, token, sheet_id):
+            return fields
+
+    def fake_load_feishu_client(target_project_id):
+        assert target_project_id == project_id
+        return (
+            {
+                "project_id": project_id,
+                "feishu_url": "https://example.feishu.cn/sheets/token?sheet=sheet123",
+                "field_mapping_cache": {
+                    "sheet:sheet123": {
+                        "source": "fallback",
+                        "field_signature": ["粉丝年龄25~44占比"],
+                        "mappings": [],
+                        "unmatched": [{"target_field": "粉丝年龄25~44占比", "reason": "old cache"}],
+                    }
+                },
+            },
+            FakeFeishuClient(),
+            FeishuTarget("sheet", "token", "sheet123", "sheet_url"),
+        )
+
+    calls = {"chat_json": 0}
+
+    def fake_chat_json(*args, **kwargs):
+        calls["chat_json"] += 1
+        return {
+            "mappings": [
+                {
+                    "target_field": "粉丝年龄25~44占比",
+                    "source_field": "粉丝年龄25-44占比",
+                    "confidence": 0.95,
+                    "reason": "explicit AI mapping",
+                }
+            ],
+            "unmatched": [],
+        }
+
+    monkeypatch.setattr("rpa_mcp_sync.web._load_feishu_client", fake_load_feishu_client)
+    monkeypatch.setattr("rpa_mcp_sync.feishu_field_agent.chat_json", fake_chat_json)
+
+    response = client.get(f"/api/projects/feishu/fields?project_id={project_id}&table_id=sheet123&use_ai_mapping=true")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert calls["chat_json"] == 1
+    assert payload["field_mapping"]["source"] == "llm"
+    assert payload["field_mapping"]["mappings"][0]["source_field"] == "粉丝年龄25-44占比"
+    assert "大模型" in payload["message"]
+    if path.exists():
+        path.unlink()
+
+
 def test_feishu_test_requires_secret_for_full_check():
     project_id = "pytest_missing_secret"
     path = feishu_connection_path(project_id)
@@ -2480,6 +2738,68 @@ def test_llm_config_roundtrip():
     )
     assert response.status_code == 200
     assert response.json()["config"]["protocol"] == "gemini"
+    if original is None:
+        if AI_PROVIDER_PATH.exists():
+            AI_PROVIDER_PATH.unlink()
+    else:
+        AI_PROVIDER_PATH.write_text(original, encoding="utf-8")
+
+
+def test_llm_config_supports_main_and_secondary_models():
+    original = AI_PROVIDER_PATH.read_text(encoding="utf-8") if AI_PROVIDER_PATH.exists() else None
+    response = client.post(
+        "/api/llm/config",
+        json={
+            "main_model": {
+                "protocol": "openai-compatible",
+                "base_url": "https://main.example.com/v1",
+                "model": "main-heavy",
+                "api_key_env": "MAIN_MODEL_KEY",
+                "temperature": 0.2,
+                "timeout_seconds": 300,
+            },
+            "secondary_model": {
+                "protocol": "openai-compatible",
+                "base_url": "https://secondary.example.com/v1",
+                "model": "secondary-batch",
+                "api_key_env": "SECONDARY_MODEL_KEY",
+                "temperature": 0.1,
+                "timeout_seconds": 120,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    config = response.json()["config"]
+    assert config["model"] == "main-heavy"
+    assert config["main_model"]["model"] == "main-heavy"
+    assert config["secondary_model"]["model"] == "secondary-batch"
+    assert config["routing"]["brief_parsing"] == "main_model"
+    assert config["routing"]["creator_scoring"] == "secondary_model"
+
+    if original is None:
+        if AI_PROVIDER_PATH.exists():
+            AI_PROVIDER_PATH.unlink()
+    else:
+        AI_PROVIDER_PATH.write_text(original, encoding="utf-8")
+
+
+def test_llm_config_does_not_append_v1_to_base_url():
+    original = AI_PROVIDER_PATH.read_text(encoding="utf-8") if AI_PROVIDER_PATH.exists() else None
+
+    response = client.post(
+        "/api/llm/config",
+        json={
+            "protocol": "openai-compatible",
+            "base_url": "https://vip.123everything.com/",
+            "model": "gpt-5.4",
+            "api_key_env": "OPENAI_API_KEY",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["config"]["base_url"] == "https://vip.123everything.com"
+
     if original is None:
         if AI_PROVIDER_PATH.exists():
             AI_PROVIDER_PATH.unlink()
@@ -2678,6 +2998,53 @@ def test_save_project_replaces_stale_generic_fit_config_for_listening_product():
         conn.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
 
 
+def test_save_project_adds_format_budget_policy_and_hard_rules_for_listening_product():
+    project_id = "pytest_listening_format_budget_policy"
+
+    response = client.post(
+        f"/api/projects/{project_id}",
+        json={
+            "project_name": project_id,
+            "brief": "有道留学听课宝，图文和视频都可，最好是视频，单达人预算1000以下KOC；需要接过商单，回复率低于50%直接pass，近1个月内有更新，内容需要50%以上学习类。",
+            "screening_plan": {"briefType": "complex", "pgyCollectionPlan": {"filters": []}},
+        },
+    )
+
+    assert response.status_code == 200
+    saved_plan = json.loads(response.json()["project"]["screening_plan"])
+    assert saved_plan["formatBudgetPolicy"]["preferred_format"] == "视频"
+    assert saved_plan["formatBudgetPolicy"]["image_quote_cap"] == 1000
+    assert saved_plan["formatBudgetPolicy"]["video_quote_cap"] == 1000
+    assert saved_plan["formatBudgetPolicy"]["premium_exception_policy"]["data_top_percent"] == 5
+    assert saved_plan["formatBudgetPolicy"]["premium_exception_policy"]["max_budget_multiplier"] == 1.5
+    assert saved_plan["hardRules"]["must_have_commercial_order"] is True
+    assert saved_plan["hardRules"]["reply_rate_min"] == 0.5
+    assert saved_plan["hardRules"]["recent_update_days"] == 30
+    assert saved_plan["hardRules"]["must_have_study_content_ratio"] == 0.5
+    assert saved_plan["scoringCriteria"]["format_budget_policy"]["preferred_format"] == "视频"
+
+    with connect() as conn:
+        conn.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
+
+
+def test_normalize_screening_standard_outputs_koc_scoring_config_for_koc_brief():
+    from rpa_mcp_sync.web import ScreeningStandardPayload, _normalize_screening_standard
+
+    plan = _normalize_screening_standard(
+        {
+            "briefType": "complex",
+            "kocScoringConfig": {"stage1_thresholds": {"read_priority_min": 1500}},
+            "pgyCollectionPlan": {"schemes": []},
+        },
+        ScreeningStandardPayload(brief="KOC项目，单达人预算1000以内，优先学习类内容达人。"),
+    )
+
+    assert plan["kocScoringConfig"]["enabled"] is True
+    assert plan["kocScoringConfig"]["stage1_thresholds"]["read_priority_min"] == 1500
+    assert plan["kocScoringConfig"]["stage1_thresholds"]["interaction_strong_min"] == 274
+    assert plan["kocScoringConfig"]["detail_stage_rules"]["missing_evidence_status"] == "待人工确认"
+
+
 def test_optimize_screening_standard_uses_larger_llm_budget_and_reports_fallback(monkeypatch):
     captured = {}
 
@@ -2778,6 +3145,8 @@ def test_optimize_screening_standard_prunes_default_age_rule_for_study_abroad(mo
     assert "inferred_fans_age" in captured["prompt"]
     assert "蒲公英真实字段“粉丝年龄”的真实选项" in captured["prompt"]
     assert "不得为了凑满方案编造 Brief 没有依据的人群" in captured["prompt"]
+    assert "真实优质样本校准后的规则" in captured["prompt"]
+    assert "kocScoringConfig" in captured["prompt"]
     assert "负向约束，例如不优先孕期/低幼/泛生活方式妈妈等" not in captured["prompt"]
 
     with connect() as conn:
@@ -3414,6 +3783,100 @@ def test_creator_pool_api_and_csv_export():
     assert "接口达人池测试" in export.text
 
 
+def test_creator_create_and_update_do_not_score_by_default(monkeypatch):
+    project_id = "pytest_web_no_implicit_score"
+    creator_id = "pytest-web-no-implicit-score-001"
+
+    def fail_score_creator(*args, **kwargs):
+        raise AssertionError("creator create/update should not score unless explicitly requested")
+
+    monkeypatch.setattr("rpa_mcp_sync.creator_store.score_creator", fail_score_creator)
+
+    create = client.post(
+        f"/api/projects/{project_id}/creators",
+        json={
+            "data": {
+                "creator_id": creator_id,
+                "nickname": "默认不评分达人",
+                "pgy_url": "https://pgy.xiaohongshu.com/creator/no-implicit-score-001",
+                "quote_price": 7600,
+            }
+        },
+    )
+    assert create.status_code == 200
+
+    update = client.patch(
+        f"/api/projects/{project_id}/creators/{creator_id}",
+        json={"data": {"nickname": "更新也不默认评分", "quote_price": 8200}},
+    )
+    assert update.status_code == 200
+    client.delete(f"/api/projects/{project_id}")
+
+
+def test_score_api_manual_source_uses_rule_scoring(monkeypatch):
+    project_id = "pytest_web_manual_score_rule"
+    creator_id = "pytest-web-manual-rule-001"
+    client.post(
+        f"/api/projects/{project_id}/creators",
+        json={
+            "data": {
+                "creator_id": creator_id,
+                "nickname": "手动规则评分达人",
+                "pgy_url": "https://pgy.xiaohongshu.com/creator/manual-rule",
+                "followers_count": 3000,
+                "quote_price": 500,
+                "creator_type": "教育",
+            }
+        },
+    )
+
+    def fail_llm(*args, **kwargs):
+        raise AssertionError("source=manual 不应调用大模型")
+
+    monkeypatch.setattr("rpa_mcp_sync.creator_store.score_values_batch_with_llm", fail_llm)
+    response = client.post(
+        f"/api/projects/{project_id}/creators/score",
+        json={"creator_ids": [creator_id], "source": "manual"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "rule"
+    assert payload["sources"]["llm"] == 0
+    client.delete(f"/api/projects/{project_id}")
+
+
+def test_score_api_manual_ai_requires_explicit_confirmation(monkeypatch):
+    project_id = "pytest_web_manual_ai_confirm_required"
+    creator_id = "pytest-web-manual-ai-confirm-001"
+    client.post(
+        f"/api/projects/{project_id}/creators",
+        json={
+            "data": {
+                "creator_id": creator_id,
+                "nickname": "AI确认拦截达人",
+                "pgy_url": "https://pgy.xiaohongshu.com/creator/manual-ai-confirm",
+                "followers_count": 3000,
+                "quote_price": 500,
+                "creator_type": "教育",
+            }
+        },
+    )
+
+    def fail_llm(*args, **kwargs):
+        raise AssertionError("未确认 AI 评分不应调用大模型")
+
+    monkeypatch.setattr("rpa_mcp_sync.creator_store.score_values_batch_with_llm", fail_llm)
+    response = client.post(
+        f"/api/projects/{project_id}/creators/score",
+        json={"creator_ids": [creator_id], "source": "manual_ai"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "llm_score_confirmation_required"
+    client.delete(f"/api/projects/{project_id}")
+
+
 def test_creator_pool_api_keeps_unreviewed_scored_creators_in_screening(monkeypatch):
     project_id = "pytest_web_screening_gate"
     create = client.post(
@@ -3448,7 +3911,7 @@ def test_creator_pool_api_keeps_unreviewed_scored_creators_in_screening(monkeypa
     monkeypatch.setattr("rpa_mcp_sync.creator_store.score_values_batch_with_llm", fake_score_values_batch_with_llm)
     score = client.post(
         f"/api/projects/{project_id}/creators/score",
-        json={"creator_ids": ["pytest-web-screening-001"], "source": "manual_ai"},
+        json={"creator_ids": ["pytest-web-screening-001"], "source": "manual_ai", "confirm_large_llm_score": True},
     )
     assert score.status_code == 200
 
@@ -3487,7 +3950,7 @@ def test_score_creators_api_returns_readable_llm_failure(monkeypatch):
     monkeypatch.setattr("rpa_mcp_sync.creator_store.score_values_batch_with_llm", failing_score_values_batch_with_llm)
     score = client.post(
         f"/api/projects/{project_id}/creators/score",
-        json={"creator_ids": ["pytest-web-llm-failure-001"], "source": "manual_ai"},
+        json={"creator_ids": ["pytest-web-llm-failure-001"], "source": "manual_ai", "confirm_large_llm_score": True},
     )
 
     assert score.status_code == 502
@@ -3555,7 +4018,7 @@ def test_score_creators_api_reports_missing_llm_config(monkeypatch):
 
     score = client.post(
         f"/api/projects/{project_id}/creators/score",
-        json={"creator_ids": ["pytest-web-llm-config-missing-001"], "source": "manual_ai"},
+        json={"creator_ids": ["pytest-web-llm-config-missing-001"], "source": "manual_ai", "confirm_large_llm_score": True},
     )
 
     assert score.status_code == 400

@@ -22,6 +22,7 @@ PGY_ALL_NON_LIVE_METRICS = "全部非直播指标"
 PGY_DETAIL_SCREENSHOT_DIR = ROOT / "runtime" / "pgy_detail_screenshots"
 PGY_BLOGGER_CATEGORY_TAXONOMY_PATH = ROOT / "config" / "pgy_blogger_category_taxonomy.json"
 PGY_KOL_API_TEMPLATE_PATH = ROOT / "runtime" / "pgy_kol_api_template.json"
+PGY_CHROME_PROFILE_DIR = ROOT / "runtime" / "chrome-pgy-profile"
 PGY_DETAIL_COLLECT_CONCURRENCY = 3
 
 PGY_DISPLAY_METRICS = [
@@ -2054,7 +2055,6 @@ def _collect_detail_interaction_states(page: Any) -> dict[str, Any]:
     scale_metrics = (
         (
             raw.get("data_performance", {}).get("cooperation")
-            or raw.get("data_performance", {}).get("daily")
             or {}
         )
         .get("scale", {})
@@ -2065,7 +2065,6 @@ def _collect_detail_interaction_states(page: Any) -> dict[str, Any]:
     cost_metrics = (
         (
             raw.get("data_performance", {}).get("cooperation")
-            or raw.get("data_performance", {}).get("daily")
             or {}
         )
         .get("cost", {})
@@ -2977,7 +2976,14 @@ def _filter_already_selected(page: Any, item: dict[str, str]) -> bool:
         threshold_candidates = _filter_threshold_candidates(item)
         has_threshold = not threshold_candidates or any(candidate in selected_text for candidate in threshold_candidates)
         return bool(selected_text and field in selected_text and has_all_subfields and has_threshold)
+    single_sub_field = str(item.get("sub_field") or item.get("subField") or "").strip()
+    if not single_sub_field and isinstance(sub_fields, list) and len(sub_fields) == 1:
+        single_sub_field = str(sub_fields[0] or "").strip()
     threshold_candidates = _filter_threshold_candidates(item)
+    if single_sub_field:
+        has_subfield = _subfield_selected_in_text(selected_text, field, single_sub_field)
+        has_threshold = not threshold_candidates or any(candidate in selected_text for candidate in threshold_candidates)
+        return bool(selected_text and field in selected_text and has_subfield and has_threshold)
     if selected_text and field in selected_text and threshold_candidates and any(candidate in selected_text for candidate in threshold_candidates):
         return True
     values = [_clean_text(candidate) for candidate in _filter_value_candidates(item)]
@@ -2987,6 +2993,80 @@ def _filter_already_selected(page: Any, item: dict[str, str]) -> bool:
     if any(value in selected_text for value in values):
         return True
     return bool(field and field in selected_text and any(value and value in selected_text for value in values))
+
+
+def _blogger_category_parent_all_selected(page: Any, main_value: str) -> bool:
+    selected_text = _clean_text(_selected_filter_text(page))
+    main_text = _clean_text(main_value)
+    if not selected_text or not main_text or "博主类目" not in selected_text:
+        return False
+    return any(
+        marker in selected_text
+        for marker in [
+            f"{main_text}-全部",
+            f"{main_text}/全部",
+            f"{main_text}：全部",
+            f"{main_text}:全部",
+        ]
+    )
+
+
+def _remove_selected_filter_chip(page: Any, required_parts: list[str]) -> bool:
+    parts = [_clean_text(part) for part in required_parts if _clean_text(part)]
+    if not parts:
+        return False
+    try:
+        removed = page.evaluate(
+            """
+            parts => {
+              const clean = text => String(text || '').replace(/\\s+/g, '');
+              const visible = el => {
+                const style = window.getComputedStyle(el);
+                const box = el.getBoundingClientRect();
+                return style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0;
+              };
+              const closeSelector = [
+                '[class*="close"]',
+                '[class*="Close"]',
+                '[class*="icon-close"]',
+                '[aria-label*="关闭"]',
+                '[aria-label*="删除"]',
+                'svg',
+                'i',
+                'button'
+              ].join(',');
+              const candidates = Array.from(document.querySelectorAll('*'))
+                .filter(visible)
+                .map(el => ({ el, text: clean(el.innerText || el.textContent || '') }))
+                .filter(item => item.text && parts.every(part => item.text.includes(part)))
+                .filter(item => item.text.length <= 80 || /tag|chip|selected|filter/i.test(String(item.el.className || '')))
+                .sort((a, b) => a.text.length - b.text.length);
+              for (const { el } of candidates) {
+                const close = Array.from(el.querySelectorAll(closeSelector))
+                  .filter(visible)
+                  .sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left)[0];
+                if (close) {
+                  close.click();
+                  return true;
+                }
+                if (/×|x/i.test(el.textContent || '')) {
+                  el.click();
+                  return true;
+                }
+              }
+              return false;
+            }
+            """,
+            parts,
+        )
+    except Exception:
+        removed = False
+    if removed:
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+    return bool(removed)
 
 
 def _verify_filter_selected(page: Any, item: dict[str, Any]) -> bool:
@@ -3563,6 +3643,12 @@ def _install_kol_response_capture(page: Any) -> None:
         kols = data.get("kols") if isinstance(data, dict) else []
         if not isinstance(kols, list) or not kols:
             return
+        try:
+            total = data.get("total") or data.get("totalCount") or data.get("count")
+            if total not in (None, ""):
+                setattr(page, "_pgy_latest_api_total", int(float(str(total).replace(",", "").replace("，", ""))))
+        except Exception:
+            pass
         _remember_kol_api_kols(page, kols)
         try:
             request = response.request
@@ -3586,6 +3672,24 @@ def _reset_kol_response_capture_state(page: Any) -> None:
     setattr(page, "_pgy_api_kol_pool", [])
     setattr(page, "_pgy_api_kol_keys", set())
     setattr(page, "_pgy_latest_kol_request", {})
+    setattr(page, "_pgy_latest_api_total", None)
+
+
+def _kol_request_body(request: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(request, dict):
+        return {}
+    post_data = str(request.get("post_data") or request.get("body") or "")
+    if post_data:
+        try:
+            payload = json.loads(post_data)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+    url = str(request.get("url") or "")
+    try:
+        return dict(parse_qsl(urlsplit(url).query, keep_blank_values=True))
+    except Exception:
+        return {}
 
 
 def _kol_request_from_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any]:
@@ -3612,7 +3716,272 @@ def _current_kol_request_snapshot(page: Any) -> dict[str, Any]:
         "request": request,
         "latest_count": len(latest) if isinstance(latest, list) else 0,
         "pool_count": len(pool) if isinstance(pool, list) else 0,
+        "total_count": getattr(page, "_pgy_latest_api_total", None),
         "captured_at": _now_text(),
+    }
+
+
+def _request_payload_values(payload: dict[str, Any], key: str) -> list[Any]:
+    value = payload.get(key)
+    if value in (None, "", [], {}):
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _request_range_min(value: Any) -> float | None:
+    if not isinstance(value, list) or not value:
+        return None
+    try:
+        number = float(value[0])
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _request_range_max(value: Any) -> float | None:
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    try:
+        number = float(value[1])
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _numbers_equal(left: Any, right: Any) -> bool:
+    try:
+        return abs(float(left) - float(right)) < 0.0001
+    except (TypeError, ValueError):
+        return False
+
+
+def expected_kol_request_constraints_from_plan(plan: dict[str, Any] | None) -> dict[str, Any]:
+    constraints: dict[str, Any] = {}
+    filters = plan.get("filters") if isinstance(plan, dict) else []
+    for item in filters or []:
+        if not isinstance(item, dict):
+            continue
+        field = str(item.get("field") or "")
+        if field == "博主类目":
+            sub_value = str(item.get("sub_value") or item.get("subValue") or "").strip()
+            value = sub_value or str(item.get("value") or "").strip()
+            if value:
+                constraints.setdefault("contentTag", [])
+                if value not in constraints["contentTag"]:
+                    constraints["contentTag"].append(value)
+        elif field in {"家庭身份", "职业身份", "特色背景"}:
+            value = str(item.get("value") or "").strip()
+            if value:
+                constraints.setdefault("personalTags", [])
+                if value not in constraints["personalTags"]:
+                    constraints["personalTags"].append(value)
+        elif field == "笔记类型":
+            value = str(item.get("value") or "").strip()
+            if "视频" in value:
+                constraints["noteType"] = 2
+            elif "图文" in value:
+                constraints["noteType"] = 1
+        elif field == "合作报价":
+            _, max_value = _apply_range_policy(item, item.get("min"), item.get("max"))
+            if max_value in (None, ""):
+                _, max_value = _range_numbers_from_text(str(item.get("value") or ""))
+            for sub_field in _subfield_names_from_item(item, default=["图文笔记", "视频笔记"]):
+                if max_value in (None, ""):
+                    continue
+                if "视频" in sub_field:
+                    constraints["videoPriceUpper"] = max_value
+                elif "图文" in sub_field or "笔记" in sub_field:
+                    constraints["notePriceUpper"] = max_value
+        elif field == "阅读中位数":
+            min_value, max_value = _apply_range_policy(item, item.get("min"), item.get("max"))
+            if min_value in (None, ""):
+                min_value, _ = _range_numbers_from_text(str(item.get("value") or ""))
+            if min_value not in (None, ""):
+                constraints["readMidNor30_min"] = min_value
+        elif field == "互动中位数":
+            min_value, max_value = _apply_range_policy(item, item.get("min"), item.get("max"))
+            if min_value in (None, ""):
+                min_value, _ = _range_numbers_from_text(str(item.get("value") or ""))
+            if min_value not in (None, ""):
+                constraints["interMidNor30_min"] = min_value
+        elif field == "粉丝量":
+            min_value, max_value = _apply_range_policy(item, item.get("min"), item.get("max"))
+            if min_value in (None, ""):
+                min_value, _ = _range_numbers_from_text(str(item.get("value") or ""))
+            if min_value not in (None, ""):
+                constraints["fansNumberLower"] = min_value
+    return constraints
+
+
+def validate_kol_request_snapshot_against_plan(
+    snapshot: dict[str, Any] | None,
+    plan: dict[str, Any] | None,
+    *,
+    require_clean_pool: bool = True,
+) -> dict[str, Any]:
+    expected = expected_kol_request_constraints_from_plan(plan)
+    request = _kol_request_from_snapshot(snapshot)
+    body = _kol_request_body(request)
+    issues: list[str] = []
+    warnings: list[str] = []
+    latest_count = int((snapshot or {}).get("latest_count") or 0) if isinstance(snapshot, dict) else 0
+    pool_count = int((snapshot or {}).get("pool_count") or 0) if isinstance(snapshot, dict) else 0
+    if not request:
+        issues.append("未捕获蒲公英达人列表 API 请求")
+    if body.get("similarUserId"):
+        issues.append("当前请求仍包含 similarUserId，相似达人搜索会污染采前筛选结果")
+    if str(body.get("searchType") or "") == "0" and expected:
+        warnings.append("当前请求 searchType=0，可能是泛推荐或空筛选请求")
+    if require_clean_pool and latest_count and pool_count > latest_count:
+        warnings.append(f"API 池包含 {pool_count} 条，最新响应 {latest_count} 条；正式采集前应只沿用当前请求分页扩展，避免旧响应混入")
+
+    content_tags = [str(item) for item in _request_payload_values(body, "contentTag")]
+    for value in expected.get("contentTag") or []:
+        if value not in content_tags:
+            issues.append(f"请求体缺少 contentTag={value}")
+    personal_tags = [str(item) for item in _request_payload_values(body, "personalTags")]
+    for value in expected.get("personalTags") or []:
+        if value not in personal_tags:
+            issues.append(f"请求体缺少 personalTags={value}")
+    for key in ("notePriceUpper", "videoPriceUpper", "fansNumberLower"):
+        if key in expected and not _numbers_equal(body.get(key), expected[key]):
+            issues.append(f"请求体 {key}={body.get(key)!r} 与期望 {expected[key]!r} 不一致")
+    if "noteType" in expected and not _numbers_equal(body.get("noteType"), expected["noteType"]):
+        issues.append(f"请求体 noteType={body.get('noteType')!r} 与期望 {expected['noteType']!r} 不一致")
+    if "readMidNor30_min" in expected:
+        actual = _request_range_min(body.get("readMidNor30"))
+        if actual is None or actual < float(expected["readMidNor30_min"]):
+            issues.append(f"请求体 readMidNor30 下限 {actual!r} 未达到期望 {expected['readMidNor30_min']!r}")
+    if "interMidNor30_min" in expected:
+        actual = _request_range_min(body.get("interMidNor30"))
+        if actual is None or actual < float(expected["interMidNor30_min"]):
+            issues.append(f"请求体 interMidNor30 下限 {actual!r} 未达到期望 {expected['interMidNor30_min']!r}")
+    return {
+        "request_valid": not issues,
+        "expected_constraints": expected,
+        "actual_constraints": {
+            "searchType": body.get("searchType"),
+            "similarUserId": body.get("similarUserId"),
+            "contentTag": body.get("contentTag"),
+            "personalTags": body.get("personalTags"),
+            "fansNumberLower": body.get("fansNumberLower"),
+            "fansNumberUpper": body.get("fansNumberUpper"),
+            "readMidNor30": body.get("readMidNor30"),
+            "interMidNor30": body.get("interMidNor30"),
+            "noteType": body.get("noteType"),
+            "notePriceUpper": body.get("notePriceUpper"),
+            "videoPriceUpper": body.get("videoPriceUpper"),
+        },
+        "issues": issues,
+        "warnings": warnings,
+    }
+
+
+def _base_kol_request_for_repair(page: Any, snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    request = _kol_request_from_snapshot(snapshot)
+    if request:
+        return request
+    request = _kol_request_from_snapshot(getattr(page, "_pgy_latest_kol_request", {}) or {})
+    if request:
+        return request
+    template = _read_kol_api_template()
+    request = _kol_request_from_snapshot(template)
+    if request:
+        return request
+    return {
+        "url": "https://pgy.xiaohongshu.com/api/solar/cooperator/blogger/v2",
+        "method": "POST",
+        "post_data": "{}",
+    }
+
+
+def _repair_kol_request_from_constraints(
+    page: Any,
+    snapshot: dict[str, Any] | None,
+    plan: dict[str, Any] | None,
+) -> dict[str, Any]:
+    expected = expected_kol_request_constraints_from_plan(plan)
+    if not expected:
+        return {}
+    base_request = _base_kol_request_for_repair(page, snapshot)
+    body = _kol_request_body(base_request)
+    if not body:
+        body = {}
+    for key in ("similarUserId", "similarWord", "filterList"):
+        if key in body:
+            if key == "filterList":
+                body[key] = []
+            else:
+                body.pop(key, None)
+    body["searchType"] = 1
+    body["pageNum"] = 1
+    body["pageSize"] = int(body.get("pageSize") or 20)
+    if expected.get("contentTag"):
+        body["contentTag"] = expected["contentTag"]
+    if expected.get("personalTags"):
+        current = [str(item) for item in body.get("personalTags") or [] if str(item)]
+        for tag in expected["personalTags"]:
+            if tag not in current:
+                current.append(tag)
+        body["personalTags"] = current
+    if "noteType" in expected:
+        body["noteType"] = expected["noteType"]
+    if "fansNumberLower" in expected:
+        body["fansNumberLower"] = expected["fansNumberLower"]
+        body.setdefault("fansNumberUpper", None)
+    if "readMidNor30_min" in expected:
+        body["readMidNor30"] = [expected["readMidNor30_min"], -1]
+    if "interMidNor30_min" in expected:
+        body["interMidNor30"] = [expected["interMidNor30_min"], -1]
+    if "notePriceUpper" in expected:
+        body["notePriceLower"] = body.get("notePriceLower", -1)
+        body["notePriceUpper"] = expected["notePriceUpper"]
+    if "videoPriceUpper" in expected:
+        body["videoPriceLower"] = body.get("videoPriceLower", -1)
+        body["videoPriceUpper"] = expected["videoPriceUpper"]
+    repaired = {
+        "url": str(base_request.get("url") or "https://pgy.xiaohongshu.com/api/solar/cooperator/blogger/v2"),
+        "method": "POST",
+        "post_data": json.dumps(body, ensure_ascii=False),
+    }
+    return repaired
+
+
+def _repair_kol_capture_for_plan(
+    page: Any,
+    snapshot: dict[str, Any] | None,
+    plan: dict[str, Any] | None,
+) -> dict[str, Any]:
+    repaired_request = _repair_kol_request_from_constraints(page, snapshot, plan)
+    if not repaired_request:
+        return {"ok": False, "message": "没有可修复的期望请求约束"}
+    _apply_kol_request_source(page, repaired_request, clear_pool=True)
+    first_page = _fetch_kol_api_page(page, repaired_request, 1, int(_kol_request_body(repaired_request).get("pageSize") or 20))
+    repaired_snapshot = _current_kol_request_snapshot(page)
+    validation = validate_kol_request_snapshot_against_plan(repaired_snapshot, plan, require_clean_pool=False)
+    if not first_page:
+        return {
+            "ok": False,
+            "message": "已重组蒲公英 API 请求，但接口未返回达人",
+            "kol_request_snapshot": repaired_snapshot,
+            "kol_request_validation": validation,
+        }
+    if not validation.get("request_valid"):
+        return {
+            "ok": False,
+            "message": "已重组蒲公英 API 请求，但修复后仍未通过校验：" + "；".join(validation.get("issues") or []),
+            "kol_request_snapshot": repaired_snapshot,
+            "kol_request_validation": validation,
+        }
+    return {
+        "ok": True,
+        "message": "已自动修复为直接蒲公英 API 采集请求",
+        "kol_request_snapshot": repaired_snapshot,
+        "kol_request_validation": validation,
+        "repaired_request": repaired_request,
+        "first_page_count": len(first_page),
     }
 
 
@@ -3624,6 +3993,7 @@ def _restore_kol_request_snapshot(page: Any, snapshot: dict[str, Any] | None, *,
         setattr(page, "_pgy_latest_api_kols", [])
         setattr(page, "_pgy_api_kol_pool", [])
         setattr(page, "_pgy_api_kol_keys", set())
+        setattr(page, "_pgy_latest_api_total", None)
     setattr(page, "_pgy_latest_kol_request", request)
     return True
 
@@ -3731,31 +4101,46 @@ def _emit_collection_progress(callback: Any, payload: dict[str, Any]) -> None:
         pass
 
 
-def _prime_kol_api_capture(page: Any, reload_if_empty: bool = True) -> bool:
-    for _ in range(10):
+def _stop_requested(callback: Any) -> bool:
+    if not callable(callback):
+        return False
+    try:
+        return bool(callback())
+    except Exception:
+        return False
+
+
+def _prime_kol_api_capture(page: Any, reload_if_empty: bool = True, stop_callback: Any = None) -> bool:
+    for _ in range(4):
+        if _stop_requested(stop_callback):
+            return False
         kols = getattr(page, "_pgy_latest_api_kols", []) or []
         if isinstance(kols, list) and kols:
             return True
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(250)
+    if _stop_requested(stop_callback):
+        return False
     if not reload_if_empty:
         return False
     try:
         try:
             with page.expect_response(
                 lambda response: "/api/solar/cooperator/blogger/v2" in getattr(response, "url", ""),
-                timeout=12000,
+                timeout=6000,
             ):
-                page.reload(wait_until="domcontentloaded", timeout=30000)
+                page.reload(wait_until="domcontentloaded", timeout=12000)
         except Exception:
-            page.reload(wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(2500)
+            page.reload(wait_until="domcontentloaded", timeout=12000)
+        page.wait_for_timeout(1200)
     except Exception:
         return False
-    for _ in range(10):
+    for _ in range(4):
+        if _stop_requested(stop_callback):
+            return False
         kols = getattr(page, "_pgy_latest_api_kols", []) or []
         if isinstance(kols, list) and kols:
             return True
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(250)
     kols = getattr(page, "_pgy_latest_api_kols", []) or []
     return isinstance(kols, list) and bool(kols)
 
@@ -3819,17 +4204,24 @@ def _fetch_kol_api_page(page: Any, request_info: dict[str, Any], page_number: in
         payload = page.evaluate(
             """
             async ({ url, method, body }) => {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), 8000);
               const init = {
                 method,
                 credentials: 'include',
+                signal: controller.signal,
                 headers: {
                   'accept': 'application/json, text/plain, */*',
                   'content-type': 'application/json;charset=UTF-8'
                 }
               };
               if (method !== 'GET' && body) init.body = body;
-              const response = await fetch(url, init);
-              return await response.json();
+              try {
+                const response = await fetch(url, init);
+                return await response.json();
+              } finally {
+                clearTimeout(timer);
+              }
             }
             """,
             request_payload,
@@ -3840,19 +4232,25 @@ def _fetch_kol_api_page(page: Any, request_info: dict[str, Any], page_number: in
     kols = data.get("kols") if isinstance(data, dict) else []
     if not isinstance(kols, list):
         return []
+    try:
+        total = data.get("total") or data.get("totalCount") or data.get("count")
+        if total not in (None, ""):
+            setattr(page, "_pgy_latest_api_total", int(float(str(total).replace(",", "").replace("，", ""))))
+    except Exception:
+        pass
     valid_kols = [kol for kol in kols if isinstance(kol, dict)]
     _remember_kol_api_kols(page, valid_kols)
     return valid_kols
 
 
-def _append_expanded_api_creators(page: Any, creators: list[dict[str, Any]], seen: set[str], limit: int) -> int:
-    api_added = _expand_kol_api_pool(page, limit)
+def _append_expanded_api_creators(page: Any, creators: list[dict[str, Any]], seen: set[str], limit: int, stop_callback: Any = None) -> int:
+    api_added = _expand_kol_api_pool(page, limit, stop_callback=stop_callback)
     if not api_added:
         return 0
     return _append_api_creators(page, creators, seen, limit)
 
 
-def _expand_kol_api_pool(page: Any, limit: int, progress_callback: Any = None, mode: str = "api") -> int:
+def _expand_kol_api_pool(page: Any, limit: int, progress_callback: Any = None, mode: str = "api", stop_callback: Any = None) -> int:
     request_info = getattr(page, "_pgy_latest_kol_request", {}) or {}
     if not isinstance(request_info, dict) or not request_info.get("url"):
         return 0
@@ -3862,6 +4260,8 @@ def _expand_kol_api_pool(page: Any, limit: int, progress_callback: Any = None, m
     max_pages = max(2, min(80, int((max(limit, before) / page_size) + 6)))
     idle_rounds = 0
     for page_number in range(2, max_pages + 1):
+        if _stop_requested(stop_callback):
+            break
         current_count = len(getattr(page, "_pgy_api_kol_pool", []) or [])
         if current_count >= limit:
             break
@@ -3923,7 +4323,10 @@ def _collect_creators_from_api_pool(
     *,
     progress_callback: Any = None,
     mode: str = "api",
+    stop_callback: Any = None,
 ) -> list[dict[str, Any]]:
+    if _stop_requested(stop_callback):
+        return []
     request_info = getattr(page, "_pgy_latest_kol_request", {}) or {}
     if not isinstance(request_info, dict) or not request_info.get("url"):
         return []
@@ -3938,8 +4341,10 @@ def _collect_creators_from_api_pool(
                 progress_callback,
                 {"mode": mode, "page_number": 1, "collected_count": min(before, limit), "limit": limit, "page_size": len(first_page)},
             )
+    if _stop_requested(stop_callback):
+        return creators
     _append_api_creators(page, creators, seen, limit)
-    _expand_kol_api_pool(page, limit, progress_callback=progress_callback, mode=mode)
+    _expand_kol_api_pool(page, limit, progress_callback=progress_callback, mode=mode, stop_callback=stop_callback)
     _append_api_creators(page, creators, seen, limit)
     if creators:
         _write_kol_api_template({"request": request_info}, source=mode)
@@ -5257,6 +5662,21 @@ def _merge_detail_payload(detail: dict[str, Any], extra: dict[str, Any]) -> dict
     return merged
 
 
+def _annotate_quote_sources(detail: dict[str, Any], source: str) -> dict[str, Any]:
+    if not detail:
+        return detail
+    annotated = {**detail}
+    raw = annotated.get("raw_payload") if isinstance(annotated.get("raw_payload"), dict) else {}
+    quote_sources = raw.get("quote_sources") if isinstance(raw.get("quote_sources"), dict) else {}
+    if annotated.get("quote_price") not in (None, ""):
+        quote_sources["quote_price"] = source
+    if annotated.get("video_quote_price") not in (None, ""):
+        quote_sources["video_quote_price"] = source
+    if quote_sources:
+        annotated["raw_payload"] = {**raw, "quote_sources": quote_sources}
+    return annotated
+
+
 def _finalize_detail_payload(detail: dict[str, Any]) -> dict[str, Any]:
     if not detail:
         return detail
@@ -5312,6 +5732,7 @@ def _collect_first_detail_for_creator(context: Any, row: Any, detail_url: str = 
         detail = _merge_detail_payload(detail, _capture_audience_profile_screenshot(detail_page, detail))
         detail = _merge_note_details_into_payload(detail)
         detail = _annotate_note_cases_with_traffic_reference(detail)
+        detail = _annotate_quote_sources(detail, "pgy_detail_one_price")
         return _finalize_detail_payload(detail)
     finally:
         try:
@@ -5339,6 +5760,7 @@ def _collect_detail_by_url(context: Any, url: str) -> dict[str, Any]:
         detail = _merge_detail_payload(detail, _capture_audience_profile_screenshot(detail_page, detail))
         detail = _merge_note_details_into_payload(detail)
         detail = _annotate_note_cases_with_traffic_reference(detail)
+        detail = _annotate_quote_sources(detail, "pgy_detail_one_price")
         return _finalize_detail_payload(detail)
     finally:
         try:
@@ -5776,6 +6198,9 @@ def _extract_current_creator_page(
             if detail:
                 raw_payload = creator.get("raw_payload") if isinstance(creator.get("raw_payload"), dict) else {}
                 detail_raw = detail.pop("raw_payload", {})
+                for price_field in ("quote_price", "video_quote_price"):
+                    if price_field in detail and detail.get(price_field) not in (None, ""):
+                        raw_payload[f"list_{price_field}"] = creator.get(price_field)
                 creator.update({key: value for key, value in detail.items() if value not in ("", None)})
                 creator["raw_payload"] = {**raw_payload, "detail": detail_raw}
         creators.append(creator)
@@ -5793,13 +6218,18 @@ def _extract_visible_creators(
     detail_limit: int | None = None,
     api_first: bool = True,
     progress_callback: Any = None,
+    stop_callback: Any = None,
 ) -> list[dict[str, Any]]:
+    if _stop_requested(stop_callback):
+        return []
     if api_first:
         for mode, prepare in [
             ("api_snapshot", lambda: bool(_kol_request_from_snapshot(getattr(page, "_pgy_latest_kol_request", {}) or {}))),
             ("api_browser_capture", lambda: _capture_kol_api_from_browser(page)),
             ("api_template", lambda: _restore_kol_request_from_template(page)),
         ]:
+            if _stop_requested(stop_callback):
+                return []
             _emit_collection_progress(
                 progress_callback,
                 {"mode": f"{mode}_start", "collected_count": 0, "limit": limit},
@@ -5810,7 +6240,7 @@ def _extract_visible_creators(
                     {"mode": f"{mode}_failed", "collected_count": 0, "limit": limit},
                 )
                 continue
-            api_creators = _collect_creators_from_api_pool(page, limit, progress_callback=progress_callback, mode=mode)
+            api_creators = _collect_creators_from_api_pool(page, limit, progress_callback=progress_callback, mode=mode, stop_callback=stop_callback)
             if api_creators:
                 return api_creators
             _emit_collection_progress(
@@ -5830,6 +6260,8 @@ def _extract_visible_creators(
     if api_matches_rows:
         _append_api_creators(page, creators, seen, limit)
     for _ in range(max_rounds):
+        if _stop_requested(stop_callback):
+            break
         before_count = len(creators)
         _extract_current_creator_page(
             page,
@@ -5846,7 +6278,7 @@ def _extract_visible_creators(
         if len(creators) >= limit:
             break
         added = len(creators) - before_count
-        api_appended = _append_expanded_api_creators(page, creators, seen, limit) if api_matches_rows else 0
+        api_appended = _append_expanded_api_creators(page, creators, seen, limit, stop_callback=stop_callback) if api_matches_rows else 0
         if api_appended:
             idle_rounds = 0
             if len(creators) >= limit:
@@ -5891,7 +6323,7 @@ def _extract_visible_creators(
             if _creator_table_signature(page) != before_signature:
                 idle_rounds = 0
                 continue
-        api_added = _append_expanded_api_creators(page, creators, seen, limit) if api_matches_rows else 0
+        api_added = _append_expanded_api_creators(page, creators, seen, limit, stop_callback=stop_callback) if api_matches_rows else 0
         if api_added:
             idle_rounds = 0
             if len(creators) >= limit:
@@ -5968,6 +6400,8 @@ def _click_filter_tag(page: Any, text: str) -> bool:
 def _click_blogger_category_subcategory(page: Any, main_value: str, sub_value: str) -> bool:
     if not main_value or not sub_value:
         return False
+    if _blogger_category_parent_all_selected(page, main_value):
+        _remove_selected_filter_chip(page, ["博主类目", main_value, "全部"])
     main_pattern = re.compile(f"^\\s*{re.escape(main_value)}\\s*$")
     main_locators = [
         page.locator(".blogger-list_filter .tag, .blogger-list_filter .selector-body-options *").filter(has_text=main_pattern),
@@ -5988,6 +6422,24 @@ def _click_blogger_category_subcategory(page: Any, main_value: str, sub_value: s
                     main.hover(timeout=1500)
                 except Exception:
                     pass
+                try:
+                    box = main.bounding_box(timeout=800)
+                    if box:
+                        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                except Exception:
+                    pass
+                try:
+                    main.evaluate(
+                        """
+                        node => {
+                          for (const type of ['mouseenter', 'mouseover', 'mousemove']) {
+                            node.dispatchEvent(new MouseEvent(type, { bubbles: true, view: window }));
+                          }
+                        }
+                        """
+                    )
+                except Exception:
+                    pass
                 page.wait_for_timeout(500)
                 for selector in [
                     ".d-popover .tag",
@@ -5995,19 +6447,11 @@ def _click_blogger_category_subcategory(page: Any, main_value: str, sub_value: s
                     ".d-popover *",
                     ".filter-select-popover .tag",
                     ".filter-select-popover *",
-                    ".blogger-list_filter .selector-body-options *",
-                    ".blogger-list_filter *",
                 ]:
                     sub = page.locator(selector).filter(has_text=re.compile(f"^\\s*{re.escape(sub_value)}\\s*$")).first
                     if not sub.count() or not _is_visible(sub):
                         continue
                     if _click_locator(page, sub, timeout=1800):
-                        page.wait_for_timeout(700)
-                        return True
-                if _click_locator(page, main, timeout=1500):
-                    page.wait_for_timeout(500)
-                    sub = page.get_by_text(sub_value, exact=True).first
-                    if sub.count() and _is_visible(sub) and _click_locator(page, sub, timeout=1800):
                         page.wait_for_timeout(700)
                         return True
             except Exception:
@@ -6433,6 +6877,10 @@ def _last_visible_popover(page: Any, selector: str = ".d-popover, .filter-select
 
 def _subfield_aliases(field: str, sub_field: str) -> list[str]:
     aliases = [sub_field]
+    if field == "合作报价" and sub_field == "图文笔记":
+        aliases.extend(["图文报价", "图文笔记报价", "图文笔记一口价"])
+    if field == "合作报价" and sub_field == "视频笔记":
+        aliases.extend(["视频报价", "视频笔记报价", "视频笔记一口价"])
     if field == "预估互动单价" and sub_field == "图文笔记互动单价":
         aliases.append("预估图文互动单价")
     if field == "预估互动单价" and sub_field == "视频笔记互动单价":
@@ -7026,7 +7474,8 @@ def _ensure_display_metrics(page: Any, metrics: list[str]) -> dict[str, list[dic
     return {"selected_metrics": selected, "skipped_metrics": skipped}
 
 
-def apply_collection_plan(page: Any, plan: dict[str, Any]) -> dict[str, Any]:
+def apply_collection_plan(page: Any, plan: dict[str, Any], stop_callback: Any = None, ensure_metrics: bool = True) -> dict[str, Any]:
+    _reset_kol_response_capture_state(page)
     applied: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
     grouped_marketing_goals: dict[str, list[dict[str, Any]]] = {}
@@ -7041,10 +7490,14 @@ def apply_collection_plan(page: Any, plan: dict[str, Any]) -> dict[str, Any]:
         else:
             regular_filters.append(item)
     for parent, items in grouped_marketing_goals.items():
+        if _stop_requested(stop_callback):
+            return {"applied_filters": applied, "skipped_filters": skipped, "selected_metrics": [], "skipped_metrics": [], "stopped": True}
         group_applied, group_skipped = _apply_marketing_goal_group(page, parent, items)
         applied.extend(group_applied)
         skipped.extend(group_skipped)
     for item in regular_filters:
+        if _stop_requested(stop_callback):
+            return {"applied_filters": applied, "skipped_filters": skipped, "selected_metrics": [], "skipped_metrics": [], "stopped": True}
         success, message = _apply_filter_item(page, item)
         if success and _filter_acceptance_required(item) and not _verify_filter_selected(page, item):
             success = False
@@ -7053,10 +7506,18 @@ def apply_collection_plan(page: Any, plan: dict[str, Any]) -> dict[str, Any]:
             applied.append({**item, "message": message})
         else:
             skipped.append({**item, "message": message})
+    if _stop_requested(stop_callback):
+        return {"applied_filters": applied, "skipped_filters": skipped, "selected_metrics": [], "skipped_metrics": [], "stopped": True}
     if applied:
         if not _wait_for_creator_table_change(page, before_signature, timeout_ms=12000):
             page.wait_for_timeout(2500)
-    metric_result = _ensure_display_metrics(page, [str(item) for item in plan.get("display_metrics") or []])
+    _reset_kol_response_capture_state(page)
+    if _stop_requested(stop_callback):
+        return {"applied_filters": applied, "skipped_filters": skipped, "selected_metrics": [], "skipped_metrics": [], "stopped": True}
+    _prime_kol_api_capture(page, reload_if_empty=True, stop_callback=stop_callback)
+    if _stop_requested(stop_callback):
+        return {"applied_filters": applied, "skipped_filters": skipped, "selected_metrics": [], "skipped_metrics": [], "stopped": True}
+    metric_result = _ensure_display_metrics(page, [str(item) for item in plan.get("display_metrics") or []]) if ensure_metrics else {"selected_metrics": [], "skipped_metrics": []}
     return {"applied_filters": applied, "skipped_filters": skipped, **metric_result}
 
 
@@ -7147,7 +7608,7 @@ def _clear_current_pgy_filters(page: Any) -> dict[str, Any]:
     }
 
 
-def _apply_relaxed_plan_after_empty_result(page: Any, plan: dict[str, Any], plan_result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _apply_relaxed_plan_after_empty_result(page: Any, plan: dict[str, Any], plan_result: dict[str, Any], stop_callback: Any = None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     current_plan = plan
     current_result = plan_result
     current_state = _read_visible_collection_state(page)
@@ -7156,16 +7617,18 @@ def _apply_relaxed_plan_after_empty_result(page: Any, plan: dict[str, Any], plan
 
     attempts = [("broad", False), ("unfiltered", True)]
     for stage, reset_filters in attempts:
+        if _stop_requested(stop_callback):
+            break
         relaxed_plan = _relaxed_collection_plan(plan, stage)
         if relaxed_plan is None:
             continue
         try:
             if reset_filters or "/solar/pre-trade/note/kol" not in page.url:
-                page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
+                page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=12000)
                 page.wait_for_timeout(1500)
         except Exception:
             pass
-        retry_result = apply_collection_plan(page, relaxed_plan) if relaxed_plan.get("filters") else {
+        retry_result = apply_collection_plan(page, relaxed_plan, stop_callback=stop_callback) if relaxed_plan.get("filters") else {
             "applied_filters": [],
             "skipped_filters": [],
             "selected_metrics": [],
@@ -7274,13 +7737,18 @@ def start_browser() -> dict[str, Any]:
     chrome = _find_chrome_exe()
     if not chrome:
         return {"connected": False, "message": "未找到 Chrome，请手动用调试端口启动浏览器"}
-    profile = ROOT / "runtime" / "chrome-pgy-profile"
+    profile = PGY_CHROME_PROFILE_DIR
     profile.mkdir(parents=True, exist_ok=True)
+    _prepare_chrome_profile_for_clean_start(profile)
     subprocess.Popen(
         [
             str(chrome),
             "--remote-debugging-port=9222",
             f"--user-data-dir={profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
             PGY_KOL_URL,
         ],
         stdout=subprocess.DEVNULL,
@@ -7288,6 +7756,33 @@ def start_browser() -> dict[str, Any]:
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     return {**browser_status(), "message": "已尝试启动独立 Chrome，请在打开的页面登录蒲公英"}
+
+
+def _prepare_chrome_profile_for_clean_start(profile: Path) -> None:
+    profile.mkdir(parents=True, exist_ok=True)
+    default_profile = profile / "Default"
+    for name in ["Last Session", "Last Tabs", "Current Session", "Current Tabs"]:
+        try:
+            (default_profile / name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    preferences_path = default_profile / "Preferences"
+    if not preferences_path.exists():
+        return
+    try:
+        preferences = json.loads(preferences_path.read_text(encoding="utf-8"))
+        if not isinstance(preferences, dict):
+            return
+        profile_prefs = preferences.setdefault("profile", {})
+        if isinstance(profile_prefs, dict):
+            profile_prefs["exit_type"] = "Normal"
+            profile_prefs["exited_cleanly"] = True
+        session_prefs = preferences.setdefault("session", {})
+        if isinstance(session_prefs, dict):
+            session_prefs["restore_on_startup"] = 0
+        preferences_path.write_text(json.dumps(preferences, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _select_pgy_list_page(context: Any, *, require_existing: bool = False) -> Any:
@@ -7343,7 +7838,7 @@ def _ensure_pgy_page_alive(context: Any, page: Any, *, preserve_existing_filters
     if preserve_existing_filters:
         return None
     page = context.new_page()
-    page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
+    page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=12000)
     page.wait_for_timeout(1500)
     return page
 
@@ -7360,6 +7855,7 @@ def collect_visible_list(
     preflight_only: bool = False,
     kol_request_snapshot: dict[str, Any] | None = None,
     progress_callback: Any = None,
+    stop_callback: Any = None,
     _recovery_attempt: int = 0,
 ) -> dict[str, Any]:
     if not browser_status()["connected"]:
@@ -7369,6 +7865,26 @@ def collect_visible_list(
     except ImportError:
         return {"ok": False, "message": "当前环境未安装 Playwright，无法执行真实页面采集"}
 
+    def stopped_payload(page: Any | None = None, **extra: Any) -> dict[str, Any]:
+        current_url = ""
+        try:
+            current_url = str(getattr(page, "url", "") or "") if page is not None else ""
+        except Exception:
+            current_url = ""
+        return {
+            "ok": False,
+            "stopped": True,
+            "message": "用户已停止当前采集",
+            "current_url": current_url,
+            "detail_collection": "stopped",
+            "export_result": {"status": "skipped", "message": "用户已停止当前采集"},
+            "creators": [],
+            **extra,
+        }
+
+    if _stop_requested(stop_callback):
+        return stopped_payload()
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
@@ -7376,6 +7892,13 @@ def collect_visible_list(
             preserve_existing_filters = bool(not apply_filters and not reset_filters)
             page = _select_pgy_list_page(context, require_existing=preserve_existing_filters)
             page = _ensure_pgy_page_alive(context, page, preserve_existing_filters=preserve_existing_filters)
+            try:
+                page.set_default_timeout(8000)
+                page.set_default_navigation_timeout(12000)
+            except Exception:
+                pass
+            if _stop_requested(stop_callback):
+                return stopped_payload(page)
             if page is None:
                 return {
                     "ok": False,
@@ -7390,6 +7913,8 @@ def collect_visible_list(
                 kol_request_snapshot,
                 clear_pool=True,
             )
+            if _stop_requested(stop_callback):
+                return stopped_payload(page)
             if (
                 "pgy.xiaohongshu.com" not in page.url
                 or "/solar/pre-trade/note/kol" not in page.url
@@ -7400,51 +7925,128 @@ def collect_visible_list(
                         "message": "当前页不是预检后的博主广场列表页，已停止以避免重置筛选条件",
                         "current_url": page.url,
                     }
-                page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=30000)
+                page.goto(PGY_KOL_URL, wait_until="domcontentloaded", timeout=12000)
+                if _stop_requested(stop_callback):
+                    return stopped_payload(page)
             if "/solar/pre-trade/note/kol" not in page.url:
                 return {"ok": False, "message": "请先打开蒲公英博主广场 / 找博主页面", "current_url": page.url}
             page.wait_for_timeout(1500)
+            if _stop_requested(stop_callback):
+                return stopped_payload(page)
             login_hint = page.locator("text=登录").first
             if login_hint.count() and "login" in page.url.lower():
                 return {"ok": False, "message": "蒲公英尚未登录，请在打开的 Chrome 页面完成登录", "current_url": page.url}
             if reset_filters and apply_filters:
                 _clear_current_pgy_filters(page)
+                if _stop_requested(stop_callback):
+                    return stopped_payload(page)
             plan = build_collection_plan(brief, screening_plan)
             plan_result = (
-                apply_collection_plan(page, plan)
+                apply_collection_plan(page, plan, stop_callback=stop_callback, ensure_metrics=not preflight_only)
                 if apply_filters
                 else {"applied_filters": [], "skipped_filters": [], "selected_metrics": [], "skipped_metrics": []}
             )
+            if plan_result.get("stopped") or _stop_requested(stop_callback):
+                return stopped_payload(page, collection_plan=plan, **plan_result)
             allow_api_reload = _should_reload_for_api_prime(
                 apply_filters=apply_filters,
                 preserve_existing_filters=preserve_existing_filters,
                 preflight_only=preflight_only,
             )
-            _prime_kol_api_capture(page, reload_if_empty=allow_api_reload and not restored_kol_snapshot)
+            _prime_kol_api_capture(page, reload_if_empty=allow_api_reload and not restored_kol_snapshot, stop_callback=stop_callback)
+            if _stop_requested(stop_callback):
+                return stopped_payload(page, collection_plan=plan, **plan_result)
             if (collect_profile_urls or include_details) and not getattr(page, "_pgy_latest_api_kols", []):
-                _prime_kol_api_capture(page, reload_if_empty=allow_api_reload and not restored_kol_snapshot)
+                _prime_kol_api_capture(page, reload_if_empty=allow_api_reload and not restored_kol_snapshot, stop_callback=stop_callback)
+                if _stop_requested(stop_callback):
+                    return stopped_payload(page, collection_plan=plan, **plan_result)
             active_plan = plan
             collection_state = _read_visible_collection_state(page)
             if apply_filters and collection_state["count"] == 0 and collection_state["empty_hint"]:
-                active_plan, plan_result, collection_state = _apply_relaxed_plan_after_empty_result(page, plan, plan_result)
+                active_plan, plan_result, collection_state = _apply_relaxed_plan_after_empty_result(page, plan, plan_result, stop_callback=stop_callback)
+                if plan_result.get("stopped") or _stop_requested(stop_callback):
+                    return stopped_payload(page, collection_plan=active_plan, **plan_result)
             recommendation_count = _extract_recommendation_count(page)
             request_snapshot = _current_kol_request_snapshot(page)
+            request_validation = validate_kol_request_snapshot_against_plan(request_snapshot, active_plan)
+            repair_result: dict[str, Any] = {}
+            repaired_capture = False
+            if apply_filters and request_validation.get("expected_constraints") and not request_validation.get("request_valid"):
+                if _stop_requested(stop_callback):
+                    return stopped_payload(page, collection_plan=active_plan, kol_request_snapshot=request_snapshot, kol_request_validation=request_validation, **plan_result, **recommendation_count)
+                original_request_issues = request_validation.get("issues") or []
+                repair_result = _repair_kol_capture_for_plan(page, request_snapshot, active_plan)
+                if _stop_requested(stop_callback):
+                    return stopped_payload(page, collection_plan=active_plan, kol_request_snapshot=request_snapshot, kol_request_validation=request_validation, kol_request_repair=repair_result, **plan_result, **recommendation_count)
+                if not repair_result.get("ok"):
+                    return {
+                        "ok": False,
+                        "message": "蒲公英页面筛选与真实 API 请求不一致，自动修复失败，已停止采集以避免误入库："
+                        + "；".join(request_validation.get("issues") or [])
+                        + f"；{repair_result.get('message') or ''}",
+                        "current_url": page.url,
+                        "collection_plan": active_plan,
+                        "kol_request_snapshot": repair_result.get("kol_request_snapshot") or request_snapshot,
+                        "kol_request_validation": repair_result.get("kol_request_validation") or request_validation,
+                        "kol_request_repair": repair_result,
+                        **plan_result,
+                        **recommendation_count,
+                        "detail_collection": "stopped_request_repair_failed",
+                        "export_result": {"status": "skipped", "message": "真实请求自动修复失败，未导出列表"},
+                        "creators": [],
+                    }
+                repaired_capture = True
+                request_snapshot = repair_result.get("kol_request_snapshot") or _current_kol_request_snapshot(page)
+                request_validation = repair_result.get("kol_request_validation") or validate_kol_request_snapshot_against_plan(request_snapshot, active_plan, require_clean_pool=False)
+                total_count = request_snapshot.get("total_count") if isinstance(request_snapshot, dict) else None
+                if total_count not in (None, ""):
+                    recommendation_count = {
+                        "actual_recommend_count": int(total_count),
+                        "actual_count_text": f"修复后 API 推荐 {int(total_count)} 位博主",
+                        "actual_count_is_lower_bound": False,
+                    }
+                elif repair_result.get("first_page_count") is not None:
+                    recommendation_count = {
+                        "actual_recommend_count": int(repair_result.get("first_page_count") or 0),
+                        "actual_count_text": f"修复后 API 首页返回 {int(repair_result.get('first_page_count') or 0)} 位博主",
+                        "actual_count_is_lower_bound": True,
+                    }
+                skipped = plan_result.get("skipped_filters") if isinstance(plan_result.get("skipped_filters"), list) else []
+                plan_result["skipped_filters"] = [
+                    *skipped,
+                    {
+                        "field": "真实请求自动修复",
+                        "value": "蒲公英达人列表 API",
+                        "message": repair_result.get("message") or "已重组请求并继续采集",
+                        "issues_before_repair": original_request_issues,
+                    },
+                ]
             if preflight_only:
                 return {
                     "ok": True,
                     "current_url": page.url,
                     "collection_plan": active_plan,
                     "kol_request_snapshot": request_snapshot,
+                    "kol_request_validation": request_validation,
+                    "kol_request_repair": repair_result,
                     **plan_result,
                     **recommendation_count,
                     "detail_collection": "preflight_only",
                     "export_result": {"status": "skipped", "message": "预检阶段不导出列表"},
                     "creators": [],
                 }
-            export_result = _export_current_table(page) if export_metrics else {"status": "skipped", "message": "本次未请求导出"}
+            export_result = (
+                {"status": "skipped", "message": "已自动修复为 API 采集，页面导出不代表修复后请求，跳过导出"}
+                if repaired_capture
+                else _export_current_table(page)
+                if export_metrics
+                else {"status": "skipped", "message": "本次未请求导出"}
+            )
+            if _stop_requested(stop_callback):
+                return stopped_payload(page, collection_plan=active_plan, export_result=export_result, kol_request_snapshot=request_snapshot, kol_request_validation=request_validation, kol_request_repair=repair_result, **plan_result, **recommendation_count)
             rows = collection_state["rows"]
             count = collection_state["count"]
-            if count == 0:
+            if count == 0 and not repaired_capture:
                 hint = collection_state.get("empty_hint")
                 message = (
                     f"蒲公英页面提示「{hint}」，系统已尝试自动放宽筛选但仍无可采集列表"
@@ -7458,6 +8060,7 @@ def collect_visible_list(
                     "collection_plan": active_plan,
                     "export_result": export_result,
                     "kol_request_snapshot": request_snapshot,
+                    "kol_request_validation": request_validation,
                     **plan_result,
                     **recommendation_count,
                 }
@@ -7465,12 +8068,15 @@ def collect_visible_list(
             creators = _extract_visible_creators(
                 page,
                 collect_limit,
-                include_details=include_details,
+                include_details=include_details and not repaired_capture,
                 collect_profile_urls=collect_profile_urls,
-                detail_limit=collect_limit if include_details else 0,
-                api_first=not include_details,
+                detail_limit=collect_limit if include_details and not repaired_capture else 0,
+                api_first=repaired_capture or not include_details,
                 progress_callback=progress_callback,
+                stop_callback=stop_callback,
             )
+            if _stop_requested(stop_callback):
+                return stopped_payload(page, collection_plan=active_plan, export_result=export_result, kol_request_snapshot=request_snapshot, kol_request_validation=request_validation, kol_request_repair=repair_result, **plan_result, **recommendation_count)
             if not creators:
                 return {
                     "ok": False,
@@ -7479,6 +8085,8 @@ def collect_visible_list(
                     "collection_plan": active_plan,
                     "export_result": export_result,
                     "kol_request_snapshot": request_snapshot,
+                    "kol_request_validation": request_validation,
+                    "kol_request_repair": repair_result,
                     **plan_result,
                     **recommendation_count,
                 }
@@ -7487,9 +8095,11 @@ def collect_visible_list(
                 "creators": creators,
                 "current_url": page.url,
                 "collection_plan": active_plan,
-                "detail_collection": "planned" if include_details else "skipped",
+                "detail_collection": "repaired_api" if repaired_capture else ("planned" if include_details else "skipped"),
                 "export_result": export_result,
                 "kol_request_snapshot": request_snapshot,
+                "kol_request_validation": request_validation,
+                "kol_request_repair": repair_result,
                 **recommendation_count,
                 **plan_result,
             }
@@ -7507,6 +8117,7 @@ def collect_visible_list(
                 preflight_only=preflight_only,
                 kol_request_snapshot=kol_request_snapshot,
                 progress_callback=progress_callback,
+                stop_callback=stop_callback,
                 _recovery_attempt=_recovery_attempt + 1,
             )
         return {"ok": False, "message": f"蒲公英采集失败：{error}"}

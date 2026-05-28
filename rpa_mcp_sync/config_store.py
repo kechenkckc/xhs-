@@ -36,6 +36,11 @@ def feishu_connection_path(project_id: str) -> Path:
     return PROJECT_CONFIG_DIR / f"{safe_id}.feishu.connection.json"
 
 
+def project_scoring_config_path(project_id: str) -> Path:
+    safe_id = "".join(ch for ch in project_id if ch.isalnum() or ch in "_-")
+    return PROJECT_CONFIG_DIR / f"{safe_id}.scoring.config.json"
+
+
 def public_feishu_config(config: dict[str, Any]) -> dict[str, Any]:
     result = dict(config)
     result.pop("app_secret", None)

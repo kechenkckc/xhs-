@@ -5797,6 +5797,11 @@ table {
   min-width: 188px;
 }
 
+.screening-review-col-koc {
+  width: 178px;
+  min-width: 178px;
+}
+
 .screening-review-col-model {
   width: 244px;
   min-width: 244px;
@@ -5842,9 +5847,38 @@ table {
 }
 
 .screening-review-cell-model,
+.screening-review-cell-koc,
 .screening-review-cell-risk,
 .screening-review-cell-comment {
   line-height: 1.5;
+}
+
+.screening-koc-summary {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.screening-koc-summary > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.screening-koc-summary small,
+.screening-koc-summary span,
+.screening-koc-empty {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.screening-koc-summary small {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  word-break: break-word;
 }
 
 .screening-review-cell-comment > div:first-child {
@@ -6129,6 +6163,9 @@ table {
   color: var(--text-secondary);
   font-size: var(--text-sm);
   line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 2;
 }
 
 .creator-audit-note-topic-row {
@@ -6390,7 +6427,7 @@ table {
 
 .creator-detail-summary {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: var(--space-3);
   margin-bottom: var(--space-4);
 }
@@ -6426,6 +6463,44 @@ table {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--space-3);
+}
+
+.creator-koc-score-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.creator-koc-score-grid > div {
+  min-width: 0;
+  padding: var(--space-3);
+  background: #f8fafc;
+  border: 1px solid #e5eaf1;
+  border-radius: var(--radius-md);
+}
+
+.creator-koc-score-grid span {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.creator-koc-score-grid strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.creator-koc-score-grid p {
+  display: -webkit-box;
+  margin: 8px 0 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: 1.55;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
 }
 
 .creator-model-grid > div,
@@ -7412,6 +7487,299 @@ table {
 .screening-api-provider-switch button.active {
   color: var(--text-primary);
   background: var(--accent-blue-subtle);
+}
+
+.screening-api-model-role-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+
+.screening-api-model-role-card {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: var(--space-4);
+  min-height: 96px;
+  padding: var(--space-4);
+  color: inherit;
+  text-align: left;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.screening-api-model-role-card.active {
+  border-color: var(--accent-blue);
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.09), rgba(16, 185, 129, 0.05)), var(--bg-primary);
+}
+
+.screening-api-model-role-card strong,
+.screening-api-model-role-card small,
+.screening-api-model-role-card em,
+.screening-api-model-role-card i {
+  display: block;
+}
+
+.screening-api-model-role-card strong {
+  color: var(--text-primary);
+  font-size: var(--text-base);
+}
+
+.screening-api-model-role-card small {
+  margin-top: var(--space-2);
+  color: var(--text-secondary);
+  line-height: var(--leading-relaxed);
+}
+
+.screening-api-model-role-aside {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-2);
+  min-width: 150px;
+}
+
+.screening-api-model-role-aside em {
+  max-width: 230px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-style: normal;
+  overflow-wrap: anywhere;
+}
+
+.screening-api-model-role-aside i {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-style: normal;
+}
+
+.api-settings-hero {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+
+.api-settings-eyebrow {
+  margin-bottom: var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.api-settings-hero h2 {
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.api-settings-hero p {
+  margin: var(--space-2) 0 0;
+  color: var(--text-secondary);
+}
+
+.api-settings-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.api-model-role-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.api-model-role-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: stretch;
+  gap: var(--space-4);
+  min-height: 104px;
+  padding: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+
+.api-model-role-card.active {
+  border-color: rgba(59, 130, 246, 0.55);
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.api-model-role-card strong,
+.api-model-role-card small,
+.api-model-role-card em,
+.api-model-role-card i {
+  display: block;
+}
+
+.api-model-role-card strong {
+  color: var(--text-primary);
+  font-size: var(--text-base);
+}
+
+.api-model-role-card small {
+  margin-top: 6px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.api-model-role-aside {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  min-width: 156px;
+}
+
+.api-model-role-aside em {
+  max-width: 220px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-style: normal;
+  overflow-wrap: anywhere;
+}
+
+.api-model-role-aside i {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-style: normal;
+}
+
+.api-settings-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: var(--space-4);
+}
+
+.api-form-stack {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.api-provider-switch {
+  display: inline-flex;
+  width: fit-content;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+}
+
+.api-provider-switch button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.api-provider-switch button.active {
+  border-color: rgba(59, 130, 246, 0.42);
+  background: rgba(59, 130, 246, 0.14);
+  color: var(--text-primary);
+}
+
+.api-form-control {
+  display: grid;
+  gap: 8px;
+}
+
+.api-form-control span {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
+
+.api-settings-status {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.api-settings-status-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.api-settings-status-row span {
+  color: var(--text-secondary);
+}
+
+.api-settings-status-row strong {
+  color: var(--text-primary);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.api-settings-note,
+.api-settings-feedback {
+  margin-top: var(--space-4);
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.api-settings-feedback {
+  margin-top: 0;
+  color: var(--text-primary);
+}
+
+@media (max-width: 980px) {
+  .screening-api-model-role-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .screening-api-model-role-card {
+    flex-direction: column;
+  }
+
+  .screening-api-model-role-aside {
+    align-items: flex-start;
+    min-width: 0;
+  }
+
+  .api-settings-hero,
+  .api-model-role-card {
+    flex-direction: column;
+  }
+
+  .api-model-role-grid,
+  .api-settings-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .api-model-role-aside {
+    align-items: flex-start;
+    min-width: 0;
+  }
 }
 
 .screening-api-control {

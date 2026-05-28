@@ -1,3 +1,5 @@
+import json
+
 from rpa_mcp_sync.creator_store import normalize_creator, parse_number, sanitize_creator_type
 from rpa_mcp_sync.pgy_browser import (
     _build_detail_collection_summary,
@@ -19,6 +21,8 @@ from rpa_mcp_sync.pgy_browser import (
     _prime_kol_api_capture,
     _should_reload_for_api_prime,
     _filter_already_selected,
+    _blogger_category_parent_all_selected,
+    _subfield_aliases,
     _detail_url_fields,
     _extract_detail_fields,
 )
@@ -45,13 +49,15 @@ def test_detail_url_fields_builds_xhs_profile_url_from_pgy_blogger_id():
 
 def test_extract_detail_fields_builds_xhs_profile_url_from_current_pgy_url():
     detail = _extract_detail_fields(
-        "笔记主页\n直播主页\n听课宝达人\n小红书号：\n95292130186\n北京\n无机构\n教育\n粉丝数\n1234",
+        "笔记主页\n直播主页\n听课宝达人\n小红书号：\n95292130186\n北京\n无机构\n教育\n粉丝数\n1234\n合作报价\n图文笔记一口价\n¥350\n视频笔记一口价\n¥800",
         "https://pgy.xiaohongshu.com/solar/pre-trade/blogger-detail/67e3aefa000000000d008d1b",
     )
 
     assert detail["xiaohongshu_id"] == "95292130186"
     assert detail["pgy_blogger_id"] == "67e3aefa000000000d008d1b"
     assert detail["profile_url"] == "https://www.xiaohongshu.com/user/profile/67e3aefa000000000d008d1b"
+    assert detail["quote_price"] == 350
+    assert detail["video_quote_price"] == 800
 
 
 def test_parse_row_text_prefers_table_follower_value_over_position_guess():
@@ -365,6 +371,161 @@ def test_selected_filter_text_confirms_all_required_subfields():
         page,
         {"field": "曝光中位数", "value": "2000以上", "min": 2000},
     )
+
+
+def test_selected_filter_text_does_not_treat_image_quote_as_video_quote():
+    class FakeLocator:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def inner_text(self, timeout=None):
+            return "\n".join(
+                [
+                    "合作报价：",
+                    "图文笔记：不限-1000",
+                    "重置",
+                    "存为常用筛选",
+                ]
+            )
+
+    class FakePage:
+        def locator(self, selector):
+            return FakeLocator()
+
+    page = FakePage()
+
+    assert _filter_already_selected(page, {"field": "合作报价", "sub_field": "图文笔记", "max": 1000})
+    assert not _filter_already_selected(page, {"field": "合作报价", "sub_field": "视频笔记", "max": 1000})
+    assert not _filter_already_selected(page, {"field": "合作报价", "sub_fields": ["图文笔记", "视频笔记"], "max": 1000})
+
+
+def test_quote_subfield_aliases_match_pgy_labels():
+    assert "图文笔记一口价" in _subfield_aliases("合作报价", "图文笔记")
+    assert "视频报价" in _subfield_aliases("合作报价", "视频笔记")
+
+
+def test_kol_request_validation_catches_empty_or_similar_request():
+    from rpa_mcp_sync.pgy_browser import validate_kol_request_snapshot_against_plan
+
+    plan = {
+        "filters": [
+            {"field": "博主类目", "value": "教育", "sub_value": "留学教育"},
+            {"field": "职业身份", "value": "学生"},
+            {"field": "特色背景", "value": "留学背景"},
+            {"field": "笔记类型", "value": "视频笔记为主"},
+            {"field": "合作报价", "value": "图文笔记：0-1000；视频笔记：0-1000", "sub_fields": ["图文笔记", "视频笔记"], "max": 1000},
+            {"field": "阅读中位数", "value": "1000以上", "min": 1000},
+            {"field": "互动中位数", "value": "100以上", "min": 100},
+        ]
+    }
+    invalid = {
+        "request": {
+            "url": "https://pgy.xiaohongshu.com/api/solar/cooperator/blogger/v2",
+            "method": "POST",
+            "post_data": json.dumps({"searchType": 0, "personalTags": [], "readMidNor30": [], "interMidNor30": [], "similarUserId": "abc"}, ensure_ascii=False),
+        },
+        "latest_count": 20,
+        "pool_count": 58,
+    }
+    valid = {
+        "request": {
+            "url": "https://pgy.xiaohongshu.com/api/solar/cooperator/blogger/v2",
+            "method": "POST",
+            "post_data": json.dumps(
+                {
+                    "searchType": 1,
+                    "contentTag": ["留学教育"],
+                    "personalTags": ["学生", "留学背景"],
+                    "noteType": 2,
+                    "readMidNor30": [1000, -1],
+                    "interMidNor30": [100, -1],
+                    "notePriceUpper": 1000,
+                    "videoPriceUpper": 1000,
+                },
+                ensure_ascii=False,
+            ),
+        },
+        "latest_count": 20,
+        "pool_count": 20,
+    }
+
+    invalid_result = validate_kol_request_snapshot_against_plan(invalid, plan)
+    valid_result = validate_kol_request_snapshot_against_plan(valid, plan)
+
+    assert invalid_result["request_valid"] is False
+    assert any("similarUserId" in issue for issue in invalid_result["issues"])
+    assert any("notePriceUpper" in issue for issue in invalid_result["issues"])
+    assert any("noteType" in issue for issue in invalid_result["issues"])
+    assert valid_result["request_valid"] is True
+    assert valid_result["expected_constraints"]["videoPriceUpper"] == 1000
+    assert valid_result["expected_constraints"]["noteType"] == 2
+
+
+def test_blogger_category_parent_all_selected_detects_all_chip():
+    class FakeLocator:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def inner_text(self, timeout=None):
+            return "博主类目：教育-全部 ×\n博主性别：女 ×\n重置\n存为常用筛选"
+
+    class FakePage:
+        def locator(self, selector):
+            return FakeLocator()
+
+    page = FakePage()
+
+    assert _blogger_category_parent_all_selected(page, "教育")
+    assert not _filter_already_selected(page, {"field": "博主类目", "value": "教育", "sub_value": "留学教育"})
+    assert not _blogger_category_parent_all_selected(page, "母婴")
+
+
+def test_repair_kol_request_from_constraints_removes_similarity_and_adds_filters():
+    from rpa_mcp_sync.pgy_browser import _repair_kol_request_from_constraints, _kol_request_body
+
+    class FakePage:
+        pass
+
+    plan = {
+        "filters": [
+            {"field": "博主类目", "value": "教育", "sub_value": "留学教育"},
+            {"field": "职业身份", "value": "学生"},
+            {"field": "特色背景", "value": "留学背景"},
+            {"field": "笔记类型", "value": "视频笔记为主"},
+            {"field": "合作报价", "value": "图文笔记：0-1000；视频笔记：0-1000", "sub_fields": ["图文笔记", "视频笔记"], "max": 1000},
+            {"field": "阅读中位数", "value": "1000以上", "min": 1000},
+            {"field": "互动中位数", "value": "100以上", "min": 100},
+        ]
+    }
+    snapshot = {
+        "request": {
+            "url": "https://pgy.xiaohongshu.com/api/solar/cooperator/blogger/v2",
+            "method": "POST",
+            "post_data": json.dumps({"searchType": 0, "similarUserId": "abc", "similarWord": "menggg", "personalTags": []}, ensure_ascii=False),
+        }
+    }
+
+    repaired = _repair_kol_request_from_constraints(FakePage(), snapshot, plan)
+    body = _kol_request_body(repaired)
+
+    assert body["searchType"] == 1
+    assert "similarUserId" not in body
+    assert "similarWord" not in body
+    assert body["contentTag"] == ["留学教育"]
+    assert body["personalTags"] == ["学生", "留学背景"]
+    assert body["noteType"] == 2
+    assert body["readMidNor30"] == [1000, -1]
+    assert body["interMidNor30"] == [100, -1]
+    assert body["notePriceUpper"] == 1000
+    assert body["videoPriceUpper"] == 1000
 
 
 def test_recent_note_comments_from_payload_flattens_top_level_and_replies():

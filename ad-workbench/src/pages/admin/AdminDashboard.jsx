@@ -754,49 +754,112 @@ function TabAgents({ actions }) {
 /* ============================================================
    Tab 5: API 配置
    ============================================================ */
+const defaultApiModelConfig = {
+  protocol: 'openai-compatible',
+  base_url: 'https://api.openai.com',
+  model: 'gpt-4.1-mini',
+  api_key: '',
+  api_key_env: 'OPENAI_API_KEY',
+  temperature: 0.2,
+  max_tokens: null,
+  timeout_seconds: null,
+};
+
+const modelRoleMeta = {
+  main_model: {
+    title: '主模型',
+    badge: '重任务',
+    description: 'Brief 解析、策略生成、字段映射等复杂推理任务',
+  },
+  secondary_model: {
+    title: '副模型',
+    badge: '批量任务',
+    description: '达人评分、批量重复判断等高频调用任务',
+  },
+};
+
+function normalizeApiModelConfig(remote, fallback = defaultApiModelConfig) {
+  return {
+    ...fallback,
+    protocol: remote?.protocol || fallback.protocol,
+    base_url: remote?.base_url || fallback.base_url,
+    model: remote?.model || fallback.model,
+    api_key: '',
+    api_key_env: remote?.api_key_env || fallback.api_key_env,
+    temperature: remote?.temperature ?? fallback.temperature,
+    max_tokens: remote?.max_tokens ?? fallback.max_tokens,
+    timeout_seconds: remote?.timeout_seconds ?? fallback.timeout_seconds,
+  };
+}
+
+function apiModelPublicMeta(remote) {
+  return {
+    path: remote?.path || 'config/ai_provider.yaml',
+    api_key_configured: Boolean(remote?.api_key_configured),
+    api_key_source: remote?.api_key_source || 'none',
+    using_example_config: Boolean(remote?.using_example_config),
+  };
+}
+
+/* ============================================================
+   Tab 5: API 配置
+   ============================================================ */
 function TabApiSettings() {
   const [config, setConfig] = useState({
-    protocol: 'openai-compatible',
-    base_url: 'https://api.openai.com/v1',
-    model: 'gpt-4.1-mini',
-    api_key: '',
-    api_key_env: 'OPENAI_API_KEY',
-    temperature: 0.2,
-    max_tokens: null,
-    timeout_seconds: null,
+    main_model: {
+      ...defaultApiModelConfig,
+      model: 'gpt-4.1-mini',
+    },
+    secondary_model: {
+      ...defaultApiModelConfig,
+      model: 'gpt-4.1-mini',
+      temperature: 0.1,
+      timeout_seconds: 120,
+    },
   });
+  const [activeModelRole, setActiveModelRole] = useState('main_model');
   const [meta, setMeta] = useState({
     path: 'config/ai_provider.yaml',
-    api_key_configured: false,
-    api_key_source: 'none',
-    using_example_config: false,
+    main_model: apiModelPublicMeta(),
+    secondary_model: apiModelPublicMeta(),
   });
   const [feedback, setFeedback] = useState('');
   const [busy, setBusy] = useState(false);
 
+  const selectedConfig = config[activeModelRole] || config.main_model;
+  const selectedMeta = meta[activeModelRole] || apiModelPublicMeta();
+
   const updateConfig = (key, value) => {
-    setConfig((prev) => ({ ...prev, [key]: value }));
+    setConfig((prev) => ({
+      ...prev,
+      [activeModelRole]: {
+        ...(prev[activeModelRole] || defaultApiModelConfig),
+        [key]: value,
+      },
+    }));
   };
 
   const applyRemoteConfig = (payload) => {
     const remote = payload?.config;
     if (!remote) return;
-    setConfig((prev) => ({
-      ...prev,
-      protocol: remote.protocol || prev.protocol,
-      base_url: remote.base_url || prev.base_url,
-      model: remote.model || prev.model,
-      api_key: '',
-      api_key_env: remote.api_key_env || '',
-      temperature: remote.temperature ?? prev.temperature,
-      max_tokens: remote.max_tokens ?? prev.max_tokens,
-      timeout_seconds: remote.timeout_seconds ?? prev.timeout_seconds,
-    }));
+    const mainRemote = remote.main_model || remote;
+    const secondaryRemote = remote.secondary_model || remote;
+    setConfig({
+      main_model: normalizeApiModelConfig(mainRemote, {
+        ...defaultApiModelConfig,
+        model: 'gpt-4.1-mini',
+      }),
+      secondary_model: normalizeApiModelConfig(secondaryRemote, {
+        ...defaultApiModelConfig,
+        model: 'gpt-4.1-mini',
+        temperature: 0.1,
+        timeout_seconds: 120,
+      }),
+    });
     setMeta({
       path: remote.path || 'config/ai_provider.yaml',
-      api_key_configured: Boolean(remote.api_key_configured),
-      api_key_source: remote.api_key_source || 'none',
-      using_example_config: Boolean(remote.using_example_config),
+      main_model: apiModelPublicMeta(mainRemote),
+      secondary_model: apiModelPublicMeta(secondaryRemote),
     });
   };
 
@@ -804,7 +867,18 @@ function TabApiSettings() {
     const cached = localStorage.getItem('adflow-api-config');
     if (cached) {
       try {
-        setConfig((prev) => ({ ...prev, ...JSON.parse(cached), api_key: '' }));
+        const parsed = JSON.parse(cached);
+        if (parsed.main_model || parsed.secondary_model) {
+          setConfig((prev) => ({
+            main_model: normalizeApiModelConfig(parsed.main_model, prev.main_model),
+            secondary_model: normalizeApiModelConfig(parsed.secondary_model, prev.secondary_model),
+          }));
+        } else {
+          setConfig((prev) => ({
+            ...prev,
+            main_model: normalizeApiModelConfig(parsed, prev.main_model),
+          }));
+        }
       } catch {
         // ignore stale local cache
       }
@@ -817,7 +891,7 @@ function TabApiSettings() {
 
   const protocolDefaults = {
     'openai-compatible': {
-      base_url: 'https://api.openai.com/v1',
+      base_url: 'https://api.openai.com',
       model: 'gpt-4.1-mini',
       api_key_env: 'OPENAI_API_KEY',
     },
@@ -829,7 +903,21 @@ function TabApiSettings() {
   };
 
   const switchProtocol = (protocol) => {
-    setConfig((prev) => ({ ...prev, protocol, ...protocolDefaults[protocol] }));
+    setConfig((prev) => ({
+      ...prev,
+      [activeModelRole]: {
+        ...(prev[activeModelRole] || defaultApiModelConfig),
+        protocol,
+        ...protocolDefaults[protocol],
+      },
+    }));
+  };
+
+  const clearInputKeys = () => {
+    setConfig((prev) => ({
+      main_model: { ...prev.main_model, api_key: '' },
+      secondary_model: { ...prev.secondary_model, api_key: '' },
+    }));
   };
 
   const saveConfig = async () => {
@@ -847,15 +935,21 @@ function TabApiSettings() {
       applyRemoteConfig(result);
       setFeedback(result.message || 'API 配置已保存');
     } catch (error) {
-      localStorage.setItem('adflow-api-config', JSON.stringify({ ...config, api_key: '' }));
+      localStorage.setItem('adflow-api-config', JSON.stringify({
+        main_model: { ...config.main_model, api_key: '' },
+        secondary_model: { ...config.secondary_model, api_key: '' },
+      }));
       setMeta((prev) => ({
         ...prev,
-        api_key_configured: prev.api_key_configured || Boolean(config.api_key || config.api_key_env),
-        api_key_source: config.api_key ? 'inline' : (config.api_key_env ? 'env' : 'none'),
+        [activeModelRole]: {
+          ...(prev[activeModelRole] || apiModelPublicMeta()),
+          api_key_configured: (prev[activeModelRole]?.api_key_configured) || Boolean(selectedConfig.api_key || selectedConfig.api_key_env),
+          api_key_source: selectedConfig.api_key ? 'inline' : (selectedConfig.api_key_env ? 'env' : 'none'),
+        },
       }));
       setFeedback(`${formatApiErrorMessage(error, '后端暂不可用')}，已先保存到本地工作台配置。`);
     } finally {
-      setConfig((prev) => ({ ...prev, api_key: '' }));
+      clearInputKeys();
       setBusy(false);
     }
   };
@@ -867,11 +961,14 @@ function TabApiSettings() {
       const response = await fetch('/api/llm/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config),
+        body: JSON.stringify({
+          ...selectedConfig,
+          model_role: activeModelRole === 'secondary_model' ? 'secondary' : 'main',
+        }),
       });
       const result = await response.json();
       if (!response.ok || result.ok === false) throw new Error(formatApiErrorMessage(result, 'API 连接测试失败'));
-      setFeedback(result.message || 'API 连接测试成功');
+      setFeedback(`${modelRoleMeta[activeModelRole].title}${result.message || '连接测试成功'}`);
     } catch (error) {
       setFeedback(formatApiErrorMessage(error, 'API 连接测试失败'));
     } finally {
@@ -880,17 +977,18 @@ function TabApiSettings() {
   };
 
   const statusItems = [
-    { label: '当前协议', value: config.protocol },
+    { label: '当前配置', value: modelRoleMeta[activeModelRole].title },
+    { label: '当前协议', value: selectedConfig.protocol },
     { label: '配置文件', value: meta.path },
-    { label: 'Key 状态', value: meta.api_key_configured ? '已配置' : '待配置' },
-    { label: 'Key 来源', value: meta.api_key_source === 'inline' ? '配置文件' : (config.api_key_env || '未配置') },
+    { label: 'Key 状态', value: selectedMeta.api_key_configured ? '已配置' : '待配置' },
+    { label: 'Key 来源', value: selectedMeta.api_key_source === 'inline' ? '配置文件' : (selectedConfig.api_key_env || '未配置') },
   ];
   const aiCapabilities = [
-    { name: 'Brief 拆解', endpoint: '/api/projects/{id}/ai/brief', roles: '策划' },
-    { name: '创意策略生成', endpoint: '/api/projects/{id}/ai/strategy', roles: '策划' },
-    { name: '岗位交接生成', endpoint: '/api/projects/{id}/ai/handoff', roles: '策划 / 执行' },
-    { name: '执行任务拆解', endpoint: '/api/projects/{id}/ai/tasks', roles: '执行' },
-    { name: '管理层经营解读', endpoint: '/api/projects/{id}/ai/management-advice', roles: '管理层' },
+    { name: 'Brief 拆解', model: '主模型', endpoint: '/api/projects/{id}/ai/brief', roles: '策划' },
+    { name: '量化标准生成', model: '主模型', endpoint: '/api/projects/{id}/screening-standard/optimize', roles: '策划 / 筛选' },
+    { name: '飞书字段映射', model: '主模型', endpoint: '/api/projects/feishu/fields', roles: '筛选' },
+    { name: '达人 AI 评分', model: '副模型', endpoint: '/api/projects/{id}/creators/score', roles: '筛选 / 媒介' },
+    { name: '批量重复判断', model: '副模型', endpoint: 'creator_score_batch', roles: '系统任务' },
   ];
 
   return (
@@ -899,12 +997,12 @@ function TabApiSettings() {
         <div>
           <div className="api-settings-eyebrow">Model Gateway</div>
           <h2>API 配置</h2>
-          <p>独立维护 Gemini、OpenAI 以及 OpenAI 兼容网关的 base-url、模型名、密钥来源和生成参数。</p>
+          <p>主模型负责 Brief 解析等重任务，副模型负责达人评分等批量多次重复任务。</p>
         </div>
         <div className="api-settings-actions">
           <button className="btn btn-secondary" type="button" disabled={busy} onClick={testConfig}>
             <RefreshCw size={14} />
-            <span>测试连接</span>
+            <span>测试当前模型</span>
           </button>
           <button className="btn btn-primary" type="button" disabled={busy} onClick={saveConfig}>
             <Save size={14} />
@@ -913,22 +1011,47 @@ function TabApiSettings() {
         </div>
       </div>
 
+      <div className="api-model-role-grid">
+        {Object.entries(modelRoleMeta).map(([role, item]) => {
+          const roleConfig = config[role] || defaultApiModelConfig;
+          const roleMeta = meta[role] || apiModelPublicMeta();
+          return (
+            <button
+              className={`api-model-role-card ${activeModelRole === role ? 'active' : ''}`}
+              type="button"
+              key={role}
+              onClick={() => setActiveModelRole(role)}
+            >
+              <span>
+                <strong>{item.title}</strong>
+                <small>{item.description}</small>
+              </span>
+              <span className="api-model-role-aside">
+                <Badge variant={roleMeta.api_key_configured ? 'green' : 'amber'}>{roleMeta.api_key_configured ? 'Key 已配置' : 'Key 待配置'}</Badge>
+                <em>{roleConfig.model}</em>
+                <i>{item.badge}</i>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
       <div className="api-settings-grid">
         <div className="card api-settings-main">
           <div className="card-header">
             <div className="flex items-center gap-2">
               <KeyRound size={16} className="text-secondary" />
-              <h3>模型服务</h3>
+              <h3>{modelRoleMeta[activeModelRole].title}服务</h3>
             </div>
-            <Badge variant={meta.api_key_configured ? 'green' : 'amber'}>
-              {meta.api_key_configured ? 'Key 已配置' : 'Key 待配置'}
+            <Badge variant={selectedMeta.api_key_configured ? 'green' : 'amber'}>
+              {selectedMeta.api_key_configured ? 'Key 已配置' : 'Key 待配置'}
             </Badge>
           </div>
           <div className="card-body">
             <div className="api-form-stack">
               <div className="api-provider-switch">
                 <button
-                  className={config.protocol === 'openai-compatible' ? 'active' : ''}
+                  className={selectedConfig.protocol === 'openai-compatible' ? 'active' : ''}
                   type="button"
                   onClick={() => switchProtocol('openai-compatible')}
                 >
@@ -936,7 +1059,7 @@ function TabApiSettings() {
                   <span>OpenAI / 兼容</span>
                 </button>
                 <button
-                  className={config.protocol === 'gemini' ? 'active' : ''}
+                  className={selectedConfig.protocol === 'gemini' ? 'active' : ''}
                   type="button"
                   onClick={() => switchProtocol('gemini')}
                 >
@@ -950,16 +1073,16 @@ function TabApiSettings() {
                   <span>Base URL</span>
                   <input
                     className="input-field"
-                    value={config.base_url}
+                    value={selectedConfig.base_url}
                     onChange={(event) => updateConfig('base_url', event.target.value)}
-                    placeholder="https://api.openai.com/v1"
+                    placeholder="https://api.openai.com"
                   />
                 </label>
                 <label className="api-form-control">
                   <span>模型名</span>
                   <input
                     className="input-field"
-                    value={config.model}
+                    value={selectedConfig.model}
                     onChange={(event) => updateConfig('model', event.target.value)}
                     placeholder="gpt-4.1-mini 或 gemini-2.5-flash"
                   />
@@ -972,9 +1095,9 @@ function TabApiSettings() {
                   <input
                     className="input-field"
                     type="password"
-                    value={config.api_key}
+                    value={selectedConfig.api_key}
                     onChange={(event) => updateConfig('api_key', event.target.value)}
-                    placeholder={meta.api_key_configured ? '留空则保留已保存密钥' : '填写模型服务密钥'}
+                    placeholder={selectedMeta.api_key_configured ? '留空则保留已保存密钥' : '填写模型服务密钥'}
                     autoComplete="new-password"
                   />
                 </label>
@@ -982,7 +1105,7 @@ function TabApiSettings() {
                   <span>环境变量名</span>
                   <input
                     className="input-field"
-                    value={config.api_key_env}
+                    value={selectedConfig.api_key_env}
                     onChange={(event) => updateConfig('api_key_env', event.target.value)}
                     placeholder="OPENAI_API_KEY / GEMINI_API_KEY"
                   />
@@ -998,7 +1121,7 @@ function TabApiSettings() {
                     step="0.1"
                     min="0"
                     max="2"
-                    value={config.temperature}
+                    value={selectedConfig.temperature}
                     onChange={(event) => updateConfig('temperature', Number(event.target.value))}
                   />
                 </label>
@@ -1007,7 +1130,7 @@ function TabApiSettings() {
                   <input
                     className="input-field"
                     type="number"
-                    value={config.max_tokens ?? ''}
+                    value={selectedConfig.max_tokens ?? ''}
                     onChange={(event) => updateConfig('max_tokens', event.target.value === '' ? null : Number(event.target.value))}
                     placeholder="不限制"
                   />
@@ -1017,7 +1140,7 @@ function TabApiSettings() {
                   <input
                     className="input-field"
                     type="number"
-                    value={config.timeout_seconds ?? ''}
+                    value={selectedConfig.timeout_seconds ?? ''}
                     onChange={(event) => updateConfig('timeout_seconds', event.target.value === '' ? null : Number(event.target.value))}
                     placeholder="不限制"
                   />
@@ -1057,17 +1180,21 @@ function TabApiSettings() {
             <Bot size={16} className="text-secondary" />
             <h3>业务 AI 能力注册</h3>
           </div>
-          <Badge variant={meta.api_key_configured ? 'green' : 'amber'}>
-            {meta.api_key_configured ? '统一网关可用' : '等待配置'}
+          <Badge variant={(meta.main_model.api_key_configured || meta.secondary_model.api_key_configured) ? 'green' : 'amber'}>
+            {(meta.main_model.api_key_configured || meta.secondary_model.api_key_configured) ? '模型网关可用' : '等待配置'}
           </Badge>
         </div>
         <div className="card-body">
           <DataTable
             columns={[
               { key: 'name', label: '能力' },
+              { key: 'model', label: '模型路由', render: (val) => <Badge variant={val === '主模型' ? 'blue' : 'cyan'}>{val}</Badge> },
               { key: 'roles', label: '使用工作台' },
               { key: 'endpoint', label: '统一入口', render: (val) => <span className="font-mono text-muted">{val}</span> },
-              { key: 'status', label: '状态', render: () => <Badge variant={meta.api_key_configured ? 'green' : 'amber'}>{meta.api_key_configured ? '已接入' : '配置后启用'}</Badge> },
+              { key: 'status', label: '状态', render: (_, row) => {
+                const enabled = row.model === '主模型' ? meta.main_model.api_key_configured : meta.secondary_model.api_key_configured;
+                return <Badge variant={enabled ? 'green' : 'amber'}>{enabled ? '已接入' : '配置后启用'}</Badge>;
+              } },
             ]}
             data={aiCapabilities}
           />

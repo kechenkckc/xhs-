@@ -5,7 +5,7 @@ import { hardFilterLabel } from '../constants/screeningConstants';
 export { parseCountValue };
 
 export function reviewVariantFromStatus(status) {
-  return { 已通过: 'green', 已写回飞书: 'green', 已邀约: 'blue', 已驳回: 'red', 备选: 'amber', 待审核: 'blue', 待补数据: 'default' }[status] || 'default';
+  return { 已通过: 'green', 已写回飞书: 'green', 已邀约: 'blue', 已驳回: 'red', 已废弃: 'red', 备选: 'amber', 待审核: 'blue', 待补数据: 'default' }[status] || 'default';
 }
 
 export function normalizeDimensionScore(value, weight) {
@@ -45,6 +45,17 @@ export function deriveDimensionScores(item) {
 }
 
 export function normalizeScoreTierKey(value, score) {
+  if (score !== null && score !== undefined && score !== '') {
+    const number = Number(score);
+    if (Number.isFinite(number)) {
+      if (number >= 95) return 'S';
+      if (number >= 80) return 'A';
+      if (number >= 75) return 'B+';
+      if (number >= 70) return 'B';
+      return 'C';
+    }
+  }
+
   const text = String(value ?? '').trim().replace(/\s+/g, '').toUpperCase();
   if (['S', 'A', 'B+', 'B', 'C'].includes(text)) return text;
   if (['S档', 'S級', 'S级'].includes(text)) return 'S';
@@ -58,15 +69,7 @@ export function normalizeScoreTierKey(value, score) {
   if (/中高优先级/.test(text)) return 'B+';
   if (/中优先级/.test(text)) return 'B';
   if (/低优先级/.test(text)) return 'C';
-
-  if (score === null || score === undefined || score === '') return '';
-  const number = Number(score);
-  if (!Number.isFinite(number)) return '';
-  if (number >= 95) return 'S';
-  if (number >= 80) return 'A';
-  if (number >= 75) return 'B+';
-  if (number >= 70) return 'B';
-  return 'C';
+  return '';
 }
 
 export function sanitizeCreatorType(value) {
@@ -241,6 +244,19 @@ export function mapBackendCreator(item) {
     informationCompletenessLabel: formatCompleteness(item.information_completeness),
     initialTier: normalizeScoreTierKey(item.initial_tier || item.tier || item.detail_collection_priority, score),
     detailCollectionPriority: item.detail_collection_priority || '',
+    stage1Priority: item.stage1_priority || '',
+    stage1Reason: item.stage1_reason || '',
+    projectMatchStatus: item.project_match_status || '',
+    projectMatchConfidence: item.project_match_confidence,
+    finalRecommendLevel: item.final_recommend_level || item.recommend_level || '',
+    targetContentRatio: item.target_content_ratio,
+    targetContentEvidence: parseStructuredList(item.target_content_evidence),
+    productSceneRatio: item.product_scene_ratio,
+    productSceneEvidence: parseStructuredList(item.product_scene_evidence),
+    conflictContentRatio: item.conflict_content_ratio,
+    conflictContentCategories: parseStructuredList(item.conflict_content_categories),
+    riskControlResult: parseJsonValue(item.risk_control_result, {}),
+    recommendedFormat: item.recommended_format || '',
     risk: uniqueRisks,
     scores,
     aiReason: item.score_reason || '待补充蒲公英详情数据后生成完整评分说明。',
@@ -437,6 +453,18 @@ function parsePayloadObject(payload, depth = 0) {
     return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
     return {};
+  }
+}
+
+function parseJsonValue(value, fallback = {}) {
+  if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return fallback;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : fallback;
+  } catch {
+    return fallback;
   }
 }
 
@@ -1335,6 +1363,7 @@ export function getCreatorFollowupInfo(creator, stage) {
     '合格达人待合作': '待排期/商务推进',
     '待建联达人': '待建联',
     '观察暂缓': '暂缓观察',
+    '废弃达人池': '已废弃',
   };
   const lastRaw = pickCreatorValue(creator, ['last_contacted_at', '最近跟进时间', 'reviewedAt', 'updatedAt', 'updated_at'], creator.reviewedAt || creator.updatedAt || creator.createdAt);
   const lastAt = lastRaw ? formatDateTime(lastRaw) : '待记录';
@@ -1373,6 +1402,7 @@ export function getCreatorTagGroups(creator) {
 export function getPoolStage(creator, index = 0) {
   if (creator.poolStage || creator.pool_stage) return creator.poolStage || creator.pool_stage;
   if (['待补数据', '待审核', '人工复核'].includes(creator.review)) return '筛选工作台';
+  if (creator.review === '已废弃') return '废弃达人池';
   if (['已驳回', '默认淘汰'].includes(creator.review)) return '观察暂缓';
   if (creator.review === '已写回飞书') return '已合作跟进中';
   if (['已通过', '备选'].includes(creator.review)) return '合格达人待合作';
@@ -1406,6 +1436,6 @@ export function getCreatorUpdateLog(creator, index = 0) {
 }
 
 export function getReviewVariant(review) {
-  const map = { '已通过': 'green', '已写回飞书': 'green', '已邀约': 'blue', '已驳回': 'red', '备选': 'amber', '人工复核': 'blue', '默认淘汰': 'red', '待审核': 'default', '待确认': 'amber', '待补数据': 'default' };
+  const map = { '已通过': 'green', '已写回飞书': 'green', '已邀约': 'blue', '已驳回': 'red', '已废弃': 'red', '备选': 'amber', '人工复核': 'blue', '默认淘汰': 'red', '待审核': 'default', '待确认': 'amber', '待补数据': 'default' };
   return map[review] || 'default';
 }

@@ -324,13 +324,32 @@ const roleDashboardMap = {
   screening: ScreeningDashboard,
 };
 
+const PROJECTS_CACHE_KEY = 'adflow-project-list-cache-v1';
+
+function readCachedProjects() {
+  try {
+    const cached = JSON.parse(window.localStorage.getItem(PROJECTS_CACHE_KEY) || '[]');
+    return Array.isArray(cached) ? cached : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeCachedProjects(projects = []) {
+  try {
+    window.localStorage.setItem(PROJECTS_CACHE_KEY, JSON.stringify(projects.slice(0, 50)));
+  } catch {
+    // Cache is only a startup accelerator.
+  }
+}
+
 // 主布局组件
 export default function WorkbenchLayout() {
   const { role } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
-  const [projects, setProjects] = useState([]);
+  const [projects, setProjects] = useState(() => readCachedProjects());
   const [selectedProjectId, setSelectedProjectId] = useState(() => {
     try {
       return window.localStorage.getItem('adflow-selected-project') || window.localStorage.getItem('adflow-selected-screening-project') || '';
@@ -355,6 +374,7 @@ export default function WorkbenchLayout() {
         if (cancelled) return;
         const nextProjects = payload.projects || [];
         setProjects(nextProjects);
+        writeCachedProjects(nextProjects);
         setSelectedProjectId((currentId) => (
           currentId || nextProjects[0]?.project_id || 'youdao_001'
         ));
@@ -425,6 +445,7 @@ export default function WorkbenchLayout() {
             <DashboardComponent
               selectedProjectId={selectedProjectId}
               onSelectedProjectIdChange={setSelectedProjectId}
+              layoutProjects={projects}
             />
           </Suspense>
         </div>

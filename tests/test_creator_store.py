@@ -18,6 +18,7 @@ from rpa_mcp_sync.creator_store import (
     generate_test_creators,
     get_creator,
     needs_detail_completion,
+    normalize_creator,
     quality_feishu_rows,
     review_creator,
     score_creator,
@@ -30,7 +31,7 @@ from rpa_mcp_sync.creator_store import (
     upsert_creator,
     _threshold_from_text,
 )
-from rpa_mcp_sync.config_store import ROOT
+from rpa_mcp_sync.config_store import ROOT, project_scoring_config_path, read_json, write_json
 from rpa_mcp_sync.feishu_field_agent import analyze_field_mapping, apply_field_mapping
 from rpa_mcp_sync.pgy_browser import (
     _annotate_note_cases_with_traffic_reference,
@@ -398,6 +399,65 @@ def test_scoring_uses_cpm_to_accept_higher_quote_when_exposure_is_good():
     assert efficient["total_score"] > inefficient["total_score"]
 
 
+def test_missing_cooperation_note_metrics_caps_system_priority():
+    score = score_values(
+        {
+            "creator_id": "pytest-missing-coop-metrics",
+            "nickname": "缺合作笔记数据达人",
+            "pgy_url": "https://pgy.xiaohongshu.com/creator/missing-coop",
+            "followers_count": 5000,
+            "quote_price": 300,
+            "daily_read_median": 12000,
+            "daily_interaction_median": 800,
+            "fans_35_plus_ratio": 0.5,
+            "creator_type": "教育/vlog",
+            "persona_tags": "学生/学习/留学",
+            "raw_payload": {
+                "recent_notes": [
+                    {"title": "课堂笔记复盘", "read_count": 12000, "like_count": 600},
+                    {"title": "学习效率提升", "read_count": 9000, "like_count": 500},
+                ]
+            },
+        }
+    )
+
+    assert score["total_score"] >= 80
+    assert score["detail_collection_priority"] not in {"最高优先级", "高优先级"}
+    assert "缺合作笔记核心数据" in score["score_reason"]
+
+
+def test_daily_performance_payload_does_not_count_as_cooperation_metrics():
+    score = score_values(
+        {
+            "creator_id": "pytest-daily-filled-coop-fields",
+            "nickname": "日常数据误填合作字段达人",
+            "pgy_url": "https://pgy.xiaohongshu.com/creator/daily-filled",
+            "followers_count": 5000,
+            "quote_price": 300,
+            "daily_read_median": 12000,
+            "daily_interaction_median": 800,
+            "cooperation_read_median": 12000,
+            "cooperation_interaction_median": 800,
+            "creator_type": "教育/留学/学习",
+            "persona_tags": "留学生、课堂复盘、学习工具",
+            "raw_payload": {
+                "data_performance": {
+                    "daily": {
+                        "scale": {"metrics": {"阅读中位数": "12,000", "互动中位数": "800"}}
+                    }
+                },
+                "recent_notes": [
+                    {"title": "lecture听课复盘", "read_count": 12000, "like_count": 600},
+                    {"title": "学习效率提升", "read_count": 9000, "like_count": 500},
+                ],
+            },
+        }
+    )
+
+    assert score["detail_collection_priority"] == "中优先级"
+    assert "缺合作笔记核心数据" in score["score_reason"]
+
+
 def _overseas_listening_special_scoring_config():
     return {
         "enabled": True,
@@ -483,8 +543,9 @@ def test_project_special_scoring_promotes_configured_overseas_student_to_s_tier(
     )
 
     assert score["initial_tier"] == "S"
-    assert score["detail_collection_priority"] == "最高优先级"
+    assert score["detail_collection_priority"] == "中优先级"
     assert "听课宝S档依据：身份、Brief场景、数据效率累计达标" in score["score_reason"]
+    assert "缺合作笔记核心数据" in score["score_reason"]
 
 
 def test_overseas_student_background_is_not_code_level_s_tier_without_project_config():
@@ -546,6 +607,144 @@ def test_low_reply_rate_caps_high_scoring_creator():
     assert score["total_score"] <= 84
     assert score["initial_tier"] != "S"
     assert "48h回复率低于50%" in score["score_reason"]
+
+
+def test_format_budget_policy_identifies_video_over_budget_and_dominant_format():
+    project_id = f"pytest_format_budget_{uuid.uuid4().hex[:8]}"
+    save_project(
+        project_id,
+        {
+            "project_name": "听课宝形态预算项目",
+            "brief": "图文和视频都可，最好是视频，单达人预算1000以下KOC。",
+            "screening_plan": {
+                "formatBudgetPolicy": {
+                    "allowed_formats": ["图文", "视频"],
+                    "preferred_format": "视频",
+                    "image_quote_cap": 1000,
+                    "video_quote_cap": 1000,
+                },
+                "hardRules": {"reply_rate_min": 0.5},
+                "projectSpecialScoring": _overseas_listening_special_scoring_config(),
+            },
+        },
+    )
+    creator = {
+        "creator_id": "pytest-video-over-budget",
+        "project_id": project_id,
+        "nickname": "海外留学生视频学习博主",
+        "pgy_url": "https://pgy.xiaohongshu.com/creator/video-over-budget",
+        "followers_count": 5200,
+        "quote_price": 800,
+        "video_quote_price": 1500,
+        "reply_rate_48h": 0.8,
+        "daily_read_median": 5000,
+        "daily_interaction_median": 420,
+        "image_read_unit_price": 0.16,
+        "image_interaction_unit_price": 1.9,
+        "creator_type": "教育/留学教育/学习日常",
+        "persona_tags": "海外留学生、课堂复盘",
+        "raw_payload": {
+            "recent_notes": [
+                {"title": "lecture听课复盘", "note_type": "视频笔记", "read_count": 5000, "like_count": 180},
+                {"title": "课堂笔记复盘", "isVideo": True, "read_count": 4800, "like_count": 170},
+                {"title": "assignment整理", "noteType": 2, "read_count": 4600, "like_count": 160},
+            ]
+        },
+    }
+
+    score = score_values(creator, project_id=project_id)
+    assert "形态预算：仅图文可投" in score["score_reason"]
+    assert "近期/合作笔记形态：视频为主" in score["score_reason"]
+    assert score["hard_filter_passed"] == 1
+
+
+def test_format_budget_policy_passes_when_both_image_and_video_over_budget():
+    project_id = f"pytest_format_budget_pass_{uuid.uuid4().hex[:8]}"
+    save_project(
+        project_id,
+        {
+            "project_name": "听课宝均超预算项目",
+            "brief": "图文和视频都可，单达人预算1000以下KOC。",
+            "screening_plan": {
+                "formatBudgetPolicy": {
+                    "allowed_formats": ["图文", "视频"],
+                    "preferred_format": "视频",
+                    "image_quote_cap": 1000,
+                    "video_quote_cap": 1000,
+                },
+                "hardRules": {"reply_rate_min": 0.5},
+            },
+        },
+    )
+
+    score = score_values(
+        {
+            "creator_id": "pytest-both-over-budget",
+            "nickname": "留学生学习博主",
+            "pgy_url": "https://pgy.xiaohongshu.com/creator/both-over",
+            "followers_count": 5200,
+            "quote_price": 1600,
+            "video_quote_price": 1700,
+            "reply_rate_48h": 0.8,
+            "daily_read_median": 5000,
+            "daily_interaction_median": 420,
+            "creator_type": "教育/留学教育/学习日常",
+            "persona_tags": "海外留学生、课堂复盘",
+        },
+        project_id=project_id,
+    )
+
+    assert score["hard_filter_passed"] == 0
+    assert score["total_score"] <= 69
+    assert "图文/视频报价均超过项目预算" in score["score_reason"]
+
+
+def test_premium_exception_allows_top_data_creator_to_enter_detail_completion():
+    project_id = f"pytest_premium_exception_{uuid.uuid4().hex[:8]}"
+    save_project(
+        project_id,
+        {
+            "project_name": "听课宝高性价比溢价项目",
+            "brief": "图文和视频都可，单达人预算1000以下KOC；如果数据排前5%，报价不超过1.5倍，可以补详情。",
+            "screening_plan": {
+                "formatBudgetPolicy": {
+                    "allowed_formats": ["图文", "视频"],
+                    "preferred_format": "视频",
+                    "image_quote_cap": 1000,
+                    "video_quote_cap": 1000,
+                    "premium_exception_policy": {
+                        "enabled": True,
+                        "data_top_percent": 5,
+                        "max_budget_multiplier": 1.5,
+                    },
+                },
+                "hardRules": {"reply_rate_min": 0.5},
+            },
+        },
+    )
+
+    score = score_values(
+        {
+            "creator_id": "pytest-premium-exception",
+            "nickname": "超高数据留学生学习博主",
+            "pgy_url": "https://pgy.xiaohongshu.com/creator/premium",
+            "followers_count": 5200,
+            "quote_price": 1400,
+            "video_quote_price": 1450,
+            "reply_rate_48h": 0.8,
+            "daily_read_median": 8000,
+            "daily_interaction_median": 650,
+            "creator_type": "教育/留学教育/学习日常",
+            "persona_tags": "海外留学生、课堂复盘",
+        },
+        project_id=project_id,
+    )
+
+    assert score["hard_filter_passed"] == 1
+    assert score["total_score"] >= 75
+    assert score["detail_collection_priority"] == "中优先级"
+    assert "预算溢价例外" in score["score_reason"]
+    assert "图文/视频报价均超过项目预算" not in score["score_reason"]
 
 
 def test_missing_reply_rate_is_not_treated_as_low_reply_rate():
@@ -648,6 +847,101 @@ def test_rule_scoring_rejects_no_order_permission_from_raw_payload():
 
     assert score["hard_filter_passed"] == 0
     assert "无接单权限" in score["score_reason"]
+
+
+def test_score_project_defaults_to_rule_scoring(monkeypatch):
+    project_id = f"pytest_default_rule_scoring_{uuid.uuid4().hex[:8]}"
+    save_project(project_id, {"project_name": "默认规则评分项目", "brief": "教育达人"})
+    upsert_creator(
+        project_id,
+        {
+            "creator_id": f"{project_id}-creator",
+            "nickname": "默认规则评分达人",
+            "pgy_url": "https://pgy.xiaohongshu.com/creator/default-rule",
+            "followers_count": 3000,
+            "quote_price": 500,
+            "creator_type": "教育",
+        },
+        score=False,
+    )
+
+    def fail_llm(*args, **kwargs):
+        raise AssertionError("默认评分不应调用大模型")
+
+    monkeypatch.setattr("rpa_mcp_sync.creator_store.score_values_batch_with_llm", fail_llm)
+    result = score_project(project_id)
+
+    assert result["source"] == "rule"
+    assert result["sources"]["llm"] == 0
+    with connect() as conn:
+        conn.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
+
+
+def test_save_project_writes_project_scoring_config_file_and_score_reads_it():
+    project_id = f"tmp_scoring_config_{uuid.uuid4().hex[:8]}"
+    path = project_scoring_config_path(project_id)
+    if path.exists():
+        path.unlink()
+    try:
+        save_project(
+            project_id,
+            {
+                "project_name": "配置文件驱动KOC评分项目",
+                "brief": "KOC项目，单达人预算1000以内，优先学习内容达人。",
+                "screening_plan": {
+                    "projectFitConfig": {
+                        "is_koc_project": True,
+                        "project_delivery_type": "KOC达人投放",
+                    },
+                    "kocScoringConfig": {
+                        "stage1_thresholds": {
+                            "budget_accept_max": 1000,
+                            "read_priority_min": 1000,
+                            "interaction_priority_min": 100,
+                            "cpe_priority_max": 7,
+                        }
+                    },
+                },
+            },
+        )
+
+        payload = read_json(path, {})
+        assert payload["project_scoring_config"]["kocScoringConfig"]["stage1_thresholds"]["read_priority_min"] == 1000
+        assert payload["scoring_engine"] == "rpa_mcp_sync.creator_store"
+
+        payload["project_scoring_config"]["kocScoringConfig"]["stage1_thresholds"].update(
+            {
+                "budget_accept_max": 100,
+                "read_priority_min": 9000,
+                "interaction_priority_min": 9000,
+                "cpe_priority_max": 0.1,
+            }
+        )
+        write_json(path, payload)
+
+        score = score_values(
+            {
+                "creator_id": f"{project_id}-creator",
+                "nickname": "学习内容KOC",
+                "pgy_url": "https://pgy.xiaohongshu.com/creator/config-driven",
+                "followers_count": 5000,
+                "quote_price": 800,
+                "daily_read_median": 5000,
+                "daily_interaction_median": 420,
+                "image_interaction_unit_price": 1.9,
+                "creator_type": "教育/学习",
+                "persona_tags": "学习工具、课堂复盘",
+            },
+            project_id=project_id,
+        )
+
+        assert score["stage1_priority"] == "P3"
+        assert "阅读未达9000" in score["stage1_reason"]
+    finally:
+        with connect() as conn:
+            conn.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
+        if path.exists():
+            path.unlink()
 
 
 def test_default_scoring_does_not_use_35_plus_as_hard_audience_condition():
@@ -754,9 +1048,10 @@ def test_project_fit_config_caps_creator_without_product_scene_evidence():
 
     assert scored["total_score"] <= 79
     assert scored["initial_tier"] in {"A", "B+"}
-    assert scored["detail_collection_priority"] in {"高优先级", "中高优先级"}
+    assert scored["detail_collection_priority"] == "中优先级"
     assert "规则初筛分组" in scored["score_reason"]
     assert "缺少与当前产品场景直接匹配的内容证据" in scored["score_reason"]
+    assert "缺合作笔记核心数据" in scored["score_reason"]
 
 
 def test_project_fit_config_rewards_creator_with_scene_and_grade_evidence():
@@ -918,6 +1213,44 @@ def test_pgy_detail_performance_parser_handles_cooperation_cost_and_scale():
     assert cost_metrics["预估互动单价"] == "2.58元/互动"
     assert cost_metrics["预估外溢进店单价(视频)"] == "4.08元/进店"
     assert cost_metrics["外溢进店单价"] == "4.08元/进店"
+
+
+def test_pgy_detail_interaction_states_do_not_fallback_daily_to_cooperation_fields():
+    from rpa_mcp_sync import pgy_browser
+
+    class StubPage:
+        pass
+
+    def fake_overview(_page):
+        return {}
+
+    def fake_cases(_page):
+        return {}
+
+    def fake_performance(_page):
+        return {
+            "daily": {
+                "scale": {"metrics": {"曝光中位数": "39,702", "阅读中位数": "6,007", "互动中位数": "290"}},
+                "cost": {"metrics": {"外溢进店单价": "8.8元/进店"}},
+            }
+        }
+
+    original_overview = pgy_browser._collect_overview_note_states
+    original_cases = pgy_browser._collect_note_case_pages
+    original_performance = pgy_browser._collect_performance_states
+    pgy_browser._collect_overview_note_states = fake_overview
+    pgy_browser._collect_note_case_pages = fake_cases
+    pgy_browser._collect_performance_states = fake_performance
+    try:
+        detail = pgy_browser._collect_detail_interaction_states(StubPage())
+    finally:
+        pgy_browser._collect_overview_note_states = original_overview
+        pgy_browser._collect_note_case_pages = original_cases
+        pgy_browser._collect_performance_states = original_performance
+
+    assert detail.get("cooperation_read_median") is None
+    assert detail.get("cooperation_interaction_median") is None
+    assert detail.get("overflow_store_unit_price") is None
 
 
 def test_pgy_detail_note_case_parser_keeps_cooperation_brand():
@@ -1091,6 +1424,11 @@ def test_creator_pool_stage_history_and_csv_export():
 
     changed = change_creator_stage(project_id, creator["creator_id"], "已合作跟进中", "确认合作", "pytest")
     assert changed["pool_stage"] == "已合作跟进中"
+    discarded = review_creator(project_id, creator["creator_id"], "已废弃", "清空当前档位", "pytest")
+    assert discarded["status"] == "已废弃"
+    discarded_pool = creator_pool(project_id)
+    assert any(item["creator_id"] == creator["creator_id"] for item in discarded_pool["groups"]["废弃达人池"])
+    assert discarded_pool["stats"]["discarded"] == 1
     updated = update_creator_metrics(project_id, creator["creator_id"], {"followers_count": 81200}, "pytest")
     assert updated["followers_count"] == 81200
     detail = creator_pool_detail(project_id, creator["creator_id"])
@@ -1305,8 +1643,10 @@ def test_field_mapping_agent_maps_varied_sheet_headers_without_llm():
             "粉丝年龄34岁以上占比（35-44+44岁以上）": "56.9%",
             "粉丝年龄35-44占比": "49.4%",
             "图文报备价": 6000,
+            "图文报价": 6000,
             "图文执行价（含平台服务费）": 6600,
             "视频报备裸价": 12000,
+            "视频报价": 12000,
             "视频执行价（含平台服务费）": 13200,
             "预估cpe": 2,
             "视频完播率": "49.4%",
@@ -1323,6 +1663,8 @@ def test_field_mapping_agent_maps_varied_sheet_headers_without_llm():
         {"field_name": "视频报备裸价", "column_index": 7},
         {"field_name": "预估cpe", "column_index": 8},
         {"field_name": "视频完播率", "column_index": 9},
+        {"field_name": "图文报价", "column_index": 10},
+        {"field_name": "视频报价", "column_index": 11},
     ]
 
     mapped_rows, plan = apply_field_mapping(rows, fields, use_llm=False)
@@ -1333,8 +1675,37 @@ def test_field_mapping_agent_maps_varied_sheet_headers_without_llm():
     assert mapped_rows[0]["粉丝年龄34岁以上占比"] == "56.9%"
     assert mapped_rows[0]["图文执行价\n（含平台服务费）"] == 6600
     assert mapped_rows[0]["视频报备裸价"] == 12000
+    assert mapped_rows[0]["图文报价"] == 6000
+    assert mapped_rows[0]["视频报价"] == 12000
     assert mapped_rows[0]["预估cpe"] == 2
     assert not any(item["target_field"] == "达人昵称" for item in plan["unmatched"])
+
+
+def test_normalize_creator_accepts_explicit_image_and_video_quote_headers():
+    creator = normalize_creator(
+        {
+            "nickname": "报价字段达人",
+            "图文报价": "¥350",
+            "视频报价": "¥800",
+        },
+        "pytest_quote_headers",
+    )
+
+    assert creator["quote_price"] == 350
+    assert creator["video_quote_price"] == 800
+
+
+def test_normalize_creator_does_not_treat_percent_as_quote_price():
+    creator = normalize_creator(
+        {
+            "nickname": "百分比误列达人",
+            "全部报价": "7.1%",
+            "图文报价": "¥1,900",
+        },
+        "pytest_quote_headers",
+    )
+
+    assert creator["quote_price"] == 1900
 
 
 def test_quality_feishu_rows_include_project_promotion_reason():
@@ -1441,6 +1812,7 @@ def test_batch_llm_scores_multiple_creators_in_one_request(monkeypatch):
         payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
         captured["creator_count"] = len(payload["creators"])
         captured["project"] = payload["project"]
+        captured["config"] = config or {}
         return {
             "results": [
                 {
@@ -1465,6 +1837,7 @@ def test_batch_llm_scores_multiple_creators_in_one_request(monkeypatch):
     scores = score_values_batch_with_llm(project_id, creators)
 
     assert captured["creator_count"] == 2
+    assert captured["config"]["model_role"] == "secondary"
     assert "scoringCriteria" in captured["project"]
     assert "projectFitConfig" in captured["project"]
     assert "screening_plan" not in captured["project"]

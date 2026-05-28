@@ -25,6 +25,8 @@ from .config_store import (
 )
 from .creator_store import (
     DETAIL_PRIORITY_HIGH_VALUES,
+    LLM_BATCH_MAX_CREATORS,
+    LLM_SCORE_RETRY_ATTEMPTS,
     archive_project,
     bulk_upsert_creators,
     connect,
@@ -106,6 +108,7 @@ from .pgy_browser import (
     build_collection_plan,
     collect_details_for_targets,
     collect_visible_list,
+    expected_kol_request_constraints_from_plan,
     parse_export_file,
     start_browser,
 )
@@ -251,7 +254,7 @@ class FeishuConnectionPayload(BaseModel):
 
 class LlmConfigPayload(BaseModel):
     protocol: str = "openai-compatible"
-    base_url: str = "https://api.openai.com/v1"
+    base_url: str = "https://api.openai.com"
     model: str = "gpt-4.1-mini"
     api_key: str | None = None
     api_key_env: str | None = None
@@ -259,6 +262,9 @@ class LlmConfigPayload(BaseModel):
     max_tokens: int | None = None
     timeout_seconds: int | None = None
     keep_existing_api_key: bool = True
+    model_role: str | None = None
+    main_model: dict[str, Any] | None = None
+    secondary_model: dict[str, Any] | None = None
 
 
 class FeishuRecordsPayload(BaseModel):
@@ -305,6 +311,7 @@ class ScorePayload(BaseModel):
     source: str = "manual"
     segment: str = ""
     segment_label: str = ""
+    confirm_large_llm_score: bool = False
 
 
 class ReviewPayload(BaseModel):
@@ -629,7 +636,7 @@ def api_import_creators(project_id: str, payload: CreatorImportPayload) -> dict[
             creator = upsert_creator(project_id, row, score=False)
             creator_ids.append(creator["creator_id"])
             imported += 1
-        scoring = score_project(project_id, creator_ids=creator_ids, trigger_source="import")
+        scoring = score_project(project_id, use_llm=False, creator_ids=creator_ids, trigger_source="import")
         return {"imported": imported, "scoring": scoring}
     path = ROOT / payload.csv_path if payload.csv_path else None
     result = import_csv(project_id, path)
@@ -648,17 +655,47 @@ def api_update_creator(project_id: str, creator_id: str, payload: CreatorPayload
 def api_score_creators(project_id: str, payload: ScorePayload | None = None) -> dict[str, Any]:
     payload = payload or ScorePayload()
     creator_ids = [str(item) for item in payload.creator_ids if str(item or "").strip()]
-    source = payload.source or "manual_ai"
-    if source in {"rule", "manual_rule", "system", "system_rule", "batch_rule", "pgy_collect_rule"}:
+    source = payload.source or "manual_rule"
+    ai_sources = {"manual_ai", "manual_llm", "llm", "toolbar_ai", "save_plan_ai"}
+    if source not in ai_sources:
         return score_project(
             project_id,
             use_llm=False,
             creator_ids=creator_ids or None,
             trigger_source=source,
         )
-    ai_config = read_ai_config()
+    if not creator_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "ok": False,
+                "error": "llm_score_scope_required",
+                "message": "大模型评分必须先选择具体达人，禁止默认全量评分。",
+                "source": "llm",
+                "sources": {"llm": 0, "generated": 0, "rule": 0},
+                "trigger_source": source,
+                "suggestion": "请在筛选工作台勾选需要重评的达人；如需全量刷新，请使用规则评分。",
+            },
+        )
+    estimated_llm_requests = (len(creator_ids) + LLM_BATCH_MAX_CREATORS - 1) // LLM_BATCH_MAX_CREATORS if creator_ids else 0
+    estimated_max_attempts = estimated_llm_requests * LLM_SCORE_RETRY_ATTEMPTS
+    if not payload.confirm_large_llm_score:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "ok": False,
+                "error": "llm_score_confirmation_required",
+                "message": f"大模型评分必须由用户手动确认后才能执行。本次预计约 {estimated_llm_requests} 次模型请求，失败重试后最多约 {estimated_max_attempts} 次；未收到确认信号，已拦截。",
+                "source": "llm",
+                "sources": {"llm": 0, "generated": 0, "rule": 0},
+                "trigger_source": source,
+                "suggestion": "请在前端勾选达人并确认 AI 评分；自动流程和普通手动评分只会使用规则评分。",
+            },
+        )
+    all_ai_config = read_ai_config()
+    ai_config = all_ai_config.get("secondary_model") if isinstance(all_ai_config.get("secondary_model"), dict) else all_ai_config
     if not ai_config.get("api_key_configured"):
-        message = f"未配置 API Key 或环境变量 {ai_config.get('api_key_env') or 'OPENAI_API_KEY'}，无法调用大模型评分"
+        message = f"未配置 API Key（副模型）或环境变量 {ai_config.get('api_key_env') or 'OPENAI_API_KEY'}，无法调用大模型评分"
         raise HTTPException(
             status_code=400,
             detail={
@@ -669,7 +706,7 @@ def api_score_creators(project_id: str, payload: ScorePayload | None = None) -> 
                 "sources": {"llm": 0, "generated": 0, "rule": 0},
                 "trigger_source": source,
                 "llm_errors": [message],
-                "suggestion": "请在高级配置中填写 API Key，或设置对应环境变量后重启服务，再点击模型连接测试。",
+                "suggestion": "请在高级配置中填写副模型 API Key，或设置对应环境变量后重启服务，再点击模型连接测试。",
             },
         )
     try:
@@ -751,9 +788,12 @@ def api_invite_creators(project_id: str, payload: PgyInvitePayload) -> dict[str,
 
 
 @app.get("/api/projects/{project_id}/creator-pool")
-def api_creator_pool(project_id: str) -> dict[str, Any]:
+def api_creator_pool(
+    project_id: str,
+    include_screening: bool = Query(default=False),
+) -> dict[str, Any]:
     try:
-        return creator_pool(project_id)
+        return creator_pool(project_id, include_screening=include_screening)
     except KeyError:
         raise HTTPException(status_code=404, detail={"message": "项目不存在"})
 
@@ -1135,10 +1175,10 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
         except (TypeError, ValueError):
             return default
 
-    total_budget = number(project_info.get("budget"), 120000)
-    target_count = max(int(number(project_info.get("creatorCount"), 10)), 1)
-    expected_single_cost = round(total_budget / target_count, 2)
     single_hard_cap = number(project_info.get("singleBudget"), _brief_single_budget_cap(brief_text) or 20000)
+    total_budget = number(project_info.get("budget"), 0)
+    target_count = max(int(number(project_info.get("creatorCount"), 10)), 1)
+    expected_single_cost = round(total_budget / target_count, 2) if total_budget else single_hard_cap
 
     def match(*keywords: str) -> str | None:
         for name in names:
@@ -1155,9 +1195,11 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
         {"field": "近30天效果", "condition": "同T级对比", "value": "曝光、阅读、互动需达到同T级正常线，明显低于P25视为数据风险", "required": True, "feishuField": match("曝光", "阅读", "互动")},
         {"field": "预算效果效率", "condition": "核算", "value": "用报价、CPM、CPC、CPE推导单达人可获得曝光/阅读/互动总量", "required": True, "feishuField": match("cpm", "cpc", "cpe")},
         {"field": "已确认风险", "condition": "规避", "value": "仅已确认限流、违规、异常流量作为风险；缺字段不等于风险", "required": True, "feishuField": match("限流风险", "流量稳定")},
-        {"field": "孩子阶段", "condition": "匹配", "value": "小升初、初中、高中大孩家庭", "required": False, "feishuField": match("孩子年级", "孩子年龄")},
-        {"field": "地域优先级", "condition": "优先", "value": "北京、上海 IP 或中产家庭叙事", "required": False, "feishuField": match("IP", "城市", "地域")},
     ]
+    if any(keyword in brief_text for keyword in ["孩子", "年级", "初中", "高中", "小升初", "家长"]):
+        hard_filters.append({"field": "孩子阶段", "condition": "匹配", "value": "按Brief目标学段/家庭阶段匹配", "required": False, "feishuField": match("孩子年级", "孩子年龄")})
+    if _brief_mentions_region_priority(brief_text):
+        hard_filters.append({"field": "地域优先级", "condition": "优先", "value": "按Brief明确地域/IP要求优先", "required": False, "feishuField": match("IP", "城市", "地域")})
     weights = {"budget": 15, "fans": 5, "cpe": 20, "engagement": 30, "persona": 20, "content": 10}
     budget_policy = {
         "total_budget": total_budget,
@@ -1397,6 +1439,107 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
             "narrow_if_too_many": ["启用曝光中位数门槛", "启用阅读中位数门槛"],
         },
     ]
+    if wants_study_abroad:
+        quote_value = f"图文笔记：0-{single_hard_cap:g}；视频笔记：0-{single_hard_cap:g}"
+        base_quote = {"field": "合作报价", "value": quote_value, "reason": "Brief 明确低预算KOC；图文与视频报价都需受控", "control_type": "subfield_preset_or_number_range", "max": single_hard_cap}
+        base_followers = {"field": "粉丝量", "value": "0.1万以上", "reason": "低预算KOC优先放宽粉丝量，只设下限", "control_type": "preset_or_number_range", "min": 1000, "range_policy": "min_only"}
+        pgy_plan["schemes"] = [
+            {
+                "scheme_id": "study_main",
+                "name": "留学学习主池",
+                "role": "primary",
+                "precision_level": "high",
+                "target_quota": 60,
+                "max_quota": 70,
+                "goal": "优先采集教育/留学/学习日常高相关达人",
+                "target_count_range": "50-2000",
+                "required_filters": [
+                    {"field": "博主类目", "value": "教育", "sub_value": "留学教育", "reason": "留学听课宝核心相关类目"},
+                    {"field": "博主类目", "value": "教育", "sub_value": "学习日常", "reason": "学习内容占比要求的主召回入口"},
+                    {"field": "博主类目", "value": "教育", "sub_value": "大学教育", "reason": "补充大学/海外课堂学习场景"},
+                    base_followers,
+                    base_quote,
+                ],
+                "additional_filters": [],
+                "enabled_additional_filters": [
+                    {"field": "职业身份", "value": "学生", "reason": "留学生/学生画像提纯", "control_type": "checkbox_popover"},
+                    {"field": "特色背景", "value": "留学背景", "reason": "留学/海外背景提纯", "control_type": "checkbox_popover"},
+                ],
+                "filters": [],
+                "expand_if_too_few": ["先放宽职业身份/特色背景，采后复核身份", "保留报价硬约束"],
+                "narrow_if_too_many": ["启用预估互动单价", "启用阅读中位数", "启用互动中位数"],
+            },
+            {
+                "scheme_id": "video_focus",
+                "name": "视频优先学习池",
+                "role": "primary",
+                "precision_level": "high",
+                "target_quota": 30,
+                "max_quota": 40,
+                "goal": "优先采集适合视频演示听课/复盘场景的达人",
+                "target_count_range": "50-2000",
+                "required_filters": [
+                    {"field": "博主类目", "value": "教育", "sub_value": "留学教育", "reason": "留学场景主类目"},
+                    {"field": "博主类目", "value": "教育", "sub_value": "学习日常", "reason": "学习内容主类目"},
+                    {"field": "博主类目", "value": "教育", "sub_value": "大学教育", "reason": "大学/课堂场景补充"},
+                    base_followers,
+                    base_quote,
+                ],
+                "additional_filters": [],
+                "enabled_additional_filters": [
+                    {"field": "笔记类型", "value": "视频笔记为主", "reason": "Brief 明确最好视频", "control_type": "dropdown_single"},
+                    {"field": "职业身份", "value": "学生", "reason": "留学生/学生画像提纯", "control_type": "checkbox_popover"},
+                    {"field": "特色背景", "value": "留学背景", "reason": "留学/海外背景提纯", "control_type": "checkbox_popover"},
+                ],
+                "filters": [],
+                "expand_if_too_few": ["先放宽笔记类型，保留教育/留学类目", "放宽画像提纯条件并采后复核"],
+                "narrow_if_too_many": ["启用预估互动单价", "启用阅读中位数", "启用互动中位数"],
+            },
+            {
+                "scheme_id": "overseas_proxy",
+                "name": "海外生活语境补量池",
+                "role": "supplement",
+                "precision_level": "medium",
+                "target_quota": 10,
+                "max_quota": 20,
+                "precision_warning": "生活记录是海外语境代理，只能补量；采后必须复核学习内容占比。",
+                "goal": "补充有海外/校园语境但需要采后验证学习内容的达人",
+                "target_count_range": "50-2000",
+                "required_filters": [
+                    {"field": "博主类目", "value": "生活记录", "sub_value": "校园生活", "reason": "海外校园语境代理"},
+                    {"field": "博主类目", "value": "生活记录", "sub_value": "中外生活", "reason": "海外生活语境代理"},
+                    base_followers,
+                    base_quote,
+                ],
+                "additional_filters": [],
+                "enabled_additional_filters": [],
+                "filters": [],
+                "expand_if_too_few": ["放宽到教育广义补量池"],
+                "narrow_if_too_many": ["启用阅读中位数", "启用互动中位数"],
+            },
+            {
+                "scheme_id": "edu_broad_proxy",
+                "name": "广教育学习补量池",
+                "role": "supplement",
+                "precision_level": "medium",
+                "target_quota": 10,
+                "max_quota": 25,
+                "precision_warning": "语言教育/教育其他是补量入口，需采后复核留学听课场景。",
+                "goal": "补充教育泛学习达人",
+                "target_count_range": "50-2000",
+                "required_filters": [
+                    {"field": "博主类目", "value": "教育", "sub_value": "语言教育", "reason": "留学/语言学习相关补量"},
+                    {"field": "博主类目", "value": "教育", "sub_value": "教育其他", "reason": "教育广义补量"},
+                    base_followers,
+                    base_quote,
+                ],
+                "additional_filters": [],
+                "enabled_additional_filters": [],
+                "filters": [],
+                "expand_if_too_few": ["放宽画像附加筛选，采后复核"],
+                "narrow_if_too_many": ["启用阅读中位数", "启用互动中位数"],
+            },
+        ]
     project_fit_config = _fallback_project_fit_config(brief_text, brief_decomposition)
     promotion_strategy = _fallback_promotion_strategy(brief_text, brief_decomposition, project_fit_config)
     project_special_scoring = _fallback_project_special_scoring(
@@ -1405,9 +1548,14 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
         promotion_strategy,
         project_fit_config,
     )
+    koc_scoring_config = _fallback_koc_scoring_config(brief_text)
+    format_budget_policy = _fallback_format_budget_policy(brief_text, budget_policy)
+    hard_rules = _fallback_hard_rules(brief_text, project_fit_config)
     scoring_criteria = {
         "purpose": "用于采集后对达人做两阶段评分：先用找博主列表页数据做数据层分级，再用达人详情页、主页简介、笔记标题/文案做大模型人设内容判断。",
         "budget_policy": budget_policy,
+        "format_budget_policy": format_budget_policy,
+        "project_hard_rules": hard_rules,
         "tier_policy": tier_policy,
         "data_layer_scoring": data_layer_scoring,
         "hard_rules": hard_filters,
@@ -1432,6 +1580,8 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
     return {
         "briefType": "complex",
         "budgetPolicy": budget_policy,
+        "formatBudgetPolicy": format_budget_policy,
+        "hardRules": hard_rules,
         "tierPolicy": tier_policy,
         "dataLayerScoring": data_layer_scoring,
         "hardFilters": hard_filters,
@@ -1439,12 +1589,62 @@ def _fallback_screening_standard(payload: ScreeningStandardPayload) -> dict[str,
         "projectFitConfig": project_fit_config,
         "promotionStrategy": promotion_strategy,
         "projectSpecialScoring": project_special_scoring,
+        "kocScoringConfig": koc_scoring_config,
         "scoringWeights": weights,
         "scoringCriteria": scoring_criteria,
         "fieldMappings": field_mappings,
         "pgyCollectionPlan": pgy_plan,
         "summary": "已生成两阶段评分口径：先用找博主列表页的报价、近30天曝光/阅读/互动、CPM/CPC/CPE和动态T级做数据层分级，再用详情页与笔记内容证据做人设和内容质量分析。",
     }
+
+
+def _brief_mentions_total_budget(brief: str) -> bool:
+    text = str(brief or "")
+    return bool(re.search(r"(总预算|整体预算|项目预算|预算总额|总费用|整体费用|总投放预算)", text))
+
+
+def _normalize_budget_policy(value: Any, fallback: dict[str, Any], brief: str) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    result = {**fallback, **{key: val for key, val in source.items() if val not in (None, "")}}
+    single_cap = (
+        parse_number(source.get("single_hard_cap"))
+        or parse_number(source.get("singleHardCap"))
+        or parse_number(source.get("single_creator_budget_cap"))
+        or _brief_single_budget_cap(brief)
+        or parse_number(fallback.get("single_hard_cap"))
+    )
+    target_count = parse_number(source.get("target_creator_count") or source.get("targetCreatorCount") or fallback.get("target_creator_count"))
+    expected = parse_number(source.get("expected_single_cost") or source.get("expectedSingleCost") or fallback.get("expected_single_cost"))
+    total_budget = parse_number(source.get("total_budget") or source.get("totalBudget") or fallback.get("total_budget"))
+    if single_cap is not None:
+        result["single_hard_cap"] = single_cap
+        if expected is None or expected > single_cap * 1.2:
+            result["expected_single_cost"] = single_cap
+        if total_budget is not None and total_budget <= 0:
+            result["total_budget"] = ""
+        if total_budget is not None and not _brief_mentions_total_budget(brief) and target_count and total_budget / max(target_count, 1) > single_cap * 1.2:
+            result["total_budget"] = ""
+    if target_count is not None:
+        result["target_creator_count"] = int(target_count)
+    result["principle"] = str(
+        result.get("principle")
+        or "报价不是越低越好，按报价能换来的曝光/阅读/互动总量和CPM/CPC/CPE效率判断单个达人质量。"
+    )
+    return result
+
+
+def _weights_from_koc_guidance(weights: dict[str, Any], koc_scoring_config: dict[str, Any]) -> dict[str, Any]:
+    guidance = koc_scoring_config.get("weight_guidance") if isinstance(koc_scoring_config, dict) else {}
+    if not isinstance(guidance, dict) or koc_scoring_config.get("enabled") is False:
+        return weights
+    keys = ["budget", "fans", "cpe", "engagement", "persona", "content"]
+    parsed = {key: parse_number(guidance.get(key)) for key in keys}
+    if any(value is None for value in parsed.values()):
+        return weights
+    total = sum(float(value or 0) for value in parsed.values())
+    if total <= 0:
+        return weights
+    return {key: round(float(parsed[key] or 0) * 100 / total) for key in keys}
 
 
 def _ensure_pgy_scheme_count(pgy_plan: dict[str, Any], fallback_plan: dict[str, Any]) -> dict[str, Any]:
@@ -1659,6 +1859,30 @@ def _brief_prefers_video(brief: str) -> bool:
 def _brief_is_study_abroad(brief: str) -> bool:
     text = str(brief or "")
     return any(keyword in text for keyword in ["留学", "海外留学", "海外留学生", "留学生", "出国", "雅思", "托福"])
+
+
+def _brief_profile_filters_for_collection(brief: str) -> list[dict[str, Any]]:
+    text = str(brief or "")
+    filters: list[dict[str, Any]] = []
+    if any(keyword in text for keyword in ["学生", "大学生", "留学生", "海外留学生"]):
+        filters.append(
+            _pgy_filter_item(
+                "职业身份",
+                "学生",
+                "Brief 明确命中学生/留学生身份；作为采前画像提纯条件，采后仍需验证真实学习场景",
+                control_type="checkbox_popover",
+            )
+        )
+    if any(keyword in text for keyword in ["留学", "海外留学", "海外留学生", "留学生", "出国"]):
+        filters.append(
+            _pgy_filter_item(
+                "特色背景",
+                "留学背景",
+                "Brief 明确要求留学/海外背景；作为采前画像提纯条件，采后仍需验证内容占比",
+                control_type="checkbox_popover",
+            )
+        )
+    return _dedupe_filters(filters)
 
 
 def _is_default_fan_age_hard_filter(item: dict[str, Any]) -> bool:
@@ -1902,7 +2126,7 @@ def _enforce_scheme_distinct_collection_logic(pgy_plan: dict[str, Any], brief: s
         enabled = _clean_scheme_filters(scheme.get("enabled_additional_filters") or scheme.get("enabled_extra_filters") or [], allowed_fields=PGY_EXTRA_FILTER_FIELDS)
 
         is_video_scheme = index == 1 or any(keyword in text for keyword in ["video", "视频"])
-        is_overseas_proxy = study_abroad and (
+        is_overseas_proxy = study_abroad and index not in {0, 1} and (
             index == 2
             or any(keyword in text for keyword in ["overseas", "海外", "生活"])
         )
@@ -1911,8 +2135,11 @@ def _enforce_scheme_distinct_collection_logic(pgy_plan: dict[str, Any], brief: s
             or any(keyword in text for keyword in ["广", "泛", "其他"])
             or any(token in text for token in ["edu_broad", "broad_proxy", "broad_education", "broad education"])
         )
+        is_primary_scheme = str(scheme.get("role") or "").lower() == "primary" or index in {0, 1}
+        profile_filters = _brief_profile_filters_for_collection(brief)
 
         if study_abroad and index == 0:
+            required = _remove_filter(required, field="博主类目", value="生活记录")
             required = _prepend_unique_filter(required, _pgy_filter_item("博主类目", "教育", "Brief 命中留学学习主场景", control_type="tag_select_with_hover_subcategory", sub_value="留学教育"))
             required = _prepend_unique_filter(required, _pgy_filter_item("博主类目", "教育", "Brief 要求学习类内容占比高", control_type="tag_select_with_hover_subcategory", sub_value="学习日常"))
 
@@ -1956,13 +2183,23 @@ def _enforce_scheme_distinct_collection_logic(pgy_plan: dict[str, Any], brief: s
             for item in additional
             if item.get("field") == "笔记类型" and item.get("value") == "视频笔记为主"
         ]
-        additional = _dedupe_filters([*pinned_additional, *quality_filters])
+        preserved_profile_filters = [
+            item
+            for item in additional
+            if str(item.get("field") or "") in PGY_PROFILE_EXTRA_FILTER_FIELDS
+        ]
+        if study_abroad:
+            preserved_profile_filters = _dedupe_filters([*preserved_profile_filters, *profile_filters])
+        additional = _dedupe_filters([*pinned_additional, *preserved_profile_filters, *quality_filters])
         enabled = [
             item
             for item in enabled
             if item.get("field") == "笔记类型"
+            or item.get("field") in PGY_PROFILE_EXTRA_FILTER_FIELDS
             or item.get("field") in PGY_QUALITY_NARROWING_FIELDS
         ]
+        if study_abroad and is_primary_scheme:
+            enabled = _dedupe_filters([*enabled, *profile_filters])
         scheme["narrow_if_too_many"] = _quality_narrowing_labels(quality_filters)
         scheme["required_filters"] = _dedupe_filters(required)
         scheme["base_filters"] = scheme["required_filters"]
@@ -2031,6 +2268,7 @@ def _contains_any_keyword(text: str, keywords: list[str]) -> bool:
 
 def _fallback_project_fit_config(brief: str, brief_decomposition: dict[str, Any] | None = None) -> dict[str, Any]:
     text = str(brief or "")
+    is_koc = _brief_has_low_koc_budget(text) or bool(re.search(r"\bkoc\b|达人量级[^，。；;\n]*koc|项目[^，。；;\n]*koc", text, re.IGNORECASE))
     negative_constraints = []
     manual_review_rules = []
     if isinstance(brief_decomposition, dict):
@@ -2097,6 +2335,10 @@ def _fallback_project_fit_config(brief: str, brief_decomposition: dict[str, Any]
     return {
         "product_name": product_name,
         "product_category": product_category,
+        "project_delivery_type": "KOC达人投放" if is_koc else "达人投放",
+        "creator_matrix_type": "低预算KOC矩阵" if is_koc else "",
+        "is_koc_project": bool(is_koc),
+        "koc_activation_reason": "Brief明确提到KOC或达人量级为KOC时启用；不因低预算单独触发。" if is_koc else "",
         "summary": f"围绕{product_name}生成项目化评分配置，重点判断达人是否真的能自然承接产品使用场景与决策链路。",
         "target_audience_summary": target_audience_summary,
         "core_users": core_users,
@@ -2298,6 +2540,268 @@ def _fallback_project_special_scoring(
     }
 
 
+def _fallback_format_budget_policy(brief: str, budget_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    text = str(brief or "")
+    budget_policy = budget_policy if isinstance(budget_policy, dict) else {}
+    cap = (
+        parse_number(budget_policy.get("single_hard_cap"))
+        or parse_number(budget_policy.get("single_creator_budget_cap"))
+        or _brief_single_budget_cap(text)
+    )
+    preferred_format = "视频" if _brief_prefers_video(text) else "图文"
+    mentions_image = any(keyword in text for keyword in ["图文", "图片", "笔记"])
+    mentions_video = any(keyword in text for keyword in ["视频", "短视频"])
+    if mentions_image and mentions_video:
+        allowed_formats = ["图文", "视频"]
+    elif mentions_video:
+        allowed_formats = ["视频"]
+    else:
+        allowed_formats = ["图文"]
+    if preferred_format not in allowed_formats:
+        allowed_formats.append(preferred_format)
+    result = {
+        "allowed_formats": allowed_formats,
+        "preferred_format": preferred_format,
+        "single_creator_budget_cap": cap,
+        "image_quote_field": "quote_price",
+        "video_quote_field": "video_quote_price",
+        "image_quote_cap": cap,
+        "video_quote_cap": cap,
+        "premium_exception_policy": {
+            "enabled": True,
+            "data_top_percent": 5,
+            "max_budget_multiplier": 1.5,
+            "decision": "enter_detail_completion",
+            "rule": "当达人核心数据达到同量级前5%或优秀线以上，且对应合作形态报价不超过预算上限1.5倍时，不直接Pass，进入补详情/人工复核。",
+        },
+        "budget_rule": "按推荐投放形式校验预算；若偏好视频，必须读取视频报价；视频超预算但图文预算内时，只能推荐图文。",
+    }
+    return {key: value for key, value in result.items() if value not in (None, "", [])}
+
+
+def _normalize_format_budget_policy(
+    value: Any,
+    brief: str,
+    budget_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    base = _fallback_format_budget_policy(brief, budget_policy)
+    source = value if isinstance(value, dict) else {}
+    allowed = source.get("allowed_formats") or source.get("allowedFormats") or base.get("allowed_formats") or []
+    if isinstance(allowed, str):
+        allowed = [item.strip() for item in re.split(r"[、,，/|]+", allowed) if item.strip()]
+    normalized_allowed = []
+    for item in allowed if isinstance(allowed, list) else []:
+        text = str(item or "").strip()
+        if "视频" in text:
+            text = "视频"
+        elif "图文" in text or "图片" in text:
+            text = "图文"
+        if text and text not in normalized_allowed:
+            normalized_allowed.append(text)
+    preferred = str(source.get("preferred_format") or source.get("preferredFormat") or base.get("preferred_format") or "").strip()
+    if "视频" in preferred:
+        preferred = "视频"
+    elif "图文" in preferred or "图片" in preferred:
+        preferred = "图文"
+    elif normalized_allowed:
+        preferred = normalized_allowed[0]
+    if preferred and preferred not in normalized_allowed:
+        normalized_allowed.append(preferred)
+    is_koc_project = _brief_has_low_koc_budget(brief) or bool(re.search(r"\bkoc\b|达人量级[^，。；;\n]*koc|项目[^，。；;\n]*koc", str(brief or ""), re.IGNORECASE))
+    single_cap = (
+        parse_number(source.get("single_creator_budget_cap"))
+        or parse_number(source.get("singleCreatorBudgetCap"))
+        or parse_number(source.get("single_hard_cap"))
+        or parse_number(source.get("singleHardCap"))
+        or parse_number(base.get("single_creator_budget_cap"))
+    )
+    image_cap = (
+        parse_number(source.get("image_quote_cap"))
+        or parse_number(source.get("imageQuoteCap"))
+        or single_cap
+        or parse_number(base.get("image_quote_cap"))
+    )
+    video_cap = (
+        parse_number(source.get("video_quote_cap"))
+        or parse_number(source.get("videoQuoteCap"))
+        or single_cap
+        or parse_number(base.get("video_quote_cap"))
+    )
+    return {
+        **base,
+        **{key: val for key, val in source.items() if val not in (None, "", [])},
+        "allowed_formats": normalized_allowed or base.get("allowed_formats") or ["图文"],
+        "preferred_format": preferred or base.get("preferred_format") or "图文",
+        "single_creator_budget_cap": single_cap,
+        "image_quote_field": str(source.get("image_quote_field") or source.get("imageQuoteField") or base.get("image_quote_field") or "quote_price"),
+        "video_quote_field": str(source.get("video_quote_field") or source.get("videoQuoteField") or base.get("video_quote_field") or "video_quote_price"),
+        "image_quote_cap": image_cap,
+        "video_quote_cap": video_cap,
+        "koc_budget_gate": {
+            "enabled": bool(is_koc_project),
+            "activation_rule": "仅当Brief明确KOC或项目配置选择KOC时启用；低预算本身不自动触发KOC结构。",
+            "stage1_decision": "一阶段只决定入库/补详情优先级，不直接产出强推荐。",
+        },
+        "premium_exception_policy": _normalize_premium_exception_policy(
+            source.get("premium_exception_policy") or source.get("premiumExceptionPolicy"),
+            base.get("premium_exception_policy") if isinstance(base.get("premium_exception_policy"), dict) else {},
+        ),
+    }
+
+
+def _normalize_premium_exception_policy(value: Any, fallback: dict[str, Any]) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    result = {**fallback, **{key: val for key, val in source.items() if val not in (None, "")}}
+    if "maxBudgetMultiplier" in source:
+        result["max_budget_multiplier"] = source.get("maxBudgetMultiplier")
+    if "dataTopPercent" in source:
+        result["data_top_percent"] = source.get("dataTopPercent")
+    result["enabled"] = result.get("enabled") is not False
+    multiplier = parse_number(result.get("max_budget_multiplier"))
+    top_percent = parse_number(result.get("data_top_percent"))
+    result["max_budget_multiplier"] = multiplier if multiplier is not None else 1.5
+    result["data_top_percent"] = top_percent if top_percent is not None else 5
+    result["decision"] = str(result.get("decision") or "enter_detail_completion")
+    return result
+
+
+KOC_SAMPLE_CALIBRATED_SCORING_GUIDE = {
+    "source": "真实优质样本校准后的规则",
+    "sample_size": 126,
+    "quote_reference": {"median": 600, "p75": 780, "accept_max": 1000},
+    "read_reference": {"p25": 1279, "median": 2402, "p75": 4117},
+    "interaction_reference": {"p25": 116, "median": 274, "p75": 461},
+    "efficiency_reference": {"cpe_median": 2.16, "cpe_p75": 3.81, "cpe_observe_max": 10, "cpm_p75": 65.85, "cpm_risk_max": 100},
+    "content_reference": {"target_content_required_ratio": 0.5, "identity_trace_reference_ratio": 0.25},
+    "weight_guidance": {"budget": 18, "fans": 5, "cpe": 22, "engagement": 25, "persona": 20, "content": 10},
+    "decision_principles": [
+        "一阶段只决定入库/补详情优先级，不直接产出强推荐。",
+        "粉丝量只做T级坐标，CPE、阅读、互动和内容证据权重更高。",
+        "缺主页、近期笔记正文、合作笔记或回复率时，不得直接强推荐。",
+        "vlog/旅行/海外日常等冲突内容按占比风险处理，不因单个关键词直接Pass。",
+        "只有双方报价均超预算且无高数据溢价例外、无接单权限、回复率明确低于阈值、链接失效等才硬Pass。",
+    ],
+}
+
+
+def _fallback_koc_scoring_config(brief: str) -> dict[str, Any]:
+    if not (_brief_has_low_koc_budget(brief) or re.search(r"\bkoc\b|达人量级[^，。；;\n]*koc|项目[^，。；;\n]*koc", str(brief or ""), re.IGNORECASE)):
+        return {}
+    return {
+        "enabled": True,
+        "architecture": "koc_two_stage_scoring",
+        "stage1_labels": ["P0", "P1", "P2", "P3", "不入库"],
+        "stage1_thresholds": {
+            "budget_full_score_max": 800,
+            "budget_accept_max": 1000,
+            "premium_backup_max": 1600,
+            "read_priority_min": 1000,
+            "read_strong_min": 2400,
+            "interaction_priority_min": 100,
+            "interaction_strong_min": 274,
+            "cpe_strong_max": 3.8,
+            "cpe_priority_max": 7,
+            "cpe_observe_max": 10,
+            "cpm_risk_max": 100,
+        },
+        "detail_stage_rules": {
+            "note_sample_min": 8,
+            "minimum_sample_for_decision": 5,
+            "target_content_required_ratio": 0.5,
+            "identity_trace_reference_ratio": 0.25,
+            "product_scene_strong_ratio": 0.25,
+            "conflict_warning_ratio": 0.5,
+            "conflict_is_hard_only_when_target_below": 0.5,
+            "missing_evidence_status": "待人工确认",
+        },
+        "final_match_thresholds": {
+            "good_read_min": 1000,
+            "good_interaction_min": 100,
+            "good_cpe_max": 7,
+            "strong_read_min": 2400,
+            "strong_interaction_min": 274,
+            "strong_cpe_max": 3.8,
+        },
+        "weight_guidance": {
+            "budget": 18,
+            "fans": 5,
+            "cpe": 22,
+            "engagement": 25,
+            "persona": 20,
+            "content": 10,
+        },
+        "negative_policy": "vlog/旅行/海外日常按占比风险处理；只在学习内容不足且冲突内容占比过高时强降级。",
+        "evidence_policy": "一阶段只决定入库/补详情优先级；缺主页简介、近期笔记正文、合作笔记或回复率时不得直接强推荐。",
+    }
+
+
+def _normalize_koc_scoring_config(value: Any, brief: str) -> dict[str, Any]:
+    base = _fallback_koc_scoring_config(brief)
+    source = value if isinstance(value, dict) else {}
+    if not base and not source:
+        return {}
+    result = {**base, **{key: val for key, val in source.items() if val not in (None, "", [])}}
+    for section in ("stage1_thresholds", "detail_stage_rules", "final_match_thresholds", "weight_guidance"):
+        merged = {}
+        if isinstance(base.get(section), dict):
+            merged.update(base[section])
+        if isinstance(source.get(section), dict):
+            merged.update({key: val for key, val in source[section].items() if val not in (None, "")})
+        if merged:
+            result[section] = merged
+    result["enabled"] = result.get("enabled") is not False
+    return result
+
+
+def _fallback_hard_rules(brief: str, project_fit_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    text = str(brief or "")
+    fit = project_fit_config if isinstance(project_fit_config, dict) else {}
+    study_abroad = _brief_is_study_abroad(text) or any("留学" in str(item) or "海外" in str(item) for item in (fit.get("core_users") or []))
+    low_like_threshold = 20 if any(keyword in text for keyword in ["个位数", "十几", "低赞", "点赞"]) else None
+    return {
+        "must_have_commercial_order": any(keyword in text for keyword in ["接过商单", "商单", "合作笔记"]),
+        "reply_rate_min": 0.5 if any(keyword in text for keyword in ["回复率", "回复"]) else 0.5,
+        "recent_update_days": 30 if any(keyword in text for keyword in ["近1个月", "近一个月", "1个月内", "30天", "近期"]) else None,
+        "low_like_threshold": low_like_threshold,
+        "ignore_low_like_if_same_day": True,
+        "must_have_identity_match": bool(study_abroad),
+        "must_have_study_abroad_trace": bool(study_abroad),
+        "must_have_study_content_ratio": 0.5 if any(keyword in text for keyword in ["50%以上学习", "50%学习", "学习类内容需要50", "学习类内容 50"]) else None,
+        "commercial_order_rule": "仅在已有合作笔记/商单字段明确证明时通过；缺字段进入补全，不直接淘汰。",
+        "identity_rule": "必须基于类目、人设、标签、地域、近期标题/正文、主页信息等多字段综合判断，不能只看昵称。",
+    }
+
+
+def _normalize_hard_rules(value: Any, brief: str, project_fit_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = _fallback_hard_rules(brief, project_fit_config)
+    source = value if isinstance(value, dict) else {}
+    result = {**base, **{key: val for key, val in source.items() if val not in (None, "")}}
+    aliases = {
+        "mustHaveCommercialOrder": "must_have_commercial_order",
+        "replyRateMin": "reply_rate_min",
+        "recentUpdateDays": "recent_update_days",
+        "lowLikeThreshold": "low_like_threshold",
+        "ignoreLowLikeIfSameDay": "ignore_low_like_if_same_day",
+        "mustHaveIdentityMatch": "must_have_identity_match",
+        "mustHaveStudyAbroadTrace": "must_have_study_abroad_trace",
+        "mustHaveStudyContentRatio": "must_have_study_content_ratio",
+    }
+    for source_key, target_key in aliases.items():
+        if source_key in source and source[source_key] not in (None, ""):
+            result[target_key] = source[source_key]
+    for key in ("reply_rate_min", "must_have_study_content_ratio"):
+        parsed = ratio(result.get(key))
+        result[key] = parsed
+    for key in ("recent_update_days", "low_like_threshold"):
+        parsed = parse_number(result.get(key))
+        result[key] = int(parsed) if parsed is not None else None
+    for key in ("must_have_commercial_order", "ignore_low_like_if_same_day", "must_have_identity_match", "must_have_study_abroad_trace"):
+        result[key] = bool(result.get(key))
+    result["koc_activation_rule"] = "仅当Brief明确KOC或项目配置选择KOC时启用；低预算本身不自动触发KOC结构。"
+    result["stage_policy"] = "KOC项目先做一阶段入库/补详情优先级，再做二阶段项目匹配；证据不足输出待人工确认或备选。"
+    return result
+
+
 def _normalize_project_special_scoring(value: Any, fallback: dict[str, Any]) -> dict[str, Any]:
     config = copy.deepcopy(value) if isinstance(value, dict) else {}
     if config.get("enabled") is False:
@@ -2393,8 +2897,44 @@ def _hydrate_screening_plan_project_defaults(plan: dict[str, Any], brief: str) -
         normalized.get("projectSpecialScoring") or normalized.get("specialScoringPolicy") or normalized.get("project_scoring_policy"),
         _fallback_project_special_scoring(brief, brief_decomposition, promotion_strategy, project_fit_config),
     )
+    normalized["kocScoringConfig"] = _normalize_koc_scoring_config(
+        normalized.get("kocScoringConfig") or normalized.get("koc_scoring_config"),
+        brief,
+    )
+    budget_policy_source = normalized.get("budgetPolicy")
+    if not isinstance(budget_policy_source, dict):
+        scoring_criteria = normalized.get("scoringCriteria") if isinstance(normalized.get("scoringCriteria"), dict) else {}
+        budget_policy_source = scoring_criteria.get("budget_policy") if isinstance(scoring_criteria.get("budget_policy"), dict) else {}
+    budget_policy = _normalize_budget_policy(
+        budget_policy_source,
+        _fallback_screening_standard(ScreeningStandardPayload(brief=brief)).get("budgetPolicy") if brief else {},
+        brief,
+    )
+    normalized["budgetPolicy"] = budget_policy
+    if isinstance(normalized.get("kocScoringConfig"), dict) and normalized["kocScoringConfig"].get("enabled") is not False:
+        normalized["scoringWeights"] = _weights_from_koc_guidance(
+            normalized.get("scoringWeights") if isinstance(normalized.get("scoringWeights"), dict) else {},
+            normalized["kocScoringConfig"],
+        )
+    normalized["formatBudgetPolicy"] = _normalize_format_budget_policy(
+        normalized.get("formatBudgetPolicy") or normalized.get("format_budget_policy"),
+        brief,
+        budget_policy,
+    )
+    normalized["hardRules"] = _normalize_hard_rules(
+        normalized.get("hardRules") or normalized.get("hard_rules") or normalized.get("projectHardRules"),
+        brief,
+        project_fit_config,
+    )
     normalized["projectFitConfig"] = project_fit_config
     normalized["promotionStrategy"] = promotion_strategy
+    scoring_criteria = normalized.get("scoringCriteria") if isinstance(normalized.get("scoringCriteria"), dict) else {}
+    if scoring_criteria:
+        normalized["scoringCriteria"] = {
+            **scoring_criteria,
+            "format_budget_policy": scoring_criteria.get("format_budget_policy") or normalized["formatBudgetPolicy"],
+            "project_hard_rules": scoring_criteria.get("project_hard_rules") or normalized["hardRules"],
+        }
     return normalized
 
 
@@ -2472,9 +3012,39 @@ def _normalize_screening_standard(result: dict[str, Any], payload: ScreeningStan
         pgy_plan = _enforce_scheme_distinct_collection_logic(pgy_plan, payload.brief)
         pgy_plan = _normalize_scheme_filter_structure(pgy_plan)
     scoring_criteria = plan.get("scoringCriteria") or plan.get("matchingCriteria") or fallback["scoringCriteria"]
-    budget_policy = plan.get("budgetPolicy") or (scoring_criteria.get("budget_policy") if isinstance(scoring_criteria, dict) else None) or fallback.get("budgetPolicy") or {}
+    budget_policy = _normalize_budget_policy(
+        plan.get("budgetPolicy") or (scoring_criteria.get("budget_policy") if isinstance(scoring_criteria, dict) else None),
+        fallback.get("budgetPolicy") if isinstance(fallback.get("budgetPolicy"), dict) else {},
+        payload.brief,
+    )
+    format_budget_policy = _normalize_format_budget_policy(
+        plan.get("formatBudgetPolicy")
+        or plan.get("format_budget_policy")
+        or result.get("formatBudgetPolicy")
+        or result.get("format_budget_policy"),
+        payload.brief,
+        budget_policy,
+    )
+    hard_rules = _normalize_hard_rules(
+        plan.get("hardRules")
+        or plan.get("hard_rules")
+        or plan.get("projectHardRules")
+        or result.get("hardRules")
+        or result.get("hard_rules")
+        or result.get("projectHardRules"),
+        payload.brief,
+        project_fit_config,
+    )
     tier_policy = plan.get("tierPolicy") or (scoring_criteria.get("tier_policy") if isinstance(scoring_criteria, dict) else None) or fallback.get("tierPolicy") or {}
     data_layer_scoring = plan.get("dataLayerScoring") or (scoring_criteria.get("data_layer_scoring") if isinstance(scoring_criteria, dict) else None) or fallback.get("dataLayerScoring") or {}
+    koc_scoring_config = _normalize_koc_scoring_config(
+        plan.get("kocScoringConfig")
+        or plan.get("koc_scoring_config")
+        or result.get("kocScoringConfig")
+        or result.get("koc_scoring_config"),
+        payload.brief,
+    )
+    weights = _weights_from_koc_guidance(weights, koc_scoring_config)
     if isinstance(scoring_criteria, dict):
         post_score_rules = scoring_criteria.get("post_score_rules")
         if not isinstance(post_score_rules, list):
@@ -2482,6 +3052,8 @@ def _normalize_screening_standard(result: dict[str, Any], payload: ScreeningStan
         scoring_criteria = {
             **scoring_criteria,
             "budget_policy": scoring_criteria.get("budget_policy") or budget_policy,
+            "format_budget_policy": scoring_criteria.get("format_budget_policy") or format_budget_policy,
+            "project_hard_rules": scoring_criteria.get("project_hard_rules") or hard_rules,
             "tier_policy": scoring_criteria.get("tier_policy") or tier_policy,
             "data_layer_scoring": scoring_criteria.get("data_layer_scoring") or data_layer_scoring,
             "dimension_weights": scoring_criteria.get("dimension_weights") or weights,
@@ -2492,6 +3064,8 @@ def _normalize_screening_standard(result: dict[str, Any], payload: ScreeningStan
     normalized = {
         "briefType": plan.get("briefType") or fallback["briefType"],
         "budgetPolicy": budget_policy,
+        "formatBudgetPolicy": format_budget_policy,
+        "hardRules": hard_rules,
         "tierPolicy": tier_policy,
         "dataLayerScoring": data_layer_scoring,
         "collectionHardFilters": collection_hard_filters,
@@ -2501,6 +3075,7 @@ def _normalize_screening_standard(result: dict[str, Any], payload: ScreeningStan
         "projectFitConfig": project_fit_config,
         "promotionStrategy": promotion_strategy,
         "projectSpecialScoring": project_special_scoring,
+        "kocScoringConfig": koc_scoring_config,
         "scoringWeights": weights,
         "scoringCriteria": scoring_criteria,
         "fieldMappings": plan.get("fieldMappings") or result.get("fieldMappings") or fallback["fieldMappings"],
@@ -2593,6 +3168,8 @@ def _sync_screening_plan_criteria(plan: dict[str, Any]) -> dict[str, Any]:
     scoring_criteria = {
         **scoring_criteria,
         "budget_policy": scoring_criteria.get("budget_policy") or normalized.get("budgetPolicy") or {},
+        "format_budget_policy": scoring_criteria.get("format_budget_policy") or normalized.get("formatBudgetPolicy") or {},
+        "project_hard_rules": scoring_criteria.get("project_hard_rules") or normalized.get("hardRules") or {},
         "tier_policy": scoring_criteria.get("tier_policy") or normalized.get("tierPolicy") or {},
         "data_layer_scoring": scoring_criteria.get("data_layer_scoring") or normalized.get("dataLayerScoring") or {},
         "hard_rules": scoring_hard_filters,
@@ -2610,6 +3187,10 @@ def _sync_screening_plan_criteria(plan: dict[str, Any]) -> dict[str, Any]:
             normalized.get("promotionStrategy") if isinstance(normalized.get("promotionStrategy"), dict) else {},
             normalized.get("projectFitConfig") if isinstance(normalized.get("projectFitConfig"), dict) else {},
         ),
+    )
+    normalized["kocScoringConfig"] = _normalize_koc_scoring_config(
+        normalized.get("kocScoringConfig") or normalized.get("koc_scoring_config"),
+        brief_text,
     )
     return normalized
 
@@ -2927,6 +3508,8 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
         "然后再输出两个互相独立但可协同使用的结果：第一，面向小红书蒲公英找博主页面的多套筛选方案，必须只使用真实蒲公英筛选字段；"
         "第二，面向本项目工具的两阶段评分机制：先用找博主列表页数据做数据层分级，再用达人详情页、主页简介、笔记标题/文案做人设、内容和卖点承接评分。"
         "同时必须生成 projectSpecialScoring：这是该项目专属初筛评分逻辑，必须由当前 Brief、briefDecomposition 和 promotionStrategy 推导，保存后由系统解释执行；不要依赖代码里的项目名或历史模板。"
+        "如果当前 Brief 明确提到 KOC，或项目配置已选择 KOC，还必须生成 kocScoringConfig：它是项目专属评分配置文件的一部分，系统通用评分架构只负责读取并执行这些阈值和规则。"
+        "kocScoringConfig 的生成方向必须参考真实优质样本校准后的规则：低预算KOC更重视报价-效果效率、阅读/互动中位数、人设和内容证据；粉丝量只作坐标；证据缺失和冲突内容按阶段规则处理。"
         "briefDecomposition 必须明确区分蒲公英后台能直接执行的白名单前置筛选、只能宽代理表达的 proxy 条件、采后评分/硬规则、以及人工复核项。"
         "pgy_required 只代表蒲公英页面可执行的前置条件；scoringCriteria.hard_rules 代表采后判断的合作门槛。蒲公英不能前置，不等于不能成为采后硬性规则。"
         "无法被蒲公英字段直接筛选的业务语义，不得写成 pgy_required；但如果 Brief 明确将其设为合作门槛，可进入 scoringCriteria.hard_rules 或 manual_review_rules，并说明证据来源和判断方式。"
@@ -3023,6 +3606,8 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
                 "negative_fit_risks": ["不适合承接该产品的内容/人群/表达风险"],
             },
             "budgetPolicy": {"total_budget": "总达人预算", "target_creator_count": "目标达人数量", "expected_single_cost": "总预算/目标人数", "single_hard_cap": "单达人硬上限", "principle": "报价与效果总量/效率的关系"},
+            "formatBudgetPolicy": {"allowed_formats": ["图文", "视频"], "preferred_format": "首选合作形态", "single_creator_budget_cap": "单达人预算", "image_quote_cap": "图文报价上限", "video_quote_cap": "视频报价上限", "premium_exception_policy": {"enabled": True, "data_top_percent": 5, "max_budget_multiplier": 1.5}, "budget_rule": "按推荐投放形态校验预算；高性价比溢价例外进入补详情"},
+            "hardRules": {"must_have_commercial_order": "是否必须接过商单", "reply_rate_min": "回复率下限", "recent_update_days": "近期更新窗口", "low_like_threshold": "低赞风险阈值", "ignore_low_like_if_same_day": "当天笔记是否豁免", "must_have_identity_match": "是否要求人设匹配", "must_have_study_abroad_trace": "是否要求留学/海外痕迹", "must_have_study_content_ratio": "目标内容占比要求"},
             "tierPolicy": {"principle": "按类目、项目和抓取样本动态生成T级；粉丝量只作为比较坐标", "benchmark_method": "用P25/P50/P75/P90建立同T级基准"},
             "dataLayerScoring": {"purpose": "找博主列表页数据分级", "core_metrics": ["报价", "近30天曝光", "近30天阅读", "近30天互动", "CPM", "CPC", "CPE"], "levels": [{"level": "S|A|B|C", "rule": "分级规则"}]},
             "projectSpecialScoring": {
@@ -3081,11 +3666,52 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
                 },
                 "ignore_hard_filter_keywords": ["只有当 Brief 明确不应使用某些历史/代理硬筛时填写，例如不适用的年龄画像词"],
             },
+            "kocScoringConfig": {
+                "enabled": "仅当 Brief 明确 KOC 或项目配置选择 KOC 时为 true；不能只因预算低自动启用",
+                "architecture": "koc_two_stage_scoring",
+                "stage1_labels": ["P0", "P1", "P2", "P3", "不入库"],
+                "stage1_thresholds": {
+                    "budget_full_score_max": "预算满分线；低预算KOC可参考优质样本中位报价/上四分位",
+                    "budget_accept_max": "预算可接受硬线",
+                    "premium_backup_max": "数据极强但略超预算时进入备选/补详情的上限",
+                    "read_priority_min": "一阶段优先补采阅读线",
+                    "read_strong_min": "强数据阅读线",
+                    "interaction_priority_min": "一阶段优先补采互动线",
+                    "interaction_strong_min": "强数据互动线",
+                    "cpe_strong_max": "强CPE线",
+                    "cpe_priority_max": "优先补采CPE线",
+                    "cpe_observe_max": "观察CPE线",
+                    "cpm_risk_max": "CPM风险线；一般不直接淘汰",
+                },
+                "detail_stage_rules": {
+                    "note_sample_min": "建议采样笔记数，例如8-20",
+                    "minimum_sample_for_decision": "低于该样本数只能待人工确认/备选",
+                    "target_content_required_ratio": "目标内容占比要求",
+                    "identity_trace_reference_ratio": "身份痕迹参考占比",
+                    "product_scene_strong_ratio": "产品场景强推荐占比线",
+                    "conflict_warning_ratio": "冲突内容占比预警线",
+                    "conflict_is_hard_only_when_target_below": "只有目标内容占比低于该值时，冲突内容才强降级",
+                    "missing_evidence_status": "证据不足时输出状态",
+                },
+                "final_match_thresholds": {
+                    "good_read_min": "二阶段推荐阅读线",
+                    "good_interaction_min": "二阶段推荐互动线",
+                    "good_cpe_max": "二阶段推荐CPE线",
+                    "strong_read_min": "二阶段强推荐阅读线",
+                    "strong_interaction_min": "二阶段强推荐互动线",
+                    "strong_cpe_max": "二阶段强推荐CPE线",
+                },
+                "weight_guidance": {"budget": 18, "fans": 5, "cpe": 22, "engagement": 25, "persona": 20, "content": 10},
+                "negative_policy": "vlog/旅行/海外日常等冲突内容按占比风险处理，不因单个关键词直接Pass",
+                "evidence_policy": "一阶段只决定入库/补详情优先级；缺主页/笔记正文/合作笔记/回复率时不得直接强推荐",
+            },
             "hardFilters": [{"field": "只允许明确事实类硬性标准", "condition": ">=|<=|规避|同T级对比|核算", "value": "阈值或规则", "required": True, "feishuField": "匹配到的飞书字段名或空"}],
             "scoringWeights": {"budget": 15, "fans": 5, "cpe": 20, "engagement": 30, "persona": 20, "content": 10},
             "scoringCriteria": {
                 "purpose": "说明这是两阶段评分机制，不等同于蒲公英筛选条件",
                 "budget_policy": "同 budgetPolicy",
+                "format_budget_policy": "同 formatBudgetPolicy",
+                "project_hard_rules": "同 hardRules",
                 "tier_policy": "同 tierPolicy",
                 "data_layer_scoring": "同 dataLayerScoring",
                 "hard_rules": [{"field": "硬性淘汰项仅能基于已确认事实", "condition": "规则", "value": "阈值", "evidenceField": "使用哪个达人字段判断"}],
@@ -3107,6 +3733,8 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
             "pgyCollectionPlan": {
                 "strategy": "说明如何用4套独立蒲公英方案扩展候选达人；每套方案由 required_filters + additional_filters 组成，先用必备筛选条件预检推荐数，数量过多时按顺序叠加附加筛选条件",
                 "target_count_range": "50-2000",
+                "expected_request_constraints": "系统会根据 filters 自动生成真实蒲公英 API 请求期望约束；模型不要编造字段，只需输出 filters",
+                "application_validation": {"mode": "api_request_body", "on_mismatch": "repair_then_validate", "stop_on_repair_failed": True},
                 "schemes": [
                     {
                         "scheme_id": "短英文ID",
@@ -3143,6 +3771,8 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
                         "filters": [],
                         "expand_if_too_few": ["推荐博主数太少时先放宽哪些条件"],
                         "narrow_if_too_many": ["推荐博主数太多时追加哪些真实蒲公英条件"],
+                        "expected_request_constraints": "系统根据该方案实际启用 filters 自动生成，用于校验 contentTag/personalTags/报价/阅读/互动等请求体字段",
+                        "application_validation": {"mode": "api_request_body", "on_mismatch": "repair_then_validate", "stop_on_repair_failed": True},
                     }
                 ],
                 "filters": [
@@ -3163,9 +3793,15 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
         },
         "pgyFilterCatalog": PGY_FILTER_CATALOG,
         "pgyFilterFieldGuide": _pgy_filter_field_guide(),
+        "kocSampleCalibratedScoringGuide": KOC_SAMPLE_CALIBRATED_SCORING_GUIDE,
         "constraints": [
             "必须输出 briefDecomposition 和 promotionStrategy；promotionStrategy 要先于 pgyCollectionPlan/scoringCriteria 表达产品推广策略如何驱动筛选和评分",
             "必须输出 projectSpecialScoring；它是保存到项目 screening_plan 的专属初筛评分逻辑，系统会解析 identity/scene/data/efficiency/tier_rules/negative/project_fit_config_patch 来给达人评分；不得依赖代码硬编码项目名称",
+            "当 Brief 明确 KOC 或项目配置选择 KOC 时，必须输出 kocScoringConfig；这是项目专属评分配置，不是代码架构本身。更换项目时系统评分代码保持不变，只替换该配置。",
+            "kocScoringConfig 必须吸收 kocSampleCalibratedScoringGuide 的真实优质样本校准方向：报价参考中位600/P75约780/1000以内优先，阅读参考P25约1279/中位2402，互动参考P25约116/中位274，CPE参考中位2.16/P75约3.81；项目Brief有更强证据时可调整但要保守说明。",
+            "KOC评分必须保留两阶段边界：P0/P1/P2/P3只表示入库和补详情优先级；强推荐/推荐/备选/待人工确认/不推荐/Pass在详情证据补全后判断。",
+            "KOC硬Pass只用于明确事实类风险：对应合作形态均超预算且无高数据溢价例外、无接单权限、回复率明确低于阈值、链接失效或明确不合作。缺合作笔记、缺主页正文、缺回复率只能降级为待确认/备选，不能强推荐也不能直接Pass。",
+            "KOC冲突内容如vlog/旅行/海外日常必须按占比和目标内容占比共同判断：目标内容足够时只做预警，目标内容不足且冲突占比过高才强降级。",
             "projectSpecialScoring 的身份关键词、场景关键词、负向关键词、S/A/B+分段和封顶规则都必须从当前 Brief、briefDecomposition 和 promotionStrategy 推导；如果 Brief 证据不足，写低置信关键词或保守阈值，不要套用历史项目",
             "promotionStrategy 必须基于当前 Brief 逐项推导产品定位、目标用户、决策者、核心卖点、内容场景、转化路径和负向风险；禁止套用固定产品名模板或把某个历史项目方案照搬到新项目",
             "必须先输出 promotion_audience_analysis：区分当前项目的真实使用者、决策者、内容影响对象和非目标人群；所有判断都必须从当前 Brief、产品场景和转化链路推导，不能套用行业默认人群",
@@ -3177,6 +3813,10 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
             "如果 Brief 使用“必须、硬性、不要、不合作、不推荐、需要达到”等强约束表达，应优先保留其约束强度；只有当无法判断证据来源或无法稳定判断时，才标记为 manual_review，而不是自动降为加减分",
             "pgyFilterFieldGuide 是模型生成蒲公英筛选条件的字段字典：必须先查字段是否存在、usage_group 是否允许、control_type 怎么填写、options/option_groups/sub_fields 有哪些可选项，再输出筛选条件",
             "pgyCollectionPlan 只能使用 pgyFilterCatalog/pgyFilterFieldGuide 中真实存在的字段和控件类型；白名单外字段不得进入前置筛选",
+            "采前筛选方案必须生成可被蒲公英 API 请求体验证的 filters；系统会把 filters 转换为 expected_request_constraints，并用真实请求体校验。",
+            "如果 Brief 明确提到 KOC 或项目配置选择 KOC，且单达人预算低于2000元，合作报价必须同时覆盖图文笔记和视频笔记两个子字段；不能只筛图文导致视频高价混入。",
+            "低预算 KOC 初始方案优先使用温和但可验证的质量门槛，例如阅读中位数下限和互动中位数下限；这些进入 additional_filters，预检数量过多时再逐步启用。",
+            "生成后应用必须以真实蒲公英达人列表 API 请求为准；若请求体缺少期望字段、出现 similarUserId、或为空筛选请求，系统应先尝试重组/修复为正确 API 请求并再次校验；只有修复失败才停止采集。",
             "无法被蒲公英字段直接筛选的业务语义，不得写成 pgy_required；但如果 Brief 明确将其设为合作门槛，可进入 scoringCriteria.hard_rules 或 manual_review_rules，并说明证据来源和判断方式",
             "母婴、教育、生活记录等宽类目如果用于承接复杂业务意图，必须在 proxy_filters 标记 mapping_type=proxy、confidence=low/medium、proxy_risk，并限制 max_quota",
             "主池必须优先使用 direct 且高置信字段；补量池可以使用 proxy，但不能吞掉全部配额",
@@ -3203,6 +3843,7 @@ def optimize_screening_standard(project_id: str, payload: ScreeningStandardPaylo
             "营销目标是低优先级附加条件，只能放入 additional_filters 或用户手动 filters，不能放入 required_filters；字段结构要用父子指标，如 {field:'营销目标', value:'互动表现', goal:'种草', parent_value:'种草', control_type:'marketing_goal_metric'}",
             "地域/粉丝地域只有 Brief 明确强调地域、IP、城市优先/必须/重点覆盖时才放入筛选条件；仅出现城市案例或品牌叙事时不要自动加入地域",
             "家庭身份、职业身份、特色背景、母婴阶段属于高频画像筛选；Brief 明确要求且选项真实存在时，可以放入 additional_filters 或 enabled_additional_filters，但不要放入 required_filters，也不要强行解释为已精准满足业务语义。",
+            "如果 Brief 明确要求留学背景/海外留学生，应把 {field:'特色背景', value:'留学背景'} 放入主池和视频池 additional_filters 与 enabled_additional_filters；如果 Brief 明确要求学生/留学生，应把 {field:'职业身份', value:'学生'} 放入主池和视频池 additional_filters 与 enabled_additional_filters。它们是采前提纯条件，采后仍需验证真实身份和学习内容占比。",
             "不要在 required_filters 或自动 filters 中加入 行业推荐博主、平台推荐、近期合作品牌、按博主粉丝推荐、笔记类目、内容题材；这些需要人工输入/确认或容易误用的条件只有用户在前端手动添加时才允许进入 filters。",
             "超出估量时必须按顺序追加能明确缩小范围且提高达人质量的指标条件：预估互动单价(CPE)、曝光中位数、阅读中位数、互动中位数、预估阅读单价(CPC)；不要自动追加预估CPM，也不要用地域、常规剔除来充当自动收紧条件。画像筛选仅在 Brief 明确要求时使用，不能作为泛化收紧手段。",
             "笔记类型、预估互动单价、曝光中位数、阅读中位数、互动中位数、预估阅读单价等提质条件放入 additional_filters；除视频优先池的“视频笔记为主”可默认启用外，其余默认非必要；如果必备筛选下博主过多，按 additional_filters 数组顺序逐个叠加，越靠上越先启用，一旦数量达标就不再继续加下面的条件；门槛要温和，避免一追加就只剩十几名推荐。",
@@ -3317,10 +3958,12 @@ def _analyze_table_field_mapping(
     target: Any,
     selected: dict[str, Any],
     fields: list[dict[str, Any]],
+    *,
+    use_llm: bool = False,
 ) -> dict[str, Any]:
     table_id = _table_identifier(selected)
     field_names = _field_signature(fields)
-    plan = analyze_field_mapping(field_names, default_source_rows(), use_llm=True)
+    plan = analyze_field_mapping(field_names, default_source_rows(), use_llm=use_llm)
     return {
         **plan,
         "resource_type": target.resource_type,
@@ -3356,7 +3999,7 @@ def _load_tables_and_fields(client: FeishuClient, target: Any) -> tuple[list[dic
     return tables, fields_by_id
 
 
-def _refresh_feishu_field_mapping_cache(project_id: str) -> dict[str, Any]:
+def _refresh_feishu_field_mapping_cache(project_id: str, *, use_llm: bool = False) -> dict[str, Any]:
     config, client, target = _load_feishu_client(project_id)
     tables, fields_by_id = _load_tables_and_fields(client, target)
     cache: dict[str, Any] = {}
@@ -3365,7 +4008,7 @@ def _refresh_feishu_field_mapping_cache(project_id: str) -> dict[str, Any]:
         fields = fields_by_id.get(table_id) or []
         if not table_id or not fields:
             continue
-        cache[_mapping_cache_key(target.resource_type, table_id)] = _analyze_table_field_mapping(target, table, fields)
+        cache[_mapping_cache_key(target.resource_type, table_id)] = _analyze_table_field_mapping(target, table, fields, use_llm=use_llm)
     config["target"] = target.as_dict()
     config["field_mapping_cache"] = cache
     return _write_feishu_config(project_id, config)
@@ -3392,12 +4035,14 @@ def _ensure_field_mapping_plan(
     target: Any,
     selected: dict[str, Any],
     fields: list[dict[str, Any]],
+    *,
+    use_llm: bool = False,
 ) -> dict[str, Any]:
     table_id = _table_identifier(selected)
     cached = _cached_field_mapping_plan(config, target, table_id, fields)
-    if cached:
+    if cached and not use_llm:
         return cached
-    plan = _analyze_table_field_mapping(target, selected, fields)
+    plan = _analyze_table_field_mapping(target, selected, fields, use_llm=use_llm)
     cache = config.get("field_mapping_cache") if isinstance(config.get("field_mapping_cache"), dict) else {}
     cache[_mapping_cache_key(target.resource_type, table_id)] = plan
     config["field_mapping_cache"] = cache
@@ -3757,6 +4402,7 @@ def list_feishu_tables(project_id: str = Query(default="youdao_001")) -> dict[st
 def list_feishu_fields(
     project_id: str = Query(default="youdao_001"),
     table_id: str | None = Query(default=None),
+    use_ai_mapping: bool = Query(default=False),
 ) -> dict[str, Any]:
     try:
         config, client, target = _load_feishu_client(project_id)
@@ -3773,8 +4419,11 @@ def list_feishu_fields(
             fields = client.list_bitable_fields(target.token, selected_id)
         else:
             raise FeishuError("unsupported_resource_type", f"暂不支持该飞书资源：{target.resource_type}")
-        _ensure_field_mapping_plan(project_id, config, target, selected, fields)
-        return {"target": target.as_dict(), "selected_table": selected, "fields": fields}
+        field_mapping = _ensure_field_mapping_plan(project_id, config, target, selected, fields, use_llm=use_ai_mapping)
+        message = "字段映射已使用本地规则分析"
+        if use_ai_mapping:
+            message = "字段映射已按前端确认使用大模型分析" if field_mapping.get("source") == "llm" else "大模型字段映射未命中，已使用本地规则映射"
+        return {"target": target.as_dict(), "selected_table": selected, "fields": fields, "field_mapping": field_mapping, "message": message}
     except FeishuError as error:
         raise _feishu_error_response(error)
 
@@ -4217,7 +4866,7 @@ def _run_detail_collect_targets(
     for creator in result.get("creators") or []:
         updated.append(update_creator(project_id, creator["creator_id"], creator, score=False))
     if updated:
-        score_project(project_id, creator_ids=[creator["creator_id"] for creator in updated], trigger_source="pgy_detail")
+        score_project(project_id, use_llm=False, creator_ids=[creator["creator_id"] for creator in updated], trigger_source="pgy_detail")
     auto_writeback = _auto_writeback_after_detail(project_id, [creator["creator_id"] for creator in updated])
     duration_text = result.get("duration_text") or ""
     average_duration_text = result.get("average_duration_text") or ""
@@ -4514,14 +5163,19 @@ def _standardize_quote_filter(item: dict[str, Any]) -> list[dict[str, Any]]:
     min_value = item.get("min")
     max_value = item.get("max")
     if sub_field:
+        range_text = re.split(r"[：:]", value, maxsplit=1)[-1]
+        parts = [part.strip() for part in re.split(r"～|~|至|到|-", range_text) if part.strip()]
+        default_unit = "万" if "万" in range_text else ("千" if "千" in range_text else "")
+        parsed_min = _parse_money_amount(parts[0], default_unit) if parts else None
+        parsed_max = _parse_money_amount(parts[-1], default_unit) if len(parts) >= 2 else _parse_money_amount(range_text, default_unit)
         return [
             {
                 **item,
                 "field": "合作报价",
                 "control_type": item.get("control_type") or "subfield_preset_or_number_range",
                 "sub_field": sub_field,
-                "min": min_value if min_value not in (None, "") else "",
-                "max": max_value if max_value not in (None, "") else "",
+                "min": min_value if min_value not in (None, "") else (parsed_min if parsed_min is not None else ""),
+                "max": max_value if max_value not in (None, "") else (parsed_max if parsed_max is not None else ""),
             }
         ]
 
@@ -4678,6 +5332,21 @@ def _normalize_scheme_filter_structure(pgy_plan: dict[str, Any]) -> dict[str, An
         next_scheme["enabled_additional_filters"] = enabled_additional_filters
         next_scheme["enabled_extra_filters"] = enabled_additional_filters
         next_scheme["filters"] = []
+        preview_plan = {
+            **plan,
+            "filters": _dedupe_filters([*required_filters, *enabled_additional_filters]),
+        }
+        next_scheme["expected_request_constraints"] = expected_kol_request_constraints_from_plan(preview_plan)
+        next_scheme["application_validation"] = {
+            "mode": "api_request_body",
+            "on_mismatch": "repair_then_validate",
+            "stop_on_repair_failed": True,
+            "invalid_when": [
+                "自动修复后真实请求仍缺少期望的 contentTag/personalTags/noteType/报价/阅读/互动门槛",
+                "自动修复后真实请求仍包含 similarUserId",
+                "自动修复后最新响应与累计 API 池不一致且无法确认只沿用当前请求分页",
+            ],
+        }
         normalized_schemes.append(next_scheme)
     plan["schemes"] = normalized_schemes
     return plan
@@ -4743,6 +5412,13 @@ def _scheme_plan(screening_plan: dict[str, Any], scheme: dict[str, Any], active_
     pgy_plan["manual_filters"] = [item for item in global_filters if _is_manual_pgy_filter(item)]
     pgy_plan["global_filters"] = global_filters
     pgy_plan["filters"] = _dedupe_filters([*base_filters, *enabled_extra_filters, *global_filters])
+    pgy_plan["expected_request_constraints"] = expected_kol_request_constraints_from_plan(pgy_plan)
+    pgy_plan["application_validation"] = {
+        "mode": "api_request_body",
+        "on_mismatch": "repair_then_validate",
+        "stop_on_repair_failed": True,
+        "reason": "前端采集前筛选必须以蒲公英真实达人列表 API 请求为准；请求不一致时先自动修复为正确 API 请求，修复失败才停止。",
+    }
     pgy_plan["target_count_range"] = scheme.get("target_count_range") or pgy_plan.get("target_count_range") or ""
     pgy_plan["expand_if_too_few"] = scheme.get("expand_if_too_few") or []
     pgy_plan["narrow_if_too_many"] = scheme.get("narrow_if_too_many") or []
@@ -5256,9 +5932,12 @@ def _api_pgy_collect_batch_locked(
             preflight_only=preflight_only,
             kol_request_snapshot=kol_request_snapshot,
             progress_callback=progress_callback,
+            stop_callback=cancel_event.is_set,
         )
         result["scheme_id"] = scheme_id
         result["scheme_name"] = scheme_name
+        if isinstance(result.get("collection_plan"), dict):
+            result["expected_request_constraints"] = expected_kol_request_constraints_from_plan(result["collection_plan"])
         return result
 
     def sync_scheme_ingested_counts() -> None:
@@ -5355,7 +6034,7 @@ def _api_pgy_collect_batch_locked(
             total_count=total_after_scheme,
             success_count=len(creator_ids),
         )
-        saved_items = bulk_upsert_creators(project_id, prepared_creators, score=False)
+        saved_items = bulk_upsert_creators(project_id, prepared_creators, score=True)
         saved_ids = [str(item["creator_id"]) for item in saved_items if item.get("creator_id")]
         creator_ids.extend(saved_ids)
         collected_creators.extend(prepared_creators)
@@ -5440,6 +6119,8 @@ def _api_pgy_collect_batch_locked(
                     "actual_count_text": preflight_result.get("actual_count_text"),
                     "actual_count_is_lower_bound": bool(preflight_result.get("actual_count_is_lower_bound")),
                     "api_request_captured": bool(preflight_result.get("kol_request_snapshot")),
+                    "api_request_valid": bool((preflight_result.get("kol_request_validation") or {}).get("request_valid")),
+                    "api_request_validation": preflight_result.get("kol_request_validation") or {},
                     "evaluation": evaluation,
                     "filters": plan_filters,
                 }
@@ -5463,6 +6144,18 @@ def _api_pgy_collect_batch_locked(
                         history,
                     )
                     preflight_result = run_once(plan_for_scheme, scheme, reset_filters=False, preflight_only=True)
+                    stopped_result = stop_if_requested(
+                        total=len(raw_creators_by_key),
+                        success=0,
+                        collection_plan={"multi_scheme": True, "schemes": scheme_results, "base_plan": pgy_plan},
+                        applied_filters_arg=applied_filters,
+                        skipped_filters_arg=skipped_filters_base,
+                        selected_metrics_arg=selected_metrics,
+                        skipped_metrics_arg=skipped_metrics,
+                        detail_collection_arg=detail_collection,
+                    )
+                    if stopped_result:
+                        return stopped_result
                     evaluation = _evaluate_scheme_count(
                         expected_count,
                         preflight_result.get("actual_recommend_count"),
@@ -5480,6 +6173,8 @@ def _api_pgy_collect_batch_locked(
                             "actual_count_text": preflight_result.get("actual_count_text"),
                             "actual_count_is_lower_bound": bool(preflight_result.get("actual_count_is_lower_bound")),
                             "api_request_captured": bool(preflight_result.get("kol_request_snapshot")),
+                            "api_request_valid": bool((preflight_result.get("kol_request_validation") or {}).get("request_valid")),
+                            "api_request_validation": preflight_result.get("kol_request_validation") or {},
                             "evaluation": evaluation,
                             "filters": plan_filters,
                             "adaptive": len(variants) > 1,
@@ -5507,6 +6202,18 @@ def _api_pgy_collect_batch_locked(
                                 history,
                             )
                             trial_preflight_result = run_once(trial_plan_for_scheme, scheme, reset_filters=False, preflight_only=True)
+                            stopped_result = stop_if_requested(
+                                total=len(raw_creators_by_key),
+                                success=0,
+                                collection_plan={"multi_scheme": True, "schemes": scheme_results, "base_plan": pgy_plan},
+                                applied_filters_arg=applied_filters,
+                                skipped_filters_arg=skipped_filters_base,
+                                selected_metrics_arg=selected_metrics,
+                                skipped_metrics_arg=skipped_metrics,
+                                detail_collection_arg=detail_collection,
+                            )
+                            if stopped_result:
+                                return stopped_result
                             trial_evaluation = _evaluate_scheme_count(
                                 trial_expected_count,
                                 trial_preflight_result.get("actual_recommend_count"),
@@ -5528,6 +6235,8 @@ def _api_pgy_collect_batch_locked(
                                     "actual_count_text": trial_preflight_result.get("actual_count_text"),
                                     "actual_count_is_lower_bound": bool(trial_preflight_result.get("actual_count_is_lower_bound")),
                                     "api_request_captured": bool(trial_preflight_result.get("kol_request_snapshot")),
+                                    "api_request_valid": bool((trial_preflight_result.get("kol_request_validation") or {}).get("request_valid")),
+                                    "api_request_validation": trial_preflight_result.get("kol_request_validation") or {},
                                     "evaluation": trial_evaluation,
                                     "filters": trial_plan_filters,
                                     "adaptive": True,
@@ -5612,6 +6321,8 @@ def _api_pgy_collect_batch_locked(
                     "skipped_filters": preflight_result.get("skipped_filters") or [],
                     "selected_metrics": preflight_result.get("selected_metrics") or [],
                     "skipped_metrics": preflight_result.get("skipped_metrics") or [],
+                    "kol_request_snapshot": preflight_result.get("kol_request_snapshot"),
+                    "kol_request_validation": preflight_result.get("kol_request_validation") or {},
                     "export_result": {"status": "skipped", "message": "数量预检未通过，未执行实际列表采集"},
                 }
             )
@@ -5647,6 +6358,8 @@ def _api_pgy_collect_batch_locked(
                 "actual_count_error": preflight_result.get("actual_count_error"),
                 "actual_count_is_lower_bound": bool(preflight_result.get("actual_count_is_lower_bound")),
                 "api_request_captured": bool(preflight_result.get("kol_request_snapshot")),
+                "api_request_valid": bool((preflight_result.get("kol_request_validation") or {}).get("request_valid")),
+                "api_request_validation": preflight_result.get("kol_request_validation") or {},
                 "evaluation": evaluation,
                 "collected_after_preflight": should_collect,
                 "forced_collect": bool(payload.collect_out_of_range and not evaluation.get("should_collect")),
@@ -5734,6 +6447,8 @@ def _api_pgy_collect_batch_locked(
                     "applied_filters": scheme_result.get("applied_filters") or [],
                     "skipped_filters": scheme_result.get("skipped_filters") or [],
                     "collection_plan": scheme_result.get("collection_plan"),
+                    "kol_request_snapshot": scheme_result.get("kol_request_snapshot") or preflight_result.get("kol_request_snapshot"),
+                    "kol_request_validation": scheme_result.get("kol_request_validation") or preflight_result.get("kol_request_validation") or {},
                     "export_result": scheme_result.get("export_result"),
                 }
             )
@@ -5899,14 +6614,20 @@ def _api_pgy_collect_batch_locked(
             skipped_metrics=result.get("skipped_metrics") or [],
             detail_collection=result.get("detail_collection") or "",
         )
-        scoring = _queue_collect_scoring(project_id, creator_ids, batch_id)
+        scoring = {
+            "async": False,
+            "queued": 0,
+            "scored": len(creator_ids),
+            "use_llm": False,
+            "message": "规则评分已在达人入库时完成",
+        }
         batch = get_batch(batch_id) or batch
         return {
             "ok": True,
             "batch": batch,
             "creators": creators,
             "scoring": scoring,
-            "message": f"蒲公英采集完成，采到 {len(collected_creators)} 个，已按方案分批进入筛选工作台，规则评分后台执行；{len(rejected_by_hard_filters)} 个将在筛选工作台标记为条件不符并按档位区分",
+            "message": f"蒲公英采集完成，采到 {len(collected_creators)} 个，已按方案分批进入筛选工作台并完成规则评分；{len(rejected_by_hard_filters)} 个将在筛选工作台标记为条件不符并按档位区分",
             "collection_plan": collection_plan,
             "export_result": result.get("export_result"),
             "scheme_results": scheme_results,
@@ -6093,7 +6814,7 @@ def _api_pgy_collect_batch_locked(
         total_count=len(collected_creators),
         success_count=0,
     )
-    saved_items = bulk_upsert_creators(project_id, creators, score=False)
+    saved_items = bulk_upsert_creators(project_id, creators, score=True)
     creator_ids = [str(item["creator_id"]) for item in saved_items if item.get("creator_id")]
     for creator in creators:
         scheme_id = str(creator.get("collection_scheme_id") or "")
@@ -6148,7 +6869,13 @@ def _api_pgy_collect_batch_locked(
         skipped_metrics=result.get("skipped_metrics") or [],
         detail_collection=result.get("detail_collection") or "",
     )
-    scoring = _queue_collect_scoring(project_id, creator_ids, batch_id)
+    scoring = {
+        "async": False,
+        "queued": 0,
+        "scored": len(creator_ids),
+        "use_llm": False,
+        "message": "规则评分已在达人入库时完成",
+    }
     batch = get_batch(batch_id) or batch
     rejected_count = len(rejected_by_hard_filters)
     return {
@@ -6156,7 +6883,7 @@ def _api_pgy_collect_batch_locked(
         "batch": batch,
         "creators": creators,
         "scoring": scoring,
-        "message": f"蒲公英采集完成，采到 {len(collected_creators)} 个，已进入筛选工作台，规则评分后台执行；{rejected_count} 个将在筛选工作台标记为条件不符并按档位区分",
+        "message": f"蒲公英采集完成，采到 {len(collected_creators)} 个，已进入筛选工作台并完成规则评分；{rejected_count} 个将在筛选工作台标记为条件不符并按档位区分",
         "collection_plan": result.get("collection_plan"),
         "export_result": result.get("export_result"),
         "scheme_results": scheme_results,

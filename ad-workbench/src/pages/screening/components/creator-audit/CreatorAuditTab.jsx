@@ -26,6 +26,8 @@ import {
   getCreatorTags,
   getCreatorXhsId,
   getPgyUrl,
+  mapBackendCreator,
+  uniqueCompactItems,
 } from '../../utils/creatorMappers';
 import { getCreatorMatchProfile, getProjectScoringCriteria, getReviewVariant, getScoreColor, getScoreTier } from '../../utils/creatorScoring';
 import { PgyInviteModal } from '../pgy-invite/PgyInviteModal';
@@ -112,9 +114,9 @@ function formatNoteMetricValue(value) {
   return /^\d+(?:\.\d+)?$/.test(text) ? compactNumber(text) : text;
 }
 
-function getNoteDetailModel(noteModal, noteParseResult) {
+function getNoteDetailModel(noteModal) {
   const note = noteModal?.note || {};
-  const parsed = noteParseResult?.note || {};
+  const parsed = {};
   const content = String(
     parsed.content
     || note.content
@@ -253,36 +255,40 @@ function analyzeNoteTone(note, project) {
   };
 }
 
-async function parseXhsNoteLink({ link, note, creator, project }) {
-  const payload = {
-    url: link,
-    note: {
-      title: note.title,
-      note_id: note.noteId || '',
-      cover_url: note.coverUrl || '',
-      cover_text: note.coverText || note.cover_text || '',
-      published_at: note.publishedAt || '',
-      content: note.content || note.summary || note.description || '',
-      topics: deriveNoteTopics(note),
-      comment_summary: note.commentSummary || note.comment_summary || '',
-      comments: normalizeNoteComments(note),
-      metrics: {
-        read_count: note.readCount || '',
-        like_count: note.likeCount || '',
-        save_count: note.saveCount || '',
-        comment_count: note.commentCount || '',
-        share_count: note.shareCount || '',
-        exposure_count: note.exposureCount || '',
-        follow_count: note.followCount || '',
-      },
-    },
-    creator: { id: creator.id, name: creator.name },
-    project: { id: project.id || project.project_id, name: project.name || project.project_name },
+function buildNoteProjectMatch(note, project, creator) {
+  const tone = analyzeNoteTone(note, project, creator);
+  const evidence = tone.evidence || {};
+  const topics = deriveNoteTopics(note);
+  const metrics = [
+    note.readCount ? `阅读 ${compactNumber(note.readCount)}` : '',
+    note.likeCount ? `点赞 ${compactNumber(note.likeCount)}` : '',
+    note.saveCount ? `收藏 ${compactNumber(note.saveCount)}` : '',
+    note.commentCount ? `评论 ${compactNumber(note.commentCount)}` : '',
+  ].filter(Boolean);
+  const highlights = uniqueCompactItems([
+    ...tone.matched,
+    evidence.title ? '标题可直接判断内容切入点' : '',
+    note.coverUrl || evidence.coverText ? '封面素材可核验表达场景' : '',
+    evidence.content && evidence.content.length >= 40 ? '正文信息较完整，可看种草逻辑' : '',
+    evidence.comments.length ? '评论样本可辅助判断受众反馈' : '',
+    metrics.length ? `互动数据可参考：${metrics.slice(0, 3).join(' / ')}` : '',
+    noteMedianComparisonText(note) ? `流量表现：${noteMedianComparisonText(note)}` : '',
+  ], 6);
+  const risks = uniqueCompactItems(tone.risks.filter(item => !/暂无明显/.test(item)), 3);
+  const projectName = project.projectName || project.project_name || project.name || '当前项目';
+  const summary = tone.score >= 82
+    ? `这篇笔记与「${projectName}」的内容场景和表达方式匹配度较高，可作为优先复核样本。`
+    : tone.score >= 68
+      ? `这篇笔记有部分可借用场景，建议重点看正文承接、评论反馈和项目关键词是否稳定命中。`
+      : `这篇笔记与「${projectName}」的直接关联偏弱，需要更多标题/正文/评论证据再判断。`;
+
+  return {
+    ...tone,
+    summary,
+    highlights: highlights.length ? highlights : ['当前笔记证据较少，建议补齐封面、标题、正文和评论样本。'],
+    risks,
+    topics,
   };
-  return api('/api/xhs/notes/parse', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
 }
 
 function getAuditNoteCases(creator, match = {}) {
@@ -311,6 +317,13 @@ function notePreviewText(note) {
   ).trim();
 }
 
+function formatNoteBodyText(value) {
+  return String(value || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\\r\\n|\\n|\\r/g, '\n')
+    .replace(/\\t/g, '  ');
+}
+
 export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, onCollectDetails, onPgyInvite, onScore, onReview, onRefresh, onTabChange }) {
   const pageSize = 40;
   const creators = useMemo(() => getProjectCreators(project).map(c => ({
@@ -332,9 +345,9 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
   const [localMessage, setLocalMessage] = useState('');
   const [auditTask, setAuditTask] = useState(null);
   const [noteModal, setNoteModal] = useState(null);
-  const [parsingNote, setParsingNote] = useState(false);
-  const [noteParseResult, setNoteParseResult] = useState(null);
-  const noteDetail = useMemo(() => getNoteDetailModel(noteModal, noteParseResult), [noteModal, noteParseResult]);
+  const [fullCreatorDetails, setFullCreatorDetails] = useState({});
+  const [fullCreatorLoadingId, setFullCreatorLoadingId] = useState('');
+  const noteDetail = useMemo(() => getNoteDetailModel(noteModal), [noteModal]);
 
   useEffect(() => {
     setSelectedIds([]);
@@ -358,6 +371,21 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
   }, [matchFilter, rows, searchTerm]);
 
   const activeRow = rows.find(({ creator }) => creator.id === activeId) || filteredRows[0] || rows[0];
+  const activeDetailCreator = activeRow ? fullCreatorDetails[activeRow.creator.id] : null;
+  const activeDetailRow = useMemo(() => {
+    if (!activeRow) return null;
+    const creator = activeDetailCreator
+      ? {
+        ...activeRow.creator,
+        ...activeDetailCreator,
+        review: activeRow.creator.review,
+        reviewVariant: activeRow.creator.reviewVariant,
+        reviewer: activeRow.creator.reviewer,
+        reviewedAt: activeRow.creator.reviewedAt,
+      }
+      : activeRow.creator;
+    return { creator, match: getCreatorMatchProfile(creator, project) };
+  }, [activeDetailCreator, activeRow, project]);
   const selectedCreators = rows.filter(({ creator }) => selectedIds.includes(creator.id)).map(({ creator }) => creator);
   const filteredIds = filteredRows.map(({ creator }) => creator.id);
   const allFilteredSelected = filteredIds.length > 0 && filteredIds.every(id => selectedIds.includes(id));
@@ -366,11 +394,47 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
   const visibleRows = filteredRows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
   const visibleIds = visibleRows.map(({ creator }) => creator.id);
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.includes(id));
-  const activeNoteCases = activeRow ? getAuditNoteCases(activeRow.creator, activeRow.match) : [];
+  const activeNoteCases = activeDetailRow ? getAuditNoteCases(activeDetailRow.creator, activeDetailRow.match) : [];
 
   useEffect(() => {
     if (page > totalPages) setPage(totalPages);
   }, [page, totalPages]);
+
+  useEffect(() => {
+    setFullCreatorDetails({});
+    setFullCreatorLoadingId('');
+  }, [project.id]);
+
+  useEffect(() => {
+    if (!project.id || !activeRow?.creator?.id) return;
+    const creatorId = activeRow.creator.id;
+    if (fullCreatorDetails[creatorId] || getCreatorRealNoteCases(activeRow.creator).length) return;
+
+    let cancelled = false;
+    setFullCreatorLoadingId(creatorId);
+    api(`/api/projects/${encodeURIComponent(project.id)}/creators/${encodeURIComponent(creatorId)}`)
+      .then((payload) => {
+        if (cancelled || !payload?.creator) return;
+        setFullCreatorDetails(prev => ({
+          ...prev,
+          [creatorId]: mapBackendCreator(payload.creator),
+        }));
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setLocalMessage(error.message || '完整达人详情加载失败');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setFullCreatorLoadingId(current => (current === creatorId ? '' : current));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeRow, fullCreatorDetails, project.id]);
 
   const criteria = getProjectScoringCriteria(project);
   const avgMatch = rows.length
@@ -414,6 +478,13 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
         segment: 'audit',
         segmentLabel: label,
       });
+      setFullCreatorDetails(prev => {
+        const next = { ...prev };
+        targetCreators.forEach(creator => {
+          delete next[creator.id];
+        });
+        return next;
+      });
       await onRefresh?.();
       setLocalMessage(result?.message || `已完成 ${targetCreators.length} 位达人详情页完善，并触发匹配度刷新`);
     } catch (error) {
@@ -451,25 +522,10 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
     await collectForCreators(targetCreators, '审号任务达人');
   };
 
-  const openNoteModal = async (note, creator, match) => {
+  const openNoteModal = (note, creator, match) => {
     const link = fallbackXhsLink(note, creator);
-    const tone = analyzeNoteTone(note, project, creator);
-    setNoteModal({ note, creator, match, link, tone });
-    setNoteParseResult(null);
-    setParsingNote(true);
-    try {
-      const payload = await parseXhsNoteLink({ link, note, creator, project });
-      setNoteParseResult(payload);
-    } catch (error) {
-      setNoteParseResult({
-        ok: false,
-        source: 'frontend-fallback',
-        url: link,
-        message: '预置解析端口暂不可用，已使用页面现有样本信息生成调性判断。',
-      });
-    } finally {
-      setParsingNote(false);
-    }
+    const projectMatch = buildNoteProjectMatch(note, project, creator);
+    setNoteModal({ note, creator, match, link, tone: projectMatch, projectMatch });
   };
 
   const copyNoteLink = async (value) => {
@@ -744,16 +800,16 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
         </section>
 
         <aside className="creator-audit-detail">
-          {activeRow ? (
+          {activeDetailRow ? (
             <>
               <div className="creator-audit-detail-head">
                 <div>
                   <span className="creator-audit-eyebrow">Match Detail</span>
-                  <h3>{activeRow.creator.name}</h3>
-                  <p>{getCreatorIntro(activeRow.creator)}</p>
+                  <h3>{activeDetailRow.creator.name}</h3>
+                  <p>{getCreatorIntro(activeDetailRow.creator)}</p>
                 </div>
-                <div className="creator-audit-detail-score" style={{ color: getScoreColor(activeRow.match.matchScore) }}>
-                  {activeRow.match.matchScore}%
+                <div className="creator-audit-detail-score" style={{ color: getScoreColor(activeDetailRow.match.matchScore) }}>
+                  {activeDetailRow.match.matchScore}%
                 </div>
               </div>
 
@@ -765,7 +821,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
 
               <div className="creator-audit-note-grid">
                 {activeNoteCases.slice(0, 6).map((note, index) => {
-                  const tone = analyzeNoteTone(note, project, activeRow.creator);
+                  const tone = analyzeNoteTone(note, project, activeDetailRow.creator);
                   const title = noteDisplayTitle(note);
                   const brand = noteDisplayBrand(note);
                   const previewText = notePreviewText(note);
@@ -775,7 +831,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                     type="button"
                     className="creator-audit-note"
                     key={`${note.noteId || note.link || title}-${index}`}
-                    onClick={() => openNoteModal(note, activeRow.creator, activeRow.match)}
+                    onClick={() => openNoteModal(note, activeDetailRow.creator, activeDetailRow.match)}
                     title="打开笔记详情并解析小红书链接"
                   >
                     <div className="creator-audit-note-cover">
@@ -805,7 +861,9 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                   );
                 })}
                 {!activeNoteCases.length && (
-                  <div className="creator-audit-note-empty">暂无真实笔记数据，请先完善达人详情。</div>
+                  <div className="creator-audit-note-empty">
+                    {fullCreatorLoadingId === activeDetailRow.creator.id ? '正在加载完整达人详情...' : '暂无真实笔记数据，请先完善达人详情。'}
+                  </div>
                 )}
               </div>
 
@@ -813,7 +871,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                 <div>
                   <h4>深度推荐理由</h4>
                   <div className="creator-audit-deep-reason">
-                    {activeRow.match.reasonSections.map(section => (
+                    {activeDetailRow.match.reasonSections.map(section => (
                       <div key={section.title}>
                         <strong>{section.title}</strong>
                         <p>{section.text}</p>
@@ -823,7 +881,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                 </div>
                 <div>
                   <h4>维度拆解</h4>
-                  {activeRow.creator.scores ? Object.entries(activeRow.creator.scores).map(([key, value]) => (
+                  {activeDetailRow.creator.scores ? Object.entries(activeDetailRow.creator.scores).map(([key, value]) => (
                     <div className="creator-audit-dim" key={key}>
                       <span>{scoreDimLabels[key] || key}</span>
                       <div><i style={{ width: `${Math.max(0, Math.min(100, Number(value) || 0))}%`, background: getScoreColor(Number(value) || 0) }} /></div>
@@ -834,28 +892,28 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                 <div>
                   <h4>命中与风险</h4>
                   <div className="creator-audit-chip-list">
-                    {activeRow.match.matchedSignals.map(item => <span className="tag" key={item}>{item}</span>)}
-                    {activeRow.match.riskSignals.map(item => <span className="tag creator-audit-risk" key={item}>{item}</span>)}
+                    {activeDetailRow.match.matchedSignals.map(item => <span className="tag" key={item}>{item}</span>)}
+                    {activeDetailRow.match.riskSignals.map(item => <span className="tag creator-audit-risk" key={item}>{item}</span>)}
                   </div>
                 </div>
               </div>
 
               <div className="creator-audit-detail-actions">
-                <button className="btn btn-primary" onClick={() => updateReview(activeRow.creator, '已通过', `审号通过，匹配度 ${activeRow.match.matchScore}%`)}>
+                <button className="btn btn-primary" onClick={() => updateReview(activeDetailRow.creator, '已通过', `审号通过，匹配度 ${activeDetailRow.match.matchScore}%`)}>
                   <UserCheck size={14} />通过
                 </button>
-                <button className="btn btn-secondary" onClick={() => updateReview(activeRow.creator, '备选', `审号备选，匹配度 ${activeRow.match.matchScore}%`)}>
+                <button className="btn btn-secondary" onClick={() => updateReview(activeDetailRow.creator, '备选', `审号备选，匹配度 ${activeDetailRow.match.matchScore}%`)}>
                   <Bookmark size={14} />备选
                 </button>
-                <button className="btn btn-danger" onClick={() => updateReview(activeRow.creator, '已驳回', `审号驳回，匹配度 ${activeRow.match.matchScore}%`)}>
+                <button className="btn btn-danger" onClick={() => updateReview(activeDetailRow.creator, '已驳回', `审号驳回，匹配度 ${activeDetailRow.match.matchScore}%`)}>
                   <UserX size={14} />驳回
                 </button>
-                {getPgyUrl(activeRow.creator) && (
-                  <a className="btn btn-secondary" href={getPgyUrl(activeRow.creator)} target="_blank" rel="noreferrer">
+                {getPgyUrl(activeDetailRow.creator) && (
+                  <a className="btn btn-secondary" href={getPgyUrl(activeDetailRow.creator)} target="_blank" rel="noreferrer">
                     <ExternalLink size={14} />蒲公英
                   </a>
                 )}
-                <button className="btn btn-primary" onClick={() => openInviteModal([activeRow.creator], '达人详情邀约')} disabled={!onPgyInvite}>
+                <button className="btn btn-primary" onClick={() => openInviteModal([activeDetailRow.creator], '达人详情邀约')} disabled={!onPgyInvite}>
                   <Send size={14} />邀约
                 </button>
               </div>
@@ -905,7 +963,7 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                     <strong>{noteDetail.title || noteDisplayTitle(noteModal.note)}</strong>
                     {noteModal.note.noteType && <Badge variant="blue">{noteModal.note.noteType}</Badge>}
                   </div>
-                  <p>{noteDetail.content || '正文待补。当前已有真实封面、标题或基础数据；补全笔记详情后会在这里展示正文。'}</p>
+                  <p>{formatNoteBodyText(noteDetail.content || '正文待补。当前已有真实封面、标题或基础数据；补全笔记详情后会在这里展示正文。')}</p>
                   <div className="creator-audit-note-topic-row">
                     {noteDetail.topics.length ? noteDetail.topics.map(item => <span className="tag" key={item}>{item}</span>) : <span className="tag creator-audit-risk">话题待补</span>}
                   </div>
@@ -976,23 +1034,28 @@ export function CreatorAuditTab({ project, screeningStatus, setScreeningStatus, 
                   </button>
                 </div>
                 <div className="creator-audit-tone-card">
+                  <div className="creator-audit-note-data-head">
+                    <div><Target size={14} /><strong>项目匹配度</strong></div>
+                    <span>{noteDisplayBrand(noteModal.note)}</span>
+                  </div>
                   <div className="creator-audit-tone-score">
-                    <strong>{noteModal.tone.score}%</strong>
-                    <Badge variant={noteModal.tone.verdict === '符合' ? 'green' : noteModal.tone.verdict === '部分符合' ? 'amber' : 'red'}>{noteModal.tone.verdict}</Badge>
+                    <strong>{noteModal.projectMatch.score}%</strong>
+                    <Badge variant={noteModal.projectMatch.verdict === '符合' ? 'green' : noteModal.projectMatch.verdict === '部分符合' ? 'amber' : 'red'}>{noteModal.projectMatch.verdict}</Badge>
                   </div>
                   <div className="creator-audit-evidence-row">
-                    {noteModal.tone.evidenceSources.map(item => <span key={item}>{item}</span>)}
+                    {noteModal.projectMatch.evidenceSources.map(item => <span key={item}>{item}</span>)}
                   </div>
-                  <p>{noteModal.tone.reason}</p>
-                  <div className="creator-audit-tone-list">
-                    {noteModal.tone.matched.map(item => <span className="tag" key={item}>{item}</span>)}
-                    {noteModal.tone.risks.map(item => <span className="tag creator-audit-risk" key={item}>{item}</span>)}
-                  </div>
+                  <p>{noteModal.projectMatch.summary}</p>
                 </div>
-                <div className="creator-audit-parse-card">
-                  <div><Database size={14} /><strong>解析端口</strong></div>
-                  <p>{parsingNote ? '正在请求 /api/xhs/notes/parse ...' : (noteParseResult?.message || '当前会优先解析标题、封面、正文、话题与笔记数据；缺失项会单独标出来。')}</p>
-                  <pre>{JSON.stringify(noteParseResult || { endpoint: '/api/xhs/notes/parse', status: 'pending' }, null, 2)}</pre>
+                <div className="creator-audit-tone-card">
+                  <div className="creator-audit-note-data-head">
+                    <div><Sparkles size={14} /><strong>优势亮点</strong></div>
+                    <span>{noteModal.projectMatch.highlights.length} 项</span>
+                  </div>
+                  <div className="creator-audit-tone-list">
+                    {noteModal.projectMatch.highlights.map(item => <span className="tag" key={item}>{item}</span>)}
+                    {noteModal.projectMatch.risks.map(item => <span className="tag creator-audit-risk" key={item}>{item}</span>)}
+                  </div>
                 </div>
               </div>
             </div>

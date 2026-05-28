@@ -75,6 +75,7 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
     '合格达人待合作': { variant: 'blue', icon: <UserCheck size={14} />, desc: '人工筛选合格，等待排期或商务推进' },
     '待建联达人': { variant: 'amber', icon: <MessageSquare size={14} />, desc: '需要媒介建联并确认档期报价' },
     '观察暂缓': { variant: 'neutral', icon: <Clock size={14} />, desc: '低分或风险项较多，暂不进入合作池' },
+    '废弃达人池': { variant: 'red', icon: <Trash2 size={14} />, desc: '已从当前档位清空，仍保留本地记录用于追溯' },
   };
 
   const collectionDateOptions = useMemo(() => {
@@ -156,6 +157,10 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
   const visibleLimit = page * pageSize;
   const visibleStageCreators = activeStageCreators.slice(0, visibleLimit);
   const hasMoreStageCreators = visibleStageCreators.length < activeStageCreators.length;
+  const activePoolCreators = useMemo(
+    () => creators.filter(creator => getPoolStage(creator) !== '废弃达人池'),
+    [creators]
+  );
   const activeStageTotal = useMemo(() => {
     if (poolData?.groups) {
       return (poolData.groups[activeStage] || [])
@@ -165,7 +170,8 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
     }
     return dateFilteredCreators.filter(creator => getPoolStage(creator) === activeStage).length;
   }, [activeStage, collectionDateFilter, dateFilteredCreators, poolData]);
-  const avgScore = poolData?.stats?.avg_score ?? (creators.length ? (creators.reduce((sum, creator) => sum + Number(creator.baseScore || 0), 0) / creators.length).toFixed(1) : '0.0');
+  const activePoolCount = activePoolCreators.length;
+  const avgScore = activePoolCreators.length ? (activePoolCreators.reduce((sum, creator) => sum + Number(creator.baseScore || 0), 0) / activePoolCreators.length).toFixed(1) : '0.0';
 
   useEffect(() => {
     setPage(1);
@@ -325,7 +331,7 @@ export function ScorePreviewTab({ project, screeningStatus, onCollectDetails, on
           <p>采集达人先在筛选工作台完成评分匹配，人工通过后再进入项目达人池分层管理。</p>
         </div>
         <div className="creator-pool-hero-stats">
-          <div><strong>{creators.length}</strong><span>池内达人</span></div>
+          <div><strong>{activePoolCount}</strong><span>池内达人</span></div>
           <div><strong>{avgScore}</strong><span>平均评分</span></div>
           <div><strong>{grouped['已合作跟进中']?.length || 0}</strong><span>跟进中</span></div>
         </div>

@@ -149,11 +149,38 @@ function Start-PgyChrome {
 
   $profile = Join-Path $PSScriptRoot "runtime\chrome-pgy-profile"
   New-Item -ItemType Directory -Force -Path $profile | Out-Null
+  $defaultProfile = Join-Path $profile "Default"
+  foreach ($sessionFile in @("Last Session", "Last Tabs", "Current Session", "Current Tabs")) {
+    $sessionPath = Join-Path $defaultProfile $sessionFile
+    if (Test-Path -LiteralPath $sessionPath) {
+      Remove-Item -LiteralPath $sessionPath -Force -ErrorAction SilentlyContinue
+    }
+  }
+  $preferencesPath = Join-Path $defaultProfile "Preferences"
+  if (Test-Path -LiteralPath $preferencesPath) {
+    try {
+      $preferences = Get-Content -LiteralPath $preferencesPath -Raw -Encoding UTF8 | ConvertFrom-Json
+      if (-not $preferences.profile) {
+        $preferences | Add-Member -MemberType NoteProperty -Name profile -Value ([pscustomobject]@{}) -Force
+      }
+      $preferences.profile | Add-Member -MemberType NoteProperty -Name exit_type -Value "Normal" -Force
+      $preferences.profile | Add-Member -MemberType NoteProperty -Name exited_cleanly -Value $true -Force
+      if (-not $preferences.session) {
+        $preferences | Add-Member -MemberType NoteProperty -Name session -Value ([pscustomobject]@{}) -Force
+      }
+      $preferences.session | Add-Member -MemberType NoteProperty -Name restore_on_startup -Value 0 -Force
+      $preferences | ConvertTo-Json -Depth 64 -Compress | Set-Content -LiteralPath $preferencesPath -Encoding UTF8
+    } catch {}
+  }
 
   Write-Host "Starting Chrome debug browser on port $chromeDebugPort ..."
   Start-Process -FilePath $chrome -ArgumentList @(
     "--remote-debugging-port=$chromeDebugPort",
     "--user-data-dir=$profile",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
     "https://pgy.xiaohongshu.com/solar/pre-trade/note/kol"
   )
 
@@ -204,7 +231,9 @@ function Start-DetachedServer {
 Write-Host "Checking port $port ..."
 Ensure-PortFree -Port $port
 
-if (Test-Path -LiteralPath $frontend) {
+$frontendDistIndex = Join-Path $frontend "dist\index.html"
+$frontendPackage = Join-Path $frontend "package.json"
+if (Test-Path -LiteralPath $frontendPackage) {
   Push-Location -LiteralPath $frontend
   try {
     if (-not (Test-Path -LiteralPath "node_modules")) {
@@ -217,8 +246,10 @@ if (Test-Path -LiteralPath $frontend) {
   } finally {
     Pop-Location
   }
+} elseif (Test-Path -LiteralPath $frontendDistIndex) {
+  Write-Host "Using packaged frontend: $frontendDistIndex"
 } else {
-  Write-Host "Frontend folder not found: $frontend" -ForegroundColor Yellow
+  Write-Host "Frontend build not found: $frontendDistIndex" -ForegroundColor Yellow
 }
 
 Try-OpenFirewallPort

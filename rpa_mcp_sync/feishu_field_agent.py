@@ -43,10 +43,14 @@ DEFAULT_SOURCE_ROW = {
     "孩子性别": "需人工获取",
     "图文报备价": 6000,
     "图文报备裸价": 6000,
+    "图文报价": 6000,
+    "图文笔记一口价": 6000,
     "平台报价": 6000,
     "报价": 6000,
     "视频报备价": 12000,
     "视频报备裸价": 12000,
+    "视频报价": 12000,
+    "视频笔记一口价": 12000,
     "图文执行价（含平台服务费）": 6600,
     "视频执行价（含平台服务费）": 13200,
     "合作价格（含服务费）": 6600,
@@ -163,11 +167,15 @@ def _target_hints(target: str) -> list[str]:
     if "图文" in text and ("执行价" in text or "服务费" in text):
         add("图文执行价（含平台服务费）")
     elif "图文" in text and ("报备" in text or "裸价" in text or "报价" in text):
-        add("图文报备价", "图文报备裸价", "平台报价")
+        add("图文报价", "图文笔记一口价", "图文报备价", "图文报备裸价", "平台报价")
+    elif "图文" in text and "一口价" in text:
+        add("图文笔记一口价", "图文报价", "图文报备价")
     if "视频" in text and ("执行价" in text or "服务费" in text):
         add("视频执行价（含平台服务费）")
     elif "视频" in text and ("报备" in text or "裸价" in text or "报价" in text):
-        add("视频报备价", "视频报备裸价")
+        add("视频报价", "视频笔记一口价", "视频报备价", "视频报备裸价")
+    elif "视频" in text and "一口价" in text:
+        add("视频笔记一口价", "视频报价", "视频报备价")
     if "平台报价" in text or text == "报价":
         add("平台报价", "报价")
     if "合作价格" in text:
@@ -283,7 +291,7 @@ def analyze_field_mapping(
     target_fields: list[str],
     rows: list[dict[str, Any]],
     *,
-    use_llm: bool = True,
+    use_llm: bool = False,
 ) -> dict[str, Any]:
     fallback = _fallback_mapping(target_fields, rows)
     fallback_by_target = {item["target_field"]: item for item in fallback}
@@ -337,7 +345,7 @@ def apply_field_mapping(
     rows: list[dict[str, Any]],
     fields: list[dict[str, Any]],
     *,
-    use_llm: bool = True,
+    use_llm: bool = False,
     mapping_plan: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     target_fields = [_field_name(field) for field in fields]

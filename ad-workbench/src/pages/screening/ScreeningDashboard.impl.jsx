@@ -359,7 +359,26 @@ function patchProject(project = {}, patch = {}) {
   };
 }
 
-export default function ScreeningDashboard({ selectedProjectId = '', onSelectedProjectIdChange } = {}) {
+const PROJECTS_CACHE_KEY = 'adflow-project-list-cache-v1';
+
+function readCachedProjectList() {
+  try {
+    const cached = JSON.parse(window.localStorage.getItem(PROJECTS_CACHE_KEY) || '[]');
+    return Array.isArray(cached) ? cached : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeCachedProjectList(projects = []) {
+  try {
+    window.localStorage.setItem(PROJECTS_CACHE_KEY, JSON.stringify(projects.slice(0, 50)));
+  } catch {
+    // Cache is only used to avoid a blank project shell after refresh.
+  }
+}
+
+export default function ScreeningDashboard({ selectedProjectId = '', onSelectedProjectIdChange, layoutProjects = [] } = {}) {
   const navigate = useNavigate();
   const { tab } = useParams();
   const [activeTab, setActiveTab] = useState(tab || 'projects');
@@ -367,7 +386,7 @@ export default function ScreeningDashboard({ selectedProjectId = '', onSelectedP
   const [currentProject, setCurrentProject] = useState(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [screeningStatus, setScreeningStatus] = useState(initialScreeningStatus);
-  const [projectList, setProjectList] = useState([]);
+  const [projectList, setProjectList] = useState(() => (layoutProjects.length ? layoutProjects : readCachedProjectList()));
   const [projectListLoadFailed, setProjectListLoadFailed] = useState(false);
   const [feishuConfig, setFeishuConfig] = useState(null);
   const [feishuTables, setFeishuTables] = useState([]);
@@ -378,20 +397,31 @@ export default function ScreeningDashboard({ selectedProjectId = '', onSelectedP
   const currentProjectIdRef = useRef('');
   const detailCollectInFlightRef = useRef(new Set());
   const detailProgressTimerRef = useRef(null);
+  const refreshInFlightRef = useRef(new Map());
+  const backgroundRefreshTimerRef = useRef(null);
   const projectId = currentProject?.id || currentProject?.project_id;
+  const layoutProjectKey = useMemo(
+    () => layoutProjects.map(project => getProjectKey(project)).join('|'),
+    [layoutProjects],
+  );
 
   useEffect(() => {
     setActiveTab(tab || 'projects');
   }, [tab]);
 
   useEffect(() => {
+    if (layoutProjects.length) {
+      setProjectList((current) => (current.length ? current : layoutProjects));
+    }
     api('/api/projects?include_archived=true')
       .then((payload) => {
-        setProjectList(payload.projects || []);
+        const nextProjects = payload.projects || [];
+        setProjectList(nextProjects);
+        writeCachedProjectList(nextProjects);
         setProjectListLoadFailed(false);
       })
       .catch(() => setProjectListLoadFailed(true));
-  }, []);
+  }, [layoutProjectKey]);
 
   const mergedProjects = useMemo(() => {
     if (projectListLoadFailed) {
@@ -410,7 +440,19 @@ export default function ScreeningDashboard({ selectedProjectId = '', onSelectedP
 
   useEffect(() => {
     currentProjectIdRef.current = projectId || '';
+    if (backgroundRefreshTimerRef.current) {
+      globalThis.clearTimeout(backgroundRefreshTimerRef.current);
+      backgroundRefreshTimerRef.current = null;
+    }
+    refreshInFlightRef.current.clear();
   }, [projectId]);
+
+  useEffect(() => () => {
+    if (backgroundRefreshTimerRef.current) {
+      globalThis.clearTimeout(backgroundRefreshTimerRef.current);
+      backgroundRefreshTimerRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     if (!mergedProjects.length) return;
@@ -567,46 +609,72 @@ export default function ScreeningDashboard({ selectedProjectId = '', onSelectedP
     };
   }, [safeApi]);
 
-  const refreshProjectData = useCallback(async (options = {}) => {
-    if (!projectId) return { ok: false, error: '未选择项目' };
+  const refreshProjectData = useCallback((options = {}) => {
+    if (!projectId) return Promise.resolve({ ok: false, error: '未选择项目' });
     const requestedProjectId = projectId;
     const background = Boolean(options.background);
     const firstPageOnly = Boolean(options.firstPageOnly);
-    const [projectPayload, statsPayload] = await Promise.all([
-      safeApi(`/api/projects/${requestedProjectId}`),
-      safeApi(`/api/projects/${requestedProjectId}/creators/stats`),
-    ]);
-    const creatorStats = statsPayload?.tiers ? statsPayload : null;
-    if (currentProjectIdRef.current && currentProjectIdRef.current !== requestedProjectId) {
-      return { ok: false, stale: true, project: projectPayload?.project, creators: [] };
+    const pageSize = Number(options.pageSize || (firstPageOnly ? 100 : 500));
+    const dedupeKey = options.dedupe === false
+      ? ''
+      : `${requestedProjectId}:${firstPageOnly ? 'first' : 'full'}:${pageSize}`;
+    if (dedupeKey && refreshInFlightRef.current.has(dedupeKey)) {
+      return refreshInFlightRef.current.get(dedupeKey);
     }
-    let firstPageApplied = false;
-    const creatorsPayload = await fetchCreatorsPaged(requestedProjectId, 500, (firstPayload) => {
-      if (currentProjectIdRef.current && currentProjectIdRef.current !== requestedProjectId) return;
-      firstPageApplied = true;
-      const firstMappedCreators = (firstPayload.creators || []).map(mapBackendCreator);
-      applyProjectPayload(projectPayload, firstMappedCreators, { ...options, creatorStats });
-    }, { firstPageOnly });
-    if (currentProjectIdRef.current && currentProjectIdRef.current !== requestedProjectId) {
-      return { ok: false, stale: true, project: projectPayload?.project, creators: [] };
+
+    const promise = (async () => {
+      const [projectPayload, statsPayload] = await Promise.all([
+        safeApi(`/api/projects/${requestedProjectId}`),
+        safeApi(`/api/projects/${requestedProjectId}/creators/stats`),
+      ]);
+      const creatorStats = statsPayload?.tiers ? statsPayload : null;
+      if (currentProjectIdRef.current && currentProjectIdRef.current !== requestedProjectId) {
+        return { ok: false, stale: true, project: projectPayload?.project, creators: [] };
+      }
+      let firstPageApplied = false;
+      const creatorsPayload = await fetchCreatorsPaged(requestedProjectId, pageSize, (firstPayload) => {
+        if (currentProjectIdRef.current && currentProjectIdRef.current !== requestedProjectId) return;
+        firstPageApplied = true;
+        const firstMappedCreators = (firstPayload.creators || []).map(mapBackendCreator);
+        applyProjectPayload(projectPayload, firstMappedCreators, { ...options, creatorStats });
+      }, { firstPageOnly });
+      if (currentProjectIdRef.current && currentProjectIdRef.current !== requestedProjectId) {
+        return { ok: false, stale: true, project: projectPayload?.project, creators: [] };
+      }
+      const mappedCreators = (creatorsPayload.creators || []).map(mapBackendCreator);
+      if (!firstPageOnly && (!firstPageApplied || mappedCreators.length !== (creatorsPayload.creators || []).length || mappedCreators.length > 50)) {
+        applyProjectPayload(projectPayload, mappedCreators, { ...options, creatorStats });
+      }
+      if (!firstPageOnly || !creatorsPayload.partial) {
+        setLoadedCreatorProjectIds((prev) => ({ ...prev, [requestedProjectId]: true }));
+      } else if (!background) {
+        if (backgroundRefreshTimerRef.current) {
+          globalThis.clearTimeout(backgroundRefreshTimerRef.current);
+        }
+        backgroundRefreshTimerRef.current = globalThis.setTimeout(() => {
+          backgroundRefreshTimerRef.current = null;
+          refreshProjectData({ ...options, background: true, firstPageOnly: false });
+        }, 900);
+      }
+      return { ok: true, project: projectPayload?.project, creators: creatorsPayload.creators || [] };
+    })();
+
+    if (dedupeKey) {
+      refreshInFlightRef.current.set(dedupeKey, promise);
+      promise.finally(() => {
+        if (refreshInFlightRef.current.get(dedupeKey) === promise) {
+          refreshInFlightRef.current.delete(dedupeKey);
+        }
+      });
     }
-    const mappedCreators = (creatorsPayload.creators || []).map(mapBackendCreator);
-    if (!firstPageOnly && (!firstPageApplied || mappedCreators.length !== (creatorsPayload.creators || []).length || mappedCreators.length > 50)) {
-      applyProjectPayload(projectPayload, mappedCreators, { ...options, creatorStats });
-    }
-    if (!firstPageOnly || !creatorsPayload.partial) {
-      setLoadedCreatorProjectIds((prev) => ({ ...prev, [requestedProjectId]: true }));
-    } else if (!background) {
-      refreshProjectData({ ...options, background: true, firstPageOnly: false });
-    }
-    return { ok: true, project: projectPayload?.project, creators: creatorsPayload.creators || [] };
+    return promise;
   }, [applyProjectPayload, fetchCreatorsPaged, projectId, safeApi]);
 
   useEffect(() => {
     if (!projectId || currentProject?.creators?.length) return;
     if (loadedCreatorProjectIds[projectId]) return;
     if (!['screening-review', 'creator-audit'].includes(activeTab)) return;
-    refreshProjectData({ firstPageOnly: true });
+    refreshProjectData({ firstPageOnly: true, pageSize: 100 });
   }, [activeTab, currentProject?.creators?.length, loadedCreatorProjectIds, projectId, refreshProjectData]);
 
   const handleSaveProject = async (payload = {}) => {
@@ -797,7 +865,7 @@ export default function ScreeningDashboard({ selectedProjectId = '', onSelectedP
     }
   };
 
-  const handleScore = async ({ source = 'manual', creatorIds = [], segment = '', segmentLabel = '' } = {}) => {
+  const handleScore = async ({ source = 'manual', creatorIds = [], segment = '', segmentLabel = '', confirmLargeLlmScore = false } = {}) => {
     if (!projectId) return { ok: false, error: '未选择项目' };
     const result = await safeApi(`/api/projects/${projectId}/creators/score`, {
       method: 'POST',
@@ -806,6 +874,7 @@ export default function ScreeningDashboard({ selectedProjectId = '', onSelectedP
         creator_ids: creatorIds.map(String),
         segment,
         segment_label: segmentLabel,
+        confirm_large_llm_score: confirmLargeLlmScore,
       }),
     });
     if (result?.ok === false) {
@@ -889,8 +958,8 @@ export default function ScreeningDashboard({ selectedProjectId = '', onSelectedP
     return result;
   };
 
-  const handleLoadFields = async (tableId = '') => {
-    const result = await safeApi(`/api/projects/feishu/fields?project_id=${encodeURIComponent(projectId || '')}${tableId ? `&table_id=${encodeURIComponent(tableId)}` : ''}`);
+  const handleLoadFields = async (tableId = '', useAiMapping = false) => {
+    const result = await safeApi(`/api/projects/feishu/fields?project_id=${encodeURIComponent(projectId || '')}${tableId ? `&table_id=${encodeURIComponent(tableId)}` : ''}${useAiMapping ? '&use_ai_mapping=true' : ''}`);
     if (result.fields) setFeishuFields(result.fields);
     return result;
   };

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .config_store import ROOT
+from .config_store import ROOT, project_scoring_config_path, read_json, write_json
 from .llm_config import chat_json
 
 DB_PATH = ROOT / "runtime" / "tasks.db"
@@ -37,6 +39,55 @@ _PROJECT_DIRECTION_TERMS_CACHE: ContextVar[dict[str, dict[str, Any]] | None] = C
     "_PROJECT_DIRECTION_TERMS_CACHE",
     default=None,
 )
+_INIT_DB_LOCK = threading.Lock()
+_INIT_DB_DONE_PATHS: set[str] = set()
+
+KOC_DEFAULT_SCORING_CONFIG = {
+    "enabled": True,
+    "architecture": "koc_two_stage_scoring",
+    "stage1_labels": ["P0", "P1", "P2", "P3", "不入库"],
+    "stage1_thresholds": {
+        "budget_full_score_max": 800,
+        "budget_accept_max": 1000,
+        "premium_backup_max": 1600,
+        "read_priority_min": 1000,
+        "read_strong_min": 2400,
+        "interaction_priority_min": 100,
+        "interaction_strong_min": 274,
+        "cpe_strong_max": 3.8,
+        "cpe_priority_max": 7,
+        "cpe_observe_max": 10,
+        "cpm_risk_max": 100,
+    },
+    "detail_stage_rules": {
+        "note_sample_min": 8,
+        "minimum_sample_for_decision": 5,
+        "target_content_required_ratio": 0.5,
+        "identity_trace_reference_ratio": 0.25,
+        "product_scene_strong_ratio": 0.25,
+        "conflict_warning_ratio": 0.5,
+        "conflict_is_hard_only_when_target_below": 0.5,
+        "missing_evidence_status": "待人工确认",
+    },
+    "final_match_thresholds": {
+        "good_read_min": 1000,
+        "good_interaction_min": 100,
+        "good_cpe_max": 7,
+        "strong_read_min": 2400,
+        "strong_interaction_min": 274,
+        "strong_cpe_max": 3.8,
+    },
+    "weight_guidance": {
+        "budget": 18,
+        "fans": 5,
+        "cpe": 22,
+        "engagement": 25,
+        "persona": 20,
+        "content": 10,
+    },
+    "negative_policy": "冲突内容按占比风险处理，不因单个生活/vlog/旅行关键词直接Pass。",
+    "evidence_policy": "一阶段只决定入库/补详情优先级；缺主页、笔记正文、合作笔记或回复率时不得直接强推荐。",
+}
 
 
 def _int_env(name: str, default: int) -> int:
@@ -61,6 +112,14 @@ class ClosingConnection(sqlite3.Connection):
 def database_path() -> Path:
     configured = os.environ.get("RPA_MCP_SYNC_DB_PATH")
     return Path(configured) if configured else DB_PATH
+
+
+def _database_path_key() -> str:
+    path = database_path()
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path.absolute())
 
 
 def connect() -> sqlite3.Connection:
@@ -403,6 +462,19 @@ CREATE TABLE IF NOT EXISTS creator_scores (
   recommend_level TEXT,
   score_reason TEXT,
   cooperation_direction TEXT DEFAULT '',
+  stage1_priority TEXT DEFAULT '',
+  stage1_reason TEXT DEFAULT '',
+  project_match_status TEXT DEFAULT '',
+  project_match_confidence REAL,
+  final_recommend_level TEXT DEFAULT '',
+  target_content_ratio REAL,
+  target_content_evidence TEXT DEFAULT '[]',
+  product_scene_ratio REAL,
+  product_scene_evidence TEXT DEFAULT '[]',
+  conflict_content_ratio REAL,
+  conflict_content_categories TEXT DEFAULT '[]',
+  risk_control_result TEXT DEFAULT '{}',
+  recommended_format TEXT DEFAULT '',
   hard_defects TEXT DEFAULT '[]',
   warning_defects TEXT DEFAULT '[]',
   manual_review_items TEXT DEFAULT '[]',
@@ -668,9 +740,9 @@ METRIC_FIELDS = [
     "audience_gender_distribution",
 ]
 
-PROJECT_STATUSES = {"待补数据", "待审核", "已通过", "备选", "已驳回", "已写回飞书", "待建联", "已邀约", "合作中"}
+PROJECT_STATUSES = {"待补数据", "待审核", "已通过", "备选", "已驳回", "已废弃", "已写回飞书", "待建联", "已邀约", "合作中"}
 SCREENING_STAGE = "筛选工作台"
-POOL_STAGES = [SCREENING_STAGE, "已合作跟进中", "合格达人待合作", "待建联达人", "观察暂缓"]
+POOL_STAGES = [SCREENING_STAGE, "已合作跟进中", "合格达人待合作", "待建联达人", "观察暂缓", "废弃达人池"]
 
 MARKET_BENCHMARKS = [
     {"key": "0-3k", "min": 0, "max": 3000, "good_read": 800, "excellent_read": 1200, "quote_good_max": 300, "quote_high_max": 500, "cpm_good_max": 80, "cpc_good_max": 2.0, "cpe_good_max": 20},
@@ -697,6 +769,19 @@ def is_test_creator(creator: dict[str, Any]) -> bool:
 
 
 def init_db() -> None:
+    path = database_path()
+    path_key = _database_path_key()
+    if path_key in _INIT_DB_DONE_PATHS and path.exists():
+        return
+
+    with _INIT_DB_LOCK:
+        if path_key in _INIT_DB_DONE_PATHS and path.exists():
+            return
+        _init_db_uncached()
+        _INIT_DB_DONE_PATHS.add(path_key)
+
+
+def _init_db_uncached() -> None:
     with connect() as conn:
         had_projects_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'"
@@ -753,6 +838,19 @@ def init_db() -> None:
             "information_completeness": "REAL",
             "initial_tier": "TEXT",
             "detail_collection_priority": "TEXT",
+            "stage1_priority": "TEXT DEFAULT ''",
+            "stage1_reason": "TEXT DEFAULT ''",
+            "project_match_status": "TEXT DEFAULT ''",
+            "project_match_confidence": "REAL",
+            "final_recommend_level": "TEXT DEFAULT ''",
+            "target_content_ratio": "REAL",
+            "target_content_evidence": "TEXT DEFAULT '[]'",
+            "product_scene_ratio": "REAL",
+            "product_scene_evidence": "TEXT DEFAULT '[]'",
+            "conflict_content_ratio": "REAL",
+            "conflict_content_categories": "TEXT DEFAULT '[]'",
+            "risk_control_result": "TEXT DEFAULT '{}'",
+            "recommended_format": "TEXT DEFAULT ''",
             "hard_defects": "TEXT DEFAULT '[]'",
             "warning_defects": "TEXT DEFAULT '[]'",
             "manual_review_items": "TEXT DEFAULT '[]'",
@@ -896,7 +994,8 @@ def migrate_legacy_creators(conn: sqlite3.Connection) -> None:
             ON CONFLICT(creator_id) DO UPDATE SET source=excluded.source, pgy_url=excluded.pgy_url,
             xiaohongshu_id=excluded.xiaohongshu_id, pgy_blogger_id=excluded.pgy_blogger_id,
             nickname=excluded.nickname, creator_type=excluded.creator_type, persona_tags=excluded.persona_tags,
-            ip_city=excluded.ip_city, profile_url=excluded.profile_url, avatar_url=excluded.avatar_url,
+            ip_city=excluded.ip_city, profile_url=excluded.profile_url,
+            avatar_url=COALESCE(NULLIF(excluded.avatar_url, ''), creators_global.avatar_url),
             raw_payload=excluded.raw_payload, updated_at=excluded.updated_at
             """,
             (
@@ -1366,6 +1465,29 @@ def _first_metric(payload: dict[str, Any], *names: str) -> Any:
     return None
 
 
+def _looks_like_price_value(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    text = str(value).strip()
+    if not text:
+        return False
+    if "%" in text:
+        return False
+    if any(hint in text for hint in ("无接单权限", "暂不接单", "不可合作", "--")):
+        return False
+    return parse_number(text) is not None
+
+
+def _first_price_metric(payload: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        value = payload.get(name)
+        if _looks_like_price_value(value):
+            return value
+    return None
+
+
 INVALID_CREATOR_TYPE_PATTERNS = [
     "获赞",
     "收藏",
@@ -1535,7 +1657,19 @@ def normalize_creator(payload: dict[str, Any], project_id: str) -> dict[str, Any
         "status": payload.get("status") or payload.get("当前状态") or "待补数据",
         "raw_payload": json.dumps(payload.get("raw_payload") or payload, ensure_ascii=False),
         "followers_count": parse_number(payload.get("followers_count") or payload.get("粉丝数")),
-        "quote_price": parse_number(payload.get("quote_price") or payload.get("报价")),
+        "quote_price": parse_number(
+            _first_price_metric(
+                payload,
+                "quote_price",
+                "图文报价",
+                "图文笔记一口价",
+                "图文报备价",
+                "图文报备裸价",
+                "平台报价",
+                "报价",
+                "全部报价",
+            )
+        ),
         "budget_status": payload.get("budget_status") or payload.get("预算状态") or "",
         "traffic_stability": payload.get("traffic_stability") or payload.get("近30天流量稳定性") or "",
         "rate_limit_risk": payload.get("rate_limit_risk") or payload.get("限流风险判断") or "",
@@ -1576,7 +1710,16 @@ def normalize_creator(payload: dict[str, Any], project_id: str) -> dict[str, Any
         "order_fans_ratio": ratio(_first_metric(payload, "order_fans_ratio", "下单粉丝占比")),
         "reply_rate_48h": ratio(_first_metric(payload, "reply_rate_48h", "邀约48h回复率", "邀约48小时回复率")),
         "active_days_7d": parse_number(_first_metric(payload, "active_days_7d", "近7天活跃天数")),
-        "video_quote_price": parse_number(_first_metric(payload, "video_quote_price", "视频报价", "视频笔记一口价")),
+        "video_quote_price": parse_number(
+            _first_price_metric(
+                payload,
+                "video_quote_price",
+                "视频报价",
+                "视频笔记一口价",
+                "视频报备价",
+                "视频报备裸价",
+            )
+        ),
         "liked_collected_count": parse_number(_first_metric(payload, "liked_collected_count", "获赞与收藏", "赞藏数", "赞藏量")),
         "female_fans_ratio": ratio(_first_metric(payload, "female_fans_ratio", "粉丝女性用户占比", "女性粉丝占比")) or next((item["ratio"] for item in gender_distribution["segments"] if item["key"] == "female_fans_ratio"), None),
         "male_fans_ratio": ratio(_first_metric(payload, "male_fans_ratio", "粉丝男性用户占比", "男性粉丝占比")) or next((item["ratio"] for item in gender_distribution["segments"] if item["key"] == "male_fans_ratio"), None),
@@ -1677,6 +1820,8 @@ def normalize_score_tier_key(value: Any, score: Any = None) -> str:
 def stage_from_status(status: str | None, score: Any = None) -> str:
     if status in {"待补数据", "待审核", "人工复核", None, ""}:
         return SCREENING_STAGE
+    if status in {"已废弃", "废弃"}:
+        return "废弃达人池"
     if status in {"已驳回", "默认淘汰"}:
         return "观察暂缓"
     if status in {"已写回飞书", "合作中"}:
@@ -1695,6 +1840,7 @@ def status_from_stage(stage: str) -> str:
         "合格达人待合作": "已通过",
         "待建联达人": "待审核",
         "观察暂缓": "已驳回",
+        "废弃达人池": "已废弃",
     }.get(stage, "待审核")
 
 
@@ -1876,6 +2022,11 @@ def _upsert_creator_in_conn(
     review = conn.execute("SELECT review_status FROM screening_reviews WHERE creator_id=?", (creator_id,)).fetchone()
     current = conn.execute("SELECT status FROM creators WHERE project_id=? AND creator_id=?", (project_id, creator_id)).fetchone()
     status = project_row["review_status"] if project_row else (current["status"] if review and current else creator["status"])
+    existing_identity = row_dict(conn.execute(
+        "SELECT avatar_url FROM creators_global WHERE creator_id=?",
+        (creator_id,),
+    ).fetchone())
+    avatar_url = creator["avatar_url"] or (existing_identity.get("avatar_url") if existing_identity else "") or ""
     existing_legacy = conn.execute("SELECT creator_id FROM creators WHERE creator_id=?", (creator_id,)).fetchone()
     if existing_legacy:
         conn.execute(
@@ -1887,7 +2038,7 @@ def _upsert_creator_in_conn(
             (
                 creator["source"], creator["xiaohongshu_id"], creator["pgy_blogger_id"], creator["pgy_url"],
                 creator["nickname"], creator["creator_type"], creator["persona_tags"], creator["ip_city"],
-                creator["profile_url"], creator["avatar_url"], status, creator["raw_payload"], project_id, ts, creator_id,
+                creator["profile_url"], avatar_url, status, creator["raw_payload"], project_id, ts, creator_id,
             ),
         )
         action = "更新达人"
@@ -1901,7 +2052,7 @@ def _upsert_creator_in_conn(
             (
                 creator_id, project_id, creator["source"], creator["xiaohongshu_id"], creator["pgy_blogger_id"],
                 creator["pgy_url"], creator["nickname"], creator["creator_type"], creator["persona_tags"],
-                creator["ip_city"], creator["profile_url"], creator["avatar_url"], status, creator["raw_payload"], ts, ts,
+                creator["ip_city"], creator["profile_url"], avatar_url, status, creator["raw_payload"], ts, ts,
             ),
         )
         action = "新增达人"
@@ -1913,7 +2064,8 @@ def _upsert_creator_in_conn(
         ON CONFLICT(creator_id) DO UPDATE SET source=excluded.source, pgy_url=excluded.pgy_url,
         xiaohongshu_id=excluded.xiaohongshu_id, pgy_blogger_id=excluded.pgy_blogger_id,
         nickname=excluded.nickname, creator_type=excluded.creator_type, persona_tags=excluded.persona_tags,
-        ip_city=excluded.ip_city, profile_url=excluded.profile_url, avatar_url=excluded.avatar_url,
+        ip_city=excluded.ip_city, profile_url=excluded.profile_url,
+        avatar_url=COALESCE(NULLIF(excluded.avatar_url, ''), creators_global.avatar_url),
         raw_payload=excluded.raw_payload, updated_at=excluded.updated_at
         """,
         (
@@ -1927,7 +2079,7 @@ def _upsert_creator_in_conn(
             creator["persona_tags"],
             creator["ip_city"],
             creator["profile_url"],
-            creator["avatar_url"],
+            avatar_url,
             creator["raw_payload"],
             ts,
             ts,
@@ -1974,7 +2126,7 @@ def _upsert_creator_in_conn(
     }
 
 
-def upsert_creator(project_id: str, payload: dict[str, Any], score: bool = True) -> dict[str, Any]:
+def upsert_creator(project_id: str, payload: dict[str, Any], score: bool = False) -> dict[str, Any]:
     init_db()
     creator = normalize_creator(payload, project_id)
     ts = now()
@@ -2015,8 +2167,9 @@ def bulk_upsert_creators(project_id: str, payloads: list[dict[str, Any]], score:
             "success",
         )
     if score:
-        for item in saved_items:
-            score_creator(project_id, str(item["creator_id"]))
+        creator_ids = [str(item["creator_id"]) for item in saved_items if item.get("creator_id")]
+        if creator_ids:
+            score_project(project_id, use_llm=False, creator_ids=creator_ids, trigger_source="bulk_upsert")
     return saved_items
 
 
@@ -2032,7 +2185,7 @@ def import_csv(project_id: str, path: Path | None = None) -> dict[str, Any]:
             count += 1
     with connect() as conn:
         log(conn, project_id, "import", "导入达人模板", csv_path.name, "系统", f"导入 {count} 条达人记录", "success")
-    scoring = score_project(project_id, creator_ids=creator_ids, trigger_source="import")
+    scoring = score_project(project_id, use_llm=False, creator_ids=creator_ids, trigger_source="import")
     return {"imported": count, "scoring": scoring}
 
 
@@ -2140,6 +2293,75 @@ def _cached_project(project_id: str) -> dict[str, Any] | None:
     return project
 
 
+PROJECT_SCORING_CONFIG_KEYS = [
+    "briefType",
+    "projectFitConfig",
+    "promotionStrategy",
+    "budgetPolicy",
+    "formatBudgetPolicy",
+    "hardRules",
+    "tierPolicy",
+    "dataLayerScoring",
+    "scoringWeights",
+    "scoringHardFilters",
+    "scoringCriteria",
+    "projectSpecialScoring",
+    "kocScoringConfig",
+]
+
+
+def _parse_screening_plan_text(value: str | dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _project_scoring_config_payload(
+    project_id: str,
+    project_name: str,
+    brief: str,
+    screening_plan: dict[str, Any],
+    *,
+    updated_at: str,
+) -> dict[str, Any]:
+    scoring_config = {
+        key: copy.deepcopy(screening_plan.get(key))
+        for key in PROJECT_SCORING_CONFIG_KEYS
+        if screening_plan.get(key) not in (None, "", [], {})
+    }
+    return {
+        "schema_version": 1,
+        "project_id": project_id,
+        "project_name": project_name,
+        "brief_digest": str(brief or "")[:500],
+        "updated_at": updated_at,
+        "source": "screening_plan_project_config",
+        "scoring_engine": "rpa_mcp_sync.creator_store",
+        "project_scoring_config": scoring_config,
+    }
+
+
+def write_project_scoring_config_file(project_id: str, project: dict[str, Any], screening_plan: dict[str, Any]) -> None:
+    if is_test_project_id(project_id) or not screening_plan:
+        return
+    write_json(
+        project_scoring_config_path(project_id),
+        _project_scoring_config_payload(
+            project_id,
+            str(project.get("project_name") or project_id),
+            str(project.get("brief") or ""),
+            screening_plan,
+            updated_at=str(project.get("updated_at") or now()),
+        ),
+    )
+
+
 def save_project(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     init_db()
     existing = get_project(project_id)
@@ -2151,16 +2373,18 @@ def save_project(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         screening_plan_text = screening_plan
     else:
         screening_plan_text = json.dumps(screening_plan, ensure_ascii=False)
+    next_project_name = payload.get("project_name") or (existing["project_name"] if existing else project_id)
+    next_brief = payload.get("brief") or (existing.get("brief") if existing else "")
     with connect() as conn:
         if existing:
             conn.execute(
                 "UPDATE projects SET project_name=?, target_qualified_creator_count=?, period_start=?, period_end=?, brief=?, screening_plan=?, updated_at=? WHERE project_id=?",
                 (
-                    payload.get("project_name") or existing["project_name"],
+                    next_project_name,
                     int(payload.get("target_qualified_creator_count") or existing["target_qualified_creator_count"]),
                     payload.get("period_start") or existing.get("period_start"),
                     payload.get("period_end") or existing.get("period_end"),
-                    payload.get("brief") or existing.get("brief"),
+                    next_brief,
                     screening_plan_text,
                     ts,
                     project_id,
@@ -2169,9 +2393,14 @@ def save_project(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         else:
             conn.execute(
                 "INSERT INTO projects(project_id, project_name, target_qualified_creator_count, period_start, period_end, brief, screening_plan, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (project_id, payload.get("project_name") or project_id, int(payload.get("target_qualified_creator_count") or 10), payload.get("period_start"), payload.get("period_end"), payload.get("brief") or "", screening_plan_text, ts, ts),
+                (project_id, next_project_name, int(payload.get("target_qualified_creator_count") or 10), payload.get("period_start"), payload.get("period_end"), next_brief, screening_plan_text, ts, ts),
             )
-        log(conn, project_id, "project", "保存项目", payload.get("project_name") or project_id, "用户", "立项信息已保存", "success")
+        log(conn, project_id, "project", "保存项目", next_project_name, "用户", "立项信息已保存", "success")
+    write_project_scoring_config_file(
+        project_id,
+        {"project_name": next_project_name, "brief": next_brief, "updated_at": ts},
+        _parse_screening_plan_text(screening_plan_text),
+    )
     return get_project(project_id) or {}
 
 
@@ -2246,6 +2475,9 @@ def delete_project(project_id: str) -> dict[str, Any]:
     export_dir = ROOT / "runtime" / "exports" / project_id
     if export_dir.exists():
         shutil.rmtree(export_dir)
+    scoring_config_path = project_scoring_config_path(project_id)
+    if scoring_config_path.exists():
+        scoring_config_path.unlink()
     return {"project_id": project_id, "deleted": True, "creator_count": len(creator_ids)}
 
 
@@ -2255,8 +2487,8 @@ def with_project_stats(project: dict[str, Any]) -> dict[str, Any]:
         if not candidates:
             candidates = conn.execute("SELECT COUNT(*) AS count FROM creators WHERE project_id=?", (project["project_id"],)).fetchone()["count"]
         pool = conn.execute(
-            "SELECT COUNT(*) AS count FROM project_creators WHERE project_id=? AND pool_stage<>?",
-            (project["project_id"], SCREENING_STAGE),
+            "SELECT COUNT(*) AS count FROM project_creators WHERE project_id=? AND pool_stage NOT IN (?, ?)",
+            (project["project_id"], SCREENING_STAGE, "废弃达人池"),
         ).fetchone()["count"]
         qualified = conn.execute(
             "SELECT COUNT(*) AS count FROM project_creators WHERE project_id=? AND review_status IN ('已通过','已写回飞书','合作中')",
@@ -2273,6 +2505,8 @@ def with_project_stats(project: dict[str, Any]) -> dict[str, Any]:
 def list_creators(
     project_id: str,
     status: str | None = None,
+    pool_stage: str | None = None,
+    exclude_pool_stage: str | None = None,
     q: str | None = None,
     include_raw: bool = True,
     creator_id: str | None = None,
@@ -2294,6 +2528,12 @@ def list_creators(
     if status:
         where.append("pc.review_status=?")
         params.append(status)
+    if pool_stage:
+        where.append("pc.pool_stage=?")
+        params.append(pool_stage)
+    if exclude_pool_stage:
+        where.append("COALESCE(pc.pool_stage, '')<>?")
+        params.append(exclude_pool_stage)
     if q:
         where.append("(g.nickname LIKE ? OR g.persona_tags LIKE ? OR g.ip_city LIKE ?)")
         params.extend([f"%{q}%", f"%{q}%", f"%{q}%"])
@@ -2311,6 +2551,10 @@ def list_creators(
            s.initial_tier, s.detail_collection_priority,
            s.budget_score, s.fans_score, s.cpe_score, s.traffic_score,
            s.persona_score, s.content_score, s.recommend_level, s.score_reason, s.cooperation_direction,
+           s.stage1_priority, s.stage1_reason, s.project_match_status, s.project_match_confidence,
+           s.final_recommend_level, s.target_content_ratio, s.target_content_evidence,
+           s.product_scene_ratio, s.product_scene_evidence, s.conflict_content_ratio,
+           s.conflict_content_categories, s.risk_control_result, s.recommended_format,
            s.hard_defects, s.warning_defects,
            s.manual_review_items, s.evidence_quotes, s.llm_confidence, s.llm_prompt_version, s.llm_schema_version,
            s.hard_filter_passed,
@@ -2330,8 +2574,10 @@ def list_creators(
     with connect() as conn:
         rows = rows_dict(conn.execute(sql, query_params).fetchall())
         if rows:
-            for row in rows:
-                row["creator_type"] = sanitize_creator_type(row.get("creator_type"))
+            with _scoring_batch_context():
+                for row in rows:
+                    row["creator_type"] = sanitize_creator_type(row.get("creator_type"))
+                    row.update(_creator_stage_derivatives(row, project_id))
             return rows
         legacy_where = ["c.project_id=?"]
         legacy_params: list[Any] = [project_id]
@@ -2345,6 +2591,12 @@ def list_creators(
         if status:
             legacy_where.append("c.status=?")
             legacy_params.append(status)
+        if pool_stage:
+            legacy_where.append("c.status=?")
+            legacy_params.append(pool_stage)
+        if exclude_pool_stage:
+            legacy_where.append("c.status<>?")
+            legacy_params.append(exclude_pool_stage)
         if q:
             legacy_where.append("(c.nickname LIKE ? OR c.persona_tags LIKE ? OR c.ip_city LIKE ?)")
             legacy_params.extend([f"%{q}%", f"%{q}%", f"%{q}%"])
@@ -2358,6 +2610,10 @@ def list_creators(
                s.initial_tier, s.detail_collection_priority,
                s.budget_score, s.fans_score, s.cpe_score, s.traffic_score,
                s.persona_score, s.content_score, s.recommend_level, s.score_reason, s.cooperation_direction,
+               s.stage1_priority, s.stage1_reason, s.project_match_status, s.project_match_confidence,
+               s.final_recommend_level, s.target_content_ratio, s.target_content_evidence,
+               s.product_scene_ratio, s.product_scene_evidence, s.conflict_content_ratio,
+               s.conflict_content_categories, s.risk_control_result, s.recommended_format,
                s.hard_defects, s.warning_defects,
                s.manual_review_items, s.evidence_quotes, s.llm_confidence, s.llm_prompt_version, s.llm_schema_version,
                s.hard_filter_passed,
@@ -2374,8 +2630,10 @@ def list_creators(
         if limit is not None:
             legacy_query_params.extend([limit, max(0, offset)])
         legacy_rows = rows_dict(conn.execute(legacy_sql, legacy_query_params).fetchall())
-        for row in legacy_rows:
-            row["creator_type"] = sanitize_creator_type(row.get("creator_type"))
+        with _scoring_batch_context():
+            for row in legacy_rows:
+                row["creator_type"] = sanitize_creator_type(row.get("creator_type"))
+                row.update(_creator_stage_derivatives(row, project_id))
         return legacy_rows
 
 
@@ -2460,6 +2718,59 @@ def get_creator(project_id: str, creator_id: str) -> dict[str, Any] | None:
     return next((item for item in items if item["creator_id"] == creator_id), None)
 
 
+def _list_creators_for_scoring(project_id: str, creator_ids: list[str] | None = None) -> list[dict[str, Any]]:
+    init_db()
+    wanted_ids = list(dict.fromkeys(str(item) for item in (creator_ids or []) if str(item or "").strip()))
+    where = ["pc.project_id=?"]
+    params: list[Any] = [project_id]
+    if wanted_ids:
+        placeholders = ", ".join("?" for _ in wanted_ids)
+        where.append(f"pc.creator_id IN ({placeholders})")
+        params.extend(wanted_ids)
+    sql = f"""
+    SELECT pc.project_id, g.creator_id, g.source, g.xiaohongshu_id, g.pgy_blogger_id, g.pgy_url, g.nickname,
+           g.creator_type, g.persona_tags, g.ip_city, g.profile_url, g.avatar_url, g.raw_payload,
+           pc.review_status AS status, pc.pool_stage, pc.portfolio_role, pc.owner, pc.note,
+           pc.total_score AS project_total_score, pc.tier,
+           g.created_at, pc.updated_at, m.*
+    FROM project_creators pc
+    JOIN creators_global g ON pc.creator_id=g.creator_id
+    LEFT JOIN creator_metrics_current m ON g.creator_id=m.creator_id
+    WHERE {' AND '.join(where)}
+    ORDER BY pc.updated_at DESC
+    """
+    legacy_where = ["c.project_id=?"]
+    legacy_params: list[Any] = [project_id]
+    if wanted_ids:
+        placeholders = ", ".join("?" for _ in wanted_ids)
+        legacy_where.append(f"c.creator_id IN ({placeholders})")
+        legacy_params.extend(wanted_ids)
+    legacy_sql = f"""
+    SELECT c.project_id, c.creator_id, c.source, c.xiaohongshu_id, c.pgy_url, c.nickname,
+           c.creator_type, c.persona_tags, c.ip_city, c.profile_url, c.avatar_url, c.status,
+           c.created_at, c.updated_at, c.raw_payload, m.*
+    FROM creators c
+    LEFT JOIN creator_metrics m ON c.creator_id=m.creator_id
+    WHERE {' AND '.join(legacy_where)}
+    ORDER BY c.updated_at DESC
+    """
+    with connect() as conn:
+        rows = rows_dict(conn.execute(sql, params).fetchall())
+        if not rows:
+            rows = rows_dict(conn.execute(legacy_sql, legacy_params).fetchall())
+    for row in rows:
+        row["creator_type"] = sanitize_creator_type(row.get("creator_type"))
+    if wanted_ids:
+        order = {creator_id: index for index, creator_id in enumerate(wanted_ids)}
+        rows.sort(key=lambda item: order.get(str(item.get("creator_id")), len(order)))
+    return rows
+
+
+def _get_creator_for_scoring(project_id: str, creator_id: str) -> dict[str, Any] | None:
+    rows = _list_creators_for_scoring(project_id, [creator_id])
+    return rows[0] if rows else None
+
+
 def count_creators(project_id: str, status: str | None = None, q: str | None = None) -> int:
     init_db()
     where = ["pc.project_id=?"]
@@ -2498,21 +2809,20 @@ def count_creators(project_id: str, status: str | None = None, q: str | None = N
 
 def creator_screening_stats(project_id: str) -> dict[str, Any]:
     init_db()
-    excluded_statuses = ("已通过", "已写回飞书", "已驳回", "默认淘汰", "备选")
+    excluded_statuses = ("已通过", "已写回飞书", "已驳回", "默认淘汰", "已废弃", "备选")
     placeholders = ", ".join("?" for _ in excluded_statuses)
 
     with connect() as conn:
         rows = rows_dict(
             conn.execute(
                 f"""
-                SELECT COALESCE(NULLIF(s.initial_tier, ''), pc.tier, '') AS initial_tier,
-                       s.total_score,
+                SELECT COALESCE(s.total_score, pc.total_score) AS tier_score,
                        COUNT(*) AS count
                 FROM project_creators pc
                 LEFT JOIN creator_scores s ON pc.creator_id=s.creator_id
                 WHERE pc.project_id=?
                   AND COALESCE(pc.review_status, '') NOT IN ({placeholders})
-                GROUP BY COALESCE(NULLIF(s.initial_tier, ''), pc.tier, ''), s.total_score
+                GROUP BY COALESCE(s.total_score, pc.total_score)
                 """,
                 [project_id, *excluded_statuses],
             ).fetchall()
@@ -2532,14 +2842,13 @@ def creator_screening_stats(project_id: str) -> dict[str, Any]:
             legacy_rows = rows_dict(
                 conn.execute(
                     f"""
-                    SELECT COALESCE(NULLIF(s.initial_tier, ''), '') AS initial_tier,
-                           s.total_score,
+                    SELECT s.total_score AS tier_score,
                            COUNT(*) AS count
                     FROM creators c
                     LEFT JOIN creator_scores s ON c.creator_id=s.creator_id
                     WHERE c.project_id=?
                       AND COALESCE(c.status, '') NOT IN ({placeholders})
-                    GROUP BY COALESCE(NULLIF(s.initial_tier, ''), ''), s.total_score
+                    GROUP BY s.total_score
                     """,
                     [project_id, *excluded_statuses],
                 ).fetchall()
@@ -2559,7 +2868,7 @@ def creator_screening_stats(project_id: str) -> dict[str, Any]:
 
     tiers = {"S": 0, "A": 0, "B+": 0, "B": 0, "C": 0, "未评分": 0}
     for row in rows:
-        tier = normalize_score_tier_key(row.get("initial_tier"), row.get("total_score")) or "未评分"
+        tier = normalize_score_tier_key("", row.get("tier_score")) or "未评分"
         tiers[tier] = tiers.get(tier, 0) + int(row.get("count") or 0)
     statuses = {str(row.get("status") or "待审核"): int(row.get("count") or 0) for row in status_rows}
     screening_total = sum(tiers.values())
@@ -2570,6 +2879,7 @@ def creator_screening_stats(project_id: str) -> dict[str, Any]:
         "statuses": statuses,
         "passed": sum(statuses.get(status, 0) for status in ("已通过", "已写回飞书")),
         "rejected": sum(statuses.get(status, 0) for status in ("已驳回", "默认淘汰")),
+        "discarded": statuses.get("已废弃", 0),
         "backup": statuses.get("备选", 0),
         "review": statuses.get("人工复核", 0),
         "pending": screening_total - statuses.get("人工复核", 0),
@@ -2649,6 +2959,19 @@ _LIGHT_CREATOR_FIELDS = {
     "recommend_level",
     "score_reason",
     "cooperation_direction",
+    "stage1_priority",
+    "stage1_reason",
+    "project_match_status",
+    "project_match_confidence",
+    "final_recommend_level",
+    "target_content_ratio",
+    "target_content_evidence",
+    "product_scene_ratio",
+    "product_scene_evidence",
+    "conflict_content_ratio",
+    "conflict_content_categories",
+    "risk_control_result",
+    "recommended_format",
     "hard_defects",
     "warning_defects",
     "manual_review_items",
@@ -2665,10 +2988,15 @@ _LIGHT_CREATOR_FIELDS = {
 
 
 def compact_creator_for_list(creator: dict[str, Any]) -> dict[str, Any]:
+    if creator.get("project_id"):
+        with _scoring_batch_context():
+            creator = {**creator, **_creator_stage_derivatives(creator, str(creator.get("project_id")))}
     result = {key: creator.get(key) for key in _LIGHT_CREATOR_FIELDS if key in creator}
-    normalized_tier = normalize_score_tier_key(
+    display_score = result.get("total_score")
+    if display_score in (None, ""):
+        display_score = result.get("project_total_score")
+    normalized_tier = normalize_score_tier_key("", display_score) or normalize_score_tier_key(
         result.get("initial_tier") or result.get("tier") or result.get("detail_collection_priority"),
-        result.get("total_score") or result.get("project_total_score"),
     )
     if normalized_tier:
         result["initial_tier"] = normalized_tier
@@ -2689,7 +3017,7 @@ def compact_creator_for_list(creator: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def update_creator(project_id: str, creator_id: str, payload: dict[str, Any], score: bool = True) -> dict[str, Any]:
+def update_creator(project_id: str, creator_id: str, payload: dict[str, Any], score: bool = False) -> dict[str, Any]:
     existing = get_creator(project_id, creator_id)
     if not existing:
         raise KeyError(creator_id)
@@ -2913,11 +3241,15 @@ def change_creator_stage(
     return get_creator(project_id, creator_id) or {}
 
 
-def creator_pool(project_id: str) -> dict[str, Any]:
+def creator_pool(project_id: str, include_screening: bool = True) -> dict[str, Any]:
     project = get_project(project_id)
     if not project:
         raise KeyError(project_id)
-    creators = list_creators(project_id, include_raw=False)
+    creators = list_creators(
+        project_id,
+        include_raw=False,
+        exclude_pool_stage=None if include_screening else SCREENING_STAGE,
+    )
     groups = {stage: [] for stage in POOL_STAGES}
     for creator in creators:
         stage = creator.get("pool_stage") or stage_from_status(creator.get("status"), creator.get("total_score"))
@@ -2926,13 +3258,14 @@ def creator_pool(project_id: str) -> dict[str, Any]:
         groups[stage].append(creator)
     for items in groups.values():
         items.sort(key=lambda item: float(item.get("total_score") or 0), reverse=True)
-    pool_creators = [item for stage, items in groups.items() if stage != SCREENING_STAGE for item in items]
+    pool_creators = [item for stage, items in groups.items() if stage not in {SCREENING_STAGE, "废弃达人池"} for item in items]
     stats = {
         "total": len(pool_creators),
         "screening": len(groups[SCREENING_STAGE]),
         "avg_score": round(sum(float(item.get("total_score") or 0) for item in pool_creators) / len(pool_creators), 2) if pool_creators else 0,
         "by_stage": {stage: len(items) for stage, items in groups.items()},
         "qualified": len(groups["已合作跟进中"]) + len(groups["合格达人待合作"]),
+        "discarded": len(groups["废弃达人池"]),
     }
     return {"project": project, "groups": groups, "stats": stats, "updated_at": now()}
 
@@ -3285,6 +3618,22 @@ def _detail_collection_priority(total_score: Any, bonus_score: Any, hard_pass: b
     return "低优先级"
 
 
+def min_priority_label(value: str, cap: str) -> str:
+    order = {
+        "数据暂缓": 0,
+        "低优先级": 1,
+        "中优先级": 2,
+        "中高优先级": 3,
+        "高优先级": 4,
+        "最高优先级": 5,
+    }
+    value_text = str(value or "低优先级")
+    cap_text = str(cap or "低优先级")
+    if order.get(value_text, 1) <= order.get(cap_text, 1):
+        return value_text
+    return cap_text
+
+
 def _initial_rule_group_score(
     base_score: Any,
     bonus_score: Any,
@@ -3444,6 +3793,9 @@ def needs_detail_completion(creator: dict[str, Any]) -> bool:
 
 
 def cleanup_project_creator_duplicates(project_id: str) -> dict[str, Any]:
+    init_db()
+    with connect() as conn:
+        migrate_legacy_creators(conn)
     creators = list_creators(project_id)
     identity_groups: dict[str, list[dict[str, Any]]] = {}
 
@@ -3473,7 +3825,6 @@ def cleanup_project_creator_duplicates(project_id: str) -> dict[str, Any]:
     deleted_ids: list[str] = []
     touched_groups = 0
     removed_ids: set[str] = set()
-    init_db()
     with connect() as conn:
         for grouped in identity_groups.values():
             unique_ids = {
@@ -3670,6 +4021,45 @@ def _interaction_reference_from_creator(creator: dict[str, Any]) -> float | None
     ]
     values = [value for value in values if value is not None and value > 0]
     return max(values) if values else None
+
+
+def _has_cooperation_note_metrics(creator: dict[str, Any]) -> bool:
+    metric_keys = (
+        "cooperation_exposure_median",
+        "cooperation_read_median",
+        "cooperation_interaction_median",
+        "natural_cpc",
+        "natural_cpe",
+    )
+    has_metric = any((parse_number(creator.get(key)) or 0) > 0 for key in metric_keys)
+    if not has_metric:
+        return False
+    raw_payload = _creator_raw_payload(creator)
+    performance = raw_payload.get("data_performance") if isinstance(raw_payload, dict) else None
+    if not isinstance(performance, dict):
+        return True
+    cooperation = performance.get("cooperation") if isinstance(performance.get("cooperation"), dict) else {}
+    for mode in ("scale", "cost"):
+        metrics = cooperation.get(mode, {}).get("metrics", {}) if isinstance(cooperation.get(mode), dict) else {}
+        if isinstance(metrics, dict) and any((parse_number(value) or 0) > 0 for value in metrics.values()):
+            return True
+    return False
+
+
+def _apply_missing_cooperation_note_data_gate(
+    total: float,
+    creator: dict[str, Any],
+    reasons: list[str],
+    *,
+    cap: float = 79.0,
+) -> bool:
+    if _has_cooperation_note_metrics(creator):
+        return False
+    if total > cap:
+        reasons.append("缺合作笔记核心数据，系统级下调初筛优先级：详情优先级最高中优先级，需补合作笔记数据后再上调")
+    else:
+        reasons.append("缺合作笔记核心数据，优先级下调，需补合作笔记数据")
+    return True
 
 
 def _first_number(*values: Any, positive: bool = False) -> float | None:
@@ -4741,18 +5131,24 @@ LOW_REPLY_RATE_SCREENING_PENALTY = 8.0
 LOW_REPLY_RATE_SCREENING_CAP = 84.0
 
 
-def _apply_low_reply_rate_gate(total: float, creator: dict[str, Any] | None, reasons: list[str]) -> tuple[float, bool]:
+def _apply_low_reply_rate_gate(
+    total: float,
+    creator: dict[str, Any] | None,
+    reasons: list[str],
+    threshold: float | None = None,
+) -> tuple[float, bool]:
     if creator is None:
         return total, False
+    threshold = threshold if threshold is not None else LOW_REPLY_RATE_SCREENING_THRESHOLD
     reply = ratio(creator.get("reply_rate_48h"))
-    if reply is None or reply >= LOW_REPLY_RATE_SCREENING_THRESHOLD:
+    if reply is None or reply >= threshold:
         return total, False
     total = max(0.0, total - LOW_REPLY_RATE_SCREENING_PENALTY)
     if total > LOW_REPLY_RATE_SCREENING_CAP:
-        reasons.append("48h回复率低于50%，基础筛选扣8分，高分封顶到A档观察")
+        reasons.append(f"48h回复率低于{threshold:.0%}，基础筛选扣8分，高分封顶到A档观察")
         total = LOW_REPLY_RATE_SCREENING_CAP
     else:
-        reasons.append("48h回复率低于50%，基础筛选扣8分")
+        reasons.append(f"48h回复率低于{threshold:.0%}，基础筛选扣8分")
     return total, True
 
 
@@ -5025,6 +5421,9 @@ def score_values(creator: dict[str, Any], project_id: str | None = None) -> dict
     data_profile = _recent_note_data_profile(creator)
     efficiency_profile = _efficiency_profile(creator, data_profile["benchmark"], data_profile.get("median_read") or data_profile.get("avg_read"))
     data_profile["efficiency"] = efficiency_profile
+    stage_derivatives = _creator_stage_derivatives(creator, project_id)
+    is_koc_project = _is_koc_project(project_id)
+    hard_rules = _project_hard_rules_config(project_id)
 
     hard_issues = _project_hard_filter_issues(project_id, creator) if project_id else []
     if (not project_id or _project_rule_mentions(project_id, ["限流", "违规", "流量稳定", "异常"])) and _contains_any(risk, ["高风险", "严重", "违规", "疑似限流"]):
@@ -5111,11 +5510,25 @@ def score_values(creator: dict[str, Any], project_id: str | None = None) -> dict
         reasons.append(f"期待合作行业：{direction_profile['cooperation_hint']}")
     if execution_reasons:
         reasons.append(f"执行确定性：{'、'.join(execution_reasons[:3])}")
+    if stage_derivatives.get("format_budget_fit") and stage_derivatives.get("format_budget_fit") != "待核":
+        reasons.append(
+            "形态预算："
+            f"{stage_derivatives.get('format_budget_fit')}，"
+            f"{stage_derivatives.get('image_quote_status')}，"
+            f"{stage_derivatives.get('video_quote_status')}"
+        )
+    if stage_derivatives.get("dominant_note_format") and stage_derivatives.get("dominant_note_format") != "待补":
+        reasons.append(f"近期/合作笔记形态：{stage_derivatives.get('dominant_note_format')}")
+    if stage_derivatives.get("commercial_order_signal") in {"有商单证据", "疑似有商单"}:
+        reasons.append(f"商单证据：{stage_derivatives.get('commercial_order_signal')}")
+    if stage_derivatives.get("detail_need_reason"):
+        reasons.append(f"一阶段状态：{stage_derivatives.get('stage_one_status')}，{stage_derivatives.get('detail_need_reason')}")
     if data_profile["good_data"] and precise_fans and direction_profile["level"] in {"strong", "medium"}:
         reasons.append("A档候选依据：人群达标、阅读/互动有支撑、方向相关")
     total = _apply_project_fit_gate(total, creator, _project_fit_config(project_id), reasons)
     total = round(_apply_quality_gate(total, data_profile, reasons, creator, direction_profile, project_id), 2)
     total = _apply_project_special_scoring(total, creator, data_profile, efficiency_profile, direction_profile, reasons, project_id, hard_pass)
+    missing_cooperation_data_gate = _apply_missing_cooperation_note_data_gate(total, creator, reasons)
     if hard_pass and total < 70 and not data_profile["weak_recent_data"] and not efficiency_profile["poor_efficiency"]:
         total = 70.0
         reasons.append("未发现已确认硬伤，数据证据不足时按B档观察，不因缺字段直接低分")
@@ -5123,11 +5536,85 @@ def score_values(creator: dict[str, Any], project_id: str | None = None) -> dict
     if hard_pass and _has_project_special_scoring(project_id):
         tier = _initial_tier(total, hard_pass)
         priority = _detail_collection_priority(total, bonus, hard_pass)
-    total, low_reply_gate_applied = _apply_low_reply_rate_gate(total, creator, reasons)
-    total = round(total, 2)
-    if low_reply_gate_applied:
+    if stage_derivatives.get("format_budget_fit") == "均超预算" and not stage_derivatives.get("premium_exception_passed"):
+        if total > 69:
+            reasons.append("项目形态预算硬条件未达标，初评最高C档")
+            total = 69.0
+        hard_pass = False
         tier = _initial_tier(total, hard_pass)
         priority = _detail_collection_priority(total, bonus, hard_pass)
+    elif stage_derivatives.get("premium_exception_passed"):
+        reasons.append(f"预算溢价例外：{stage_derivatives.get('premium_exception_reason')}，进入补详情复核")
+        if total < 75:
+            total = 75.0
+        hard_pass = True
+        tier = _initial_tier(total, hard_pass)
+        priority = "高优先级"
+    total, low_reply_gate_applied = _apply_low_reply_rate_gate(
+        total,
+        creator,
+        reasons,
+        ratio(hard_rules.get("reply_rate_min")) if hard_rules else None,
+    )
+    total = round(total, 2)
+    if low_reply_gate_applied:
+        hard_pass = False
+        tier = _initial_tier(total, hard_pass)
+        priority = _detail_collection_priority(total, bonus, hard_pass)
+    if missing_cooperation_data_gate:
+        priority = min_priority_label(_detail_collection_priority(total, bonus, hard_pass), "中优先级")
+    koc_profile: dict[str, Any] = {}
+    if is_koc_project:
+        koc_profile = _koc_final_profile(creator, project_id, stage_derivatives, data_profile, efficiency_profile)
+        status = str(koc_profile.get("project_match_status") or "")
+        if koc_profile.get("stage1_priority"):
+            reasons.append(f"KOC一阶段：{koc_profile.get('stage1_priority')}，{koc_profile.get('stage1_reason')}")
+        target_ratio = koc_profile.get("target_content_ratio")
+        scene_ratio = koc_profile.get("product_scene_ratio")
+        conflict_ratio = koc_profile.get("conflict_content_ratio")
+        ratio_parts = []
+        if target_ratio is not None:
+            ratio_parts.append(f"学习/目标内容占比{target_ratio:.0%}")
+        if scene_ratio is not None:
+            ratio_parts.append(f"产品场景占比{scene_ratio:.0%}")
+        if conflict_ratio is not None:
+            ratio_parts.append(f"冲突内容占比{conflict_ratio:.0%}")
+        if ratio_parts:
+            reasons.append(f"KOC内容结构：{'、'.join(ratio_parts)}")
+        risk_result = koc_profile.get("risk_control_result") if isinstance(koc_profile.get("risk_control_result"), dict) else {}
+        if risk_result.get("hard"):
+            reasons.append(f"KOC硬风险：{'、'.join(risk_result['hard'][:3])}")
+        if risk_result.get("missing"):
+            reasons.append(f"KOC待补证据：{'、'.join(risk_result['missing'][:4])}")
+        if status == "Pass":
+            hard_pass = False
+            total = min(total, 69.0)
+            reasons.append("KOC二阶段：硬性条件未达标，最终Pass")
+        elif status == "不推荐":
+            hard_pass = False
+            total = min(total, 74.0)
+            reasons.append("KOC二阶段：内容/数据/身份综合不足，最终不推荐")
+        elif status == "待人工确认":
+            total = min(total, 84.0)
+            reasons.append("KOC二阶段：关键证据不足，需人工确认后再推荐")
+        elif status == "备选":
+            total = min(total, 79.0)
+            reasons.append("KOC二阶段：可做备选，不直接强推")
+        elif status == "推荐":
+            total = max(total, 80.0)
+            reasons.append("KOC二阶段：预算、数据和内容证据基本匹配")
+        elif status == "强推荐":
+            total = max(total, 90.0)
+            reasons.append("KOC二阶段：预算、数据、留学身份和学习场景证据同时达标")
+        total = round(total, 2)
+        tier = _initial_tier(total, hard_pass)
+        if status in {"待人工确认", "备选"}:
+            priority_cap = "中优先级" if status == "待人工确认" else "中高优先级"
+            priority = min_priority_label(_detail_collection_priority(total, bonus, hard_pass), priority_cap)
+        else:
+            priority = _detail_collection_priority(total, bonus, hard_pass)
+    if missing_cooperation_data_gate:
+        priority = min_priority_label(priority, "中优先级")
     if group_score > total:
         reasons.append(f"规则初筛分组：{group_score:.1f}分，{tier}档/{priority}；最终推荐分受详情证据充分度约束")
     if bonus_reasons:
@@ -5135,7 +5622,7 @@ def score_values(creator: dict[str, Any], project_id: str | None = None) -> dict
     if not reasons:
         reasons.append("基础信息匹配，适合进入项目初筛排序")
 
-    level = _recommend_level(total, hard_pass)
+    level = str(koc_profile.get("final_recommend_level") or _recommend_level(total, hard_pass))
     return {
         "total_score": total,
         "rule_group_score": group_score,
@@ -5149,6 +5636,19 @@ def score_values(creator: dict[str, Any], project_id: str | None = None) -> dict
         "recommend_level": level,
         "score_reason": "；".join(reasons),
         "cooperation_direction": _default_cooperation_direction(creator, level),
+        "stage1_priority": koc_profile.get("stage1_priority") or "",
+        "stage1_reason": koc_profile.get("stage1_reason") or "",
+        "project_match_status": koc_profile.get("project_match_status") or "",
+        "project_match_confidence": koc_profile.get("project_match_confidence"),
+        "final_recommend_level": koc_profile.get("final_recommend_level") or level,
+        "target_content_ratio": koc_profile.get("target_content_ratio"),
+        "target_content_evidence": koc_profile.get("target_content_evidence") or [],
+        "product_scene_ratio": koc_profile.get("product_scene_ratio"),
+        "product_scene_evidence": koc_profile.get("product_scene_evidence") or [],
+        "conflict_content_ratio": koc_profile.get("conflict_content_ratio"),
+        "conflict_content_categories": koc_profile.get("conflict_content_categories") or [],
+        "risk_control_result": koc_profile.get("risk_control_result") or {},
+        "recommended_format": koc_profile.get("recommended_format") or "",
     }
 
 
@@ -5164,9 +5664,892 @@ def _project_screening_plan(project_id: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             screening_plan = {}
     plan = screening_plan if isinstance(screening_plan, dict) else {}
+    if not is_test_project_id(project_id):
+        file_payload = read_json(project_scoring_config_path(project_id), {})
+        file_config = file_payload.get("project_scoring_config") if isinstance(file_payload, dict) else {}
+        if isinstance(file_config, dict) and file_config:
+            plan = {**plan, **copy.deepcopy(file_config)}
     if cache is not None:
         cache[project_id] = plan
     return plan
+
+
+def _project_format_budget_policy(project_id: str | None) -> dict[str, Any]:
+    if not project_id:
+        return {}
+    plan = _project_screening_plan(project_id)
+    scoring_criteria = plan.get("scoringCriteria") if isinstance(plan.get("scoringCriteria"), dict) else {}
+    policy = plan.get("formatBudgetPolicy") or scoring_criteria.get("format_budget_policy") or {}
+    return policy if isinstance(policy, dict) else {}
+
+
+def _project_hard_rules_config(project_id: str | None) -> dict[str, Any]:
+    if not project_id:
+        return {}
+    plan = _project_screening_plan(project_id)
+    scoring_criteria = plan.get("scoringCriteria") if isinstance(plan.get("scoringCriteria"), dict) else {}
+    rules = plan.get("hardRules") or scoring_criteria.get("project_hard_rules") or {}
+    return rules if isinstance(rules, dict) else {}
+
+
+def _project_koc_scoring_config(project_id: str | None) -> dict[str, Any]:
+    if not project_id:
+        return copy.deepcopy(KOC_DEFAULT_SCORING_CONFIG)
+    plan = _project_screening_plan(project_id)
+    source = plan.get("kocScoringConfig") if isinstance(plan.get("kocScoringConfig"), dict) else {}
+    result = copy.deepcopy(KOC_DEFAULT_SCORING_CONFIG)
+    for key, value in source.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = {**result[key], **{sub_key: sub_val for sub_key, sub_val in value.items() if sub_val not in (None, "")}}
+        elif value not in (None, "", [], {}):
+            result[key] = value
+    result["enabled"] = result.get("enabled") is not False
+    return result
+
+
+def _koc_config_number(config: dict[str, Any], section: str, key: str, default: float) -> float:
+    source = config.get(section) if isinstance(config.get(section), dict) else {}
+    value = parse_number(source.get(key))
+    return float(value) if value is not None else float(default)
+
+
+def _is_koc_project(project_id: str | None) -> bool:
+    if not project_id:
+        return False
+    plan = _project_screening_plan(project_id)
+    project_fit = plan.get("projectFitConfig") if isinstance(plan.get("projectFitConfig"), dict) else {}
+    values = [
+        plan.get("is_koc_project"),
+        project_fit.get("is_koc_project"),
+        plan.get("project_delivery_type"),
+        project_fit.get("project_delivery_type"),
+        plan.get("creator_matrix_type"),
+        project_fit.get("creator_matrix_type"),
+    ]
+    if any(value is True for value in values):
+        return True
+    text = " ".join(str(value or "") for value in values).lower()
+    if "koc" in text:
+        return True
+    project = _cached_project(project_id) or {}
+    brief = str(project.get("brief") or "").lower()
+    return bool(re.search(r"\bkoc\b|达人量级[^，。；;\n]*koc|预算[^，。；;\n]*koc", brief))
+
+
+def _quote_status(value: Any, cap: Any, label: str) -> str:
+    price = parse_number(value)
+    threshold = parse_number(cap)
+    if price is None:
+        return f"{label}待核"
+    if threshold is None:
+        return f"{label}已采集"
+    return f"{label}预算内" if price <= threshold else f"{label}超预算"
+
+
+def _note_case_format(item: dict[str, Any]) -> str:
+    values = [
+        item.get("note_type"),
+        item.get("noteType"),
+        item.get("type"),
+        item.get("media_type"),
+        item.get("mediaType"),
+        item.get("笔记类型"),
+    ]
+    for value in values:
+        text = str(value or "").strip().lower()
+        if not text:
+            continue
+        if text in {"2", "video"} or "视频" in text:
+            return "视频"
+        if text in {"1", "image", "photo"} or "图文" in text or "图片" in text:
+            return "图文"
+    if item.get("isVideo") is True or item.get("is_video") is True:
+        return "视频"
+    if item.get("isVideo") is False or item.get("is_video") is False:
+        return "图文"
+    text_blob = json.dumps(item, ensure_ascii=False)
+    if "视频笔记" in text_blob:
+        return "视频"
+    if "图文笔记" in text_blob:
+        return "图文"
+    return ""
+
+
+def _note_format_counts(creator: dict[str, Any]) -> dict[str, Any]:
+    raw_payload = _creator_raw_payload(creator)
+    cases = _collect_note_cases_from_payload(raw_payload)
+    counts = {"图文": 0, "视频": 0, "unknown": 0}
+    for item in cases:
+        note_format = _note_case_format(item)
+        if note_format in {"图文", "视频"}:
+            counts[note_format] += 1
+        else:
+            counts["unknown"] += 1
+    for key in ("note_type", "noteType", "笔记类型"):
+        note_format = _note_case_format({key: creator.get(key) or raw_payload.get(key)})
+        if note_format in {"图文", "视频"}:
+            counts[note_format] += 1
+    text_blob = json.dumps(raw_payload, ensure_ascii=False)
+    counts["视频"] += len(re.findall(r"视频笔记", text_blob))
+    counts["图文"] += len(re.findall(r"图文笔记", text_blob))
+    total_known = counts["图文"] + counts["视频"]
+    if total_known < 3:
+        dominant = "待补"
+    elif counts["视频"] / total_known >= 0.6:
+        dominant = "视频为主"
+    elif counts["图文"] / total_known >= 0.6:
+        dominant = "图文为主"
+    else:
+        dominant = "混合"
+    return {**counts, "known_total": total_known, "dominant": dominant}
+
+
+def _note_case_date(item: dict[str, Any]) -> datetime | None:
+    for key in ("publish_time", "publishTime", "create_time", "createTime", "date", "created_at", "发布时间"):
+        value = item.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            try:
+                return datetime.fromtimestamp(timestamp)
+            except (OSError, ValueError):
+                continue
+        text = str(value).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d", "%m-%d"):
+            try:
+                parsed = datetime.strptime(text[:19] if fmt.endswith("%S") else text[:10], fmt)
+                if fmt == "%m-%d":
+                    parsed = parsed.replace(year=datetime.now().year)
+                return parsed
+            except ValueError:
+                continue
+    return None
+
+
+def _latest_note_date(creator: dict[str, Any]) -> datetime | None:
+    raw_payload = _creator_raw_payload(creator)
+    dates = [_note_case_date(item) for item in _collect_note_cases_from_payload(raw_payload)]
+    return max((item for item in dates if item is not None), default=None)
+
+
+def _like_counts_from_notes(creator: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_payload = _creator_raw_payload(creator)
+    result = []
+    for item in _collect_note_cases_from_payload(raw_payload):
+        like = parse_number(item.get("like_count") or item.get("likeCount") or item.get("likes") or item.get("liked_count") or item.get("点赞数"))
+        if like is None:
+            continue
+        result.append({"like_count": like, "date": _note_case_date(item)})
+    return result
+
+
+def _note_text(item: dict[str, Any]) -> str:
+    return " ".join(
+        str(item.get(key) or "")
+        for key in (
+            "title",
+            "note_title",
+            "display_title",
+            "content",
+            "desc",
+            "description",
+            "summary",
+            "正文",
+            "标题",
+        )
+    )
+
+
+def _normalize_keyword_list(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        value = [part.strip() for part in re.split(r"[、,，;；/|\n\r\t]+", value) if part.strip()]
+    if not isinstance(value, list):
+        value = [value]
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+KOC_DEFAULT_STUDY_KEYWORDS = [
+    "学习",
+    "上课",
+    "听课",
+    "课堂",
+    "课程",
+    "笔记",
+    "复习",
+    "备考",
+    "考试",
+    "期末",
+    "final",
+    "essay",
+    "assignment",
+    "lecture",
+    "论文",
+    "作业",
+    "专业",
+    "学校",
+    "自习",
+    "图书馆",
+    "gpa",
+    "presentation",
+    "seminar",
+    "港硕",
+    "留学",
+]
+
+KOC_DEFAULT_PRODUCT_SCENE_KEYWORDS = [
+    "听课",
+    "课堂",
+    "lecture",
+    "课程",
+    "录音",
+    "转写",
+    "翻译",
+    "总结",
+    "笔记",
+    "复盘",
+    "课后",
+    "学习效率",
+    "效率工具",
+]
+
+KOC_DEFAULT_CONFLICT_KEYWORDS = [
+    "纯vlog",
+    "vlog",
+    "旅行",
+    "旅游",
+    "探店",
+    "穿搭",
+    "美妆",
+    "护肤",
+    "情绪",
+    "情侣",
+    "日常流水账",
+    "纯生活",
+    "吃喝玩乐",
+]
+
+
+def _koc_project_keywords(project_id: str | None) -> dict[str, list[str]]:
+    plan = _project_screening_plan(project_id) if project_id else {}
+    project_fit = plan.get("projectFitConfig") if isinstance(plan.get("projectFitConfig"), dict) else {}
+    special = _project_special_scoring_config(project_id)
+    patch = special.get("project_fit_config_patch") if isinstance(special.get("project_fit_config_patch"), dict) else {}
+    scene_config = special.get("scene") if isinstance(special.get("scene"), dict) else {}
+    negative_config = special.get("negative") if isinstance(special.get("negative"), dict) else {}
+    hard_rules = _project_hard_rules_config(project_id)
+    koc_config = plan.get("kocScoringConfig") if isinstance(plan.get("kocScoringConfig"), dict) else {}
+    return {
+        "target": list(dict.fromkeys([
+            *KOC_DEFAULT_STUDY_KEYWORDS,
+            *_normalize_keyword_list(project_fit.get("target_content_keywords")),
+            *_normalize_keyword_list(scene_config.get("keywords")),
+            *_normalize_keyword_list(hard_rules.get("target_content_keywords")),
+            *_normalize_keyword_list(koc_config.get("target_content_keywords")),
+        ])),
+        "product_scene": list(dict.fromkeys([
+            *KOC_DEFAULT_PRODUCT_SCENE_KEYWORDS,
+            *_normalize_keyword_list(project_fit.get("preferred_content_scenes")),
+            *_normalize_keyword_list(patch.get("preferred_content_scenes")),
+            *_normalize_keyword_list(koc_config.get("product_scene_keywords")),
+        ])),
+        "conflict": list(dict.fromkeys([
+            *KOC_DEFAULT_CONFLICT_KEYWORDS,
+            *_normalize_keyword_list(project_fit.get("discouraged_keywords")),
+            *_normalize_keyword_list(patch.get("discouraged_keywords")),
+            *_normalize_keyword_list(negative_config.get("keywords")),
+            *_normalize_keyword_list(koc_config.get("conflict_content_keywords")),
+        ])),
+    }
+
+
+def _note_keyword_ratio(cases: list[dict[str, Any]], keywords: list[str]) -> tuple[float | None, list[str]]:
+    if not cases:
+        return None, []
+    evidence: list[str] = []
+    hits = 0
+    lowered_keywords = [keyword.lower() for keyword in keywords if str(keyword or "").strip()]
+    for item in cases:
+        text = _note_text(item)
+        lowered = text.lower()
+        matched = [keyword for keyword in lowered_keywords if keyword and keyword in lowered]
+        if matched:
+            hits += 1
+            title = str(item.get("title") or item.get("note_title") or item.get("display_title") or text).strip()
+            if title:
+                evidence.append(f"{title[:60]}｜命中{', '.join(matched[:3])}")
+    return round(hits / len(cases), 4), evidence[:8]
+
+
+def _koc_content_profiles(creator: dict[str, Any], project_id: str | None) -> dict[str, Any]:
+    raw_payload = _creator_raw_payload(creator)
+    cases = _collect_note_cases_from_payload(raw_payload)
+    keywords = _koc_project_keywords(project_id)
+    target_ratio, target_evidence = _note_keyword_ratio(cases, keywords["target"])
+    scene_ratio, scene_evidence = _note_keyword_ratio(cases, keywords["product_scene"])
+    conflict_ratio, conflict_evidence = _note_keyword_ratio(cases, keywords["conflict"])
+    categories = []
+    for evidence in conflict_evidence:
+        for keyword in keywords["conflict"]:
+            if keyword.lower() in evidence.lower() and keyword not in categories:
+                categories.append(keyword)
+    return {
+        "target_content_ratio": target_ratio,
+        "target_content_evidence": target_evidence,
+        "product_scene_ratio": scene_ratio,
+        "product_scene_evidence": scene_evidence,
+        "conflict_content_ratio": conflict_ratio,
+        "conflict_content_categories": categories[:8],
+        "note_sample_count": len(cases),
+    }
+
+
+def _commercial_order_signal(creator: dict[str, Any]) -> str:
+    raw_payload = _creator_raw_payload(creator)
+    cooperation_cases = raw_payload.get("cooperation_note_cases") if isinstance(raw_payload.get("cooperation_note_cases"), list) else []
+    if cooperation_cases:
+        return "有商单证据"
+    text = _text_blob(creator)
+    if any(keyword in text for keyword in ["合作笔记", "商单", "品牌合作", "蒲公英合作"]):
+        return "疑似有商单"
+    return "待补"
+
+
+def _creator_no_order_permission_signal(creator: dict[str, Any], raw_payload: dict[str, Any] | None = None) -> str:
+    raw = raw_payload if isinstance(raw_payload, dict) else {}
+    values = [
+        creator.get("order_permission_status"),
+        raw.get("order_permission_status"),
+        raw.get("text"),
+        raw.get("detail_text"),
+        raw.get("raw_table"),
+        raw.get("list_api_kol"),
+    ]
+    text = "".join(
+        json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "")
+        for value in values
+    )
+    compact = re.sub(r"\s+", "", text)
+    if any(hint in compact for hint in ["无接单权限", "暂无接单权限", "不可接单", "不能接单", "暂不接单", "未开通接单"]):
+        return "无接单权限"
+    return ""
+
+
+def _recent_update_status(creator: dict[str, Any], days: Any) -> str:
+    window = parse_number(days)
+    if window is None:
+        return "未配置"
+    latest = _latest_note_date(creator)
+    if latest is None:
+        return "待补"
+    age_days = (datetime.now() - latest).days
+    return f"近{int(window)}天有更新" if age_days <= window else "疑似断更"
+
+
+def _low_like_risk(creator: dict[str, Any], threshold: Any, ignore_same_day: bool = True) -> str:
+    limit = parse_number(threshold)
+    if limit is None:
+        return "未配置"
+    counts = _like_counts_from_notes(creator)
+    if not counts:
+        return "待补"
+    today = datetime.now().date()
+    risky = []
+    for item in counts:
+        date = item.get("date")
+        if ignore_same_day and isinstance(date, datetime) and date.date() == today:
+            continue
+        if float(item["like_count"]) < limit:
+            risky.append(item)
+    return "低赞风险" if risky else "无明显风险"
+
+
+def _low_like_risk_profile(creator: dict[str, Any], threshold: Any, ignore_same_day: bool = True) -> dict[str, Any]:
+    limit = parse_number(threshold)
+    counts = _like_counts_from_notes(creator)
+    if limit is None:
+        return {"status": "未配置", "sample_count": len(counts), "low_count": 0, "ratio": None, "level": "none"}
+    if not counts:
+        return {"status": "待补", "sample_count": 0, "low_count": 0, "ratio": None, "level": "missing"}
+    today = datetime.now().date()
+    valid = []
+    for item in counts:
+        date = item.get("date")
+        if ignore_same_day and isinstance(date, datetime) and date.date() == today:
+            continue
+        valid.append(item)
+    if not valid:
+        return {"status": "待补", "sample_count": 0, "low_count": 0, "ratio": None, "level": "missing"}
+    low = [item for item in valid if float(item["like_count"]) < limit]
+    low_ratio = len(low) / len(valid)
+    if len(valid) >= 5 and low_ratio >= 0.5:
+        level = "hard"
+        status = "高低赞风险"
+    elif low:
+        level = "warning"
+        status = "低赞风险"
+    else:
+        level = "none"
+        status = "无明显风险"
+    return {
+        "status": status,
+        "sample_count": len(valid),
+        "low_count": len(low),
+        "ratio": round(low_ratio, 4),
+        "threshold": limit,
+        "level": level,
+    }
+
+
+def _format_budget_fit(creator: dict[str, Any], policy: dict[str, Any]) -> tuple[str, str, str]:
+    image_cap = policy.get("image_quote_cap") or policy.get("single_creator_budget_cap")
+    video_cap = policy.get("video_quote_cap") or policy.get("single_creator_budget_cap")
+    image_status = _quote_status(creator.get("quote_price"), image_cap, "图文")
+    video_status = _quote_status(creator.get("video_quote_price"), video_cap, "视频")
+    allowed = [str(item) for item in (policy.get("allowed_formats") or [])]
+    if not allowed:
+        allowed = ["图文"]
+    image_ok = image_status == "图文预算内"
+    video_ok = video_status == "视频预算内"
+    image_known = "待核" not in image_status
+    video_known = "待核" not in video_status
+    image_over = image_status == "图文超预算"
+    video_over = video_status == "视频超预算"
+    image_has_cap = parse_number(image_cap) is not None
+    video_has_cap = parse_number(video_cap) is not None
+    if "图文" in allowed and "视频" in allowed:
+        if image_ok and video_ok:
+            fit = "推荐形态预算匹配"
+        elif image_ok and video_over:
+            fit = "仅图文可投"
+        elif video_ok and image_over:
+            fit = "仅视频可投"
+        elif image_over and video_over:
+            fit = "均超预算"
+        else:
+            fit = "待核"
+    elif "视频" in allowed:
+        fit = "推荐形态预算匹配" if video_ok else ("均超预算" if video_over and video_has_cap else "待核")
+    else:
+        fit = "推荐形态预算匹配" if image_ok else ("均超预算" if image_over and image_has_cap else "待核")
+    return image_status, video_status, fit
+
+
+def _best_project_data_value(creator: dict[str, Any]) -> float | None:
+    values = [
+        parse_number(creator.get("daily_read_median")),
+        parse_number(creator.get("image_daily_read_median")),
+        parse_number(creator.get("video_daily_read_median")),
+        parse_number(creator.get("cooperation_read_median")),
+    ]
+    raw_payload = _creator_raw_payload(creator)
+    for item in _collect_note_cases_from_payload(raw_payload):
+        read = parse_number(item.get("read_count") or item.get("readCount") or item.get("read"))
+        if read is not None:
+            values.append(read)
+    numeric = [value for value in values if value is not None and value > 0]
+    return max(numeric) if numeric else None
+
+
+def _premium_exception_profile(creator: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    exception_policy = policy.get("premium_exception_policy") if isinstance(policy.get("premium_exception_policy"), dict) else {}
+    if exception_policy.get("enabled") is False:
+        return {"passed": False, "reason": "溢价例外未启用"}
+    multiplier = parse_number(exception_policy.get("max_budget_multiplier")) or 1.5
+    top_percent = parse_number(exception_policy.get("data_top_percent")) or 5
+    percentile = max(0.5, min(0.99, 1 - top_percent / 100))
+    benchmark = _scoring_benchmark_for_creator(creator)
+    top_read = parse_number(benchmark.get("top_read"))
+    if top_read is None:
+        excellent = parse_number(benchmark.get("excellent_read"))
+        good = parse_number(benchmark.get("good_read"))
+        top_read = excellent or (good * 1.5 if good is not None else None)
+    best_read = _best_project_data_value(creator)
+    data_pass = bool(best_read is not None and top_read is not None and best_read >= top_read)
+    image_cap = parse_number(policy.get("image_quote_cap") or policy.get("single_creator_budget_cap"))
+    video_cap = parse_number(policy.get("video_quote_cap") or policy.get("single_creator_budget_cap"))
+    image_quote = parse_number(creator.get("quote_price"))
+    video_quote = parse_number(creator.get("video_quote_price"))
+    quote_options = []
+    if image_cap is not None and image_quote is not None:
+        quote_options.append(("图文", image_quote, image_cap))
+    if video_cap is not None and video_quote is not None:
+        quote_options.append(("视频", video_quote, video_cap))
+    within_multiplier = [
+        label
+        for label, quote, cap in quote_options
+        if cap < quote <= cap * multiplier
+    ]
+    passed = data_pass and bool(within_multiplier)
+    reason = (
+        f"数据达前{top_percent:g}%线，最佳阅读{best_read:.0f}≥{top_read:.0f}，"
+        f"{'、'.join(within_multiplier) or '无形态'}报价不超过预算{multiplier:g}倍"
+        if passed and best_read is not None and top_read is not None
+        else ""
+    )
+    return {
+        "passed": passed,
+        "reason": reason or "未满足高性价比溢价例外",
+        "best_read": best_read,
+        "top_read_threshold": top_read,
+        "data_top_percent": top_percent,
+        "max_budget_multiplier": multiplier,
+        "formats": within_multiplier,
+        "percentile": percentile,
+    }
+
+
+def _koc_stage1_profile(
+    creator: dict[str, Any],
+    project_id: str | None,
+    data_profile: dict[str, Any] | None = None,
+    efficiency_profile: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    if not _is_koc_project(project_id):
+        return {"stage1_priority": "", "stage1_reason": ""}
+    data_profile = data_profile or _recent_note_data_profile(creator)
+    efficiency_profile = efficiency_profile or _efficiency_profile(
+        creator,
+        data_profile.get("benchmark") or {},
+        data_profile.get("median_read") or data_profile.get("avg_read"),
+    )
+    policy = _project_format_budget_policy(project_id)
+    image_status, video_status, budget_fit = _format_budget_fit(creator, policy)
+    quote = min(
+        [
+            value
+            for value in (
+                parse_number(creator.get("quote_price")),
+                parse_number(creator.get("video_quote_price")),
+            )
+            if value is not None
+        ],
+        default=None,
+    )
+    read = data_profile.get("median_read") or data_profile.get("avg_read") or _creator_read_metric(creator)
+    interaction = data_profile.get("avg_interaction") or _creator_interaction_metric(creator)
+    cpe = parse_number(efficiency_profile.get("effective_cpe")) or _creator_cpe_metric(creator)
+    overseas = _has_overseas_study_background(creator)
+    stage_derivatives = _creator_stage_derivatives(creator, project_id)
+    return _koc_stage1_profile_from_metrics(
+        creator,
+        project_id,
+        stage_derivatives,
+        read=read,
+        interaction=interaction,
+        cpe=cpe,
+        overseas=overseas,
+    )
+
+
+def _koc_stage1_profile_from_metrics(
+    creator: dict[str, Any],
+    project_id: str | None,
+    stage_derivatives: dict[str, Any],
+    *,
+    read: Any = None,
+    interaction: Any = None,
+    cpe: Any = None,
+    overseas: bool = False,
+) -> dict[str, str]:
+    if not _is_koc_project(project_id):
+        return {"stage1_priority": "", "stage1_reason": ""}
+    koc_config = _project_koc_scoring_config(project_id)
+    budget_accept_max = _koc_config_number(koc_config, "stage1_thresholds", "budget_accept_max", 1000)
+    read_priority_min = _koc_config_number(koc_config, "stage1_thresholds", "read_priority_min", 1000)
+    interaction_priority_min = _koc_config_number(koc_config, "stage1_thresholds", "interaction_priority_min", 100)
+    cpe_priority_max = _koc_config_number(koc_config, "stage1_thresholds", "cpe_priority_max", 7)
+    image_status = str(stage_derivatives.get("image_quote_status") or "")
+    video_status = str(stage_derivatives.get("video_quote_status") or "")
+    budget_fit = str(stage_derivatives.get("format_budget_fit") or "待核")
+    quote = min(
+        [
+            value
+            for value in (
+                parse_number(creator.get("quote_price")),
+                parse_number(creator.get("video_quote_price")),
+            )
+            if value is not None
+        ],
+        default=None,
+    )
+    signals = []
+    weak = []
+    if quote is not None and quote <= budget_accept_max:
+        signals.append(f"报价{quote:g}≤{budget_accept_max:g}")
+    else:
+        weak.append(f"报价待补或超{budget_accept_max:g}")
+    if read is not None and read >= read_priority_min:
+        signals.append(f"阅读{read:.0f}≥{read_priority_min:g}")
+    else:
+        weak.append(f"阅读未达{read_priority_min:g}或待补")
+    if interaction is not None and interaction >= interaction_priority_min:
+        signals.append(f"互动{interaction:.0f}≥{interaction_priority_min:g}")
+    else:
+        weak.append(f"互动未达{interaction_priority_min:g}或待补")
+    if cpe is not None and cpe <= cpe_priority_max:
+        signals.append(f"CPE{cpe:.2f}≤{cpe_priority_max:g}")
+    elif cpe is not None:
+        weak.append(f"CPE{cpe:.2f}偏高")
+    else:
+        weak.append("CPE待补")
+    if overseas:
+        signals.append("有留学/海外弱证据")
+    else:
+        weak.append("留学/海外证据待补")
+    if budget_fit == "均超预算":
+        priority = "不入库"
+    elif len(signals) >= 4:
+        priority = "P0"
+    elif len(signals) >= 3:
+        priority = "P1"
+    elif len(signals) >= 2:
+        priority = "P2"
+    else:
+        priority = "P3"
+    if not _has_cooperation_note_metrics(creator) and priority in {"P0", "P1"}:
+        priority = "P2"
+        weak.insert(0, "缺合作笔记核心数据，P级最高P2")
+    return {
+        "stage1_priority": priority,
+        "stage1_reason": "；".join([*signals, *weak[:3], f"预算状态{budget_fit}", image_status, video_status]),
+    }
+
+
+def _recommended_format_from_budget(stage_derivatives: dict[str, Any], policy: dict[str, Any]) -> str:
+    preferred = str(policy.get("preferred_format") or "").strip()
+    budget_fit = stage_derivatives.get("format_budget_fit")
+    if budget_fit == "均超预算":
+        return "不推荐"
+    if budget_fit == "仅图文可投":
+        return "图文"
+    if budget_fit == "仅视频可投":
+        return "视频"
+    if budget_fit == "推荐形态预算匹配":
+        return preferred if preferred in {"图文", "视频"} else "均可"
+    return "待补"
+
+
+def _koc_risk_control_result(
+    creator: dict[str, Any],
+    project_id: str | None,
+    stage_derivatives: dict[str, Any],
+    content_profile: dict[str, Any],
+) -> dict[str, Any]:
+    hard_rules = _project_hard_rules_config(project_id)
+    hard: list[str] = []
+    warning: list[str] = []
+    missing: list[str] = []
+    if stage_derivatives.get("format_budget_fit") == "均超预算" and not stage_derivatives.get("premium_exception_passed"):
+        hard.append("图文/视频报价均超预算")
+    reply_min = ratio(hard_rules.get("reply_rate_min"))
+    reply = ratio(creator.get("reply_rate_48h"))
+    if reply_min is not None and reply is not None and reply < reply_min:
+        hard.append(f"48h回复率{reply:.0%}低于{reply_min:.0%}")
+    if reply_min is not None and reply is None:
+        missing.append("48h回复率")
+    if hard_rules.get("must_have_commercial_order") and stage_derivatives.get("commercial_order_signal") == "待补":
+        missing.append("商单证据")
+    if stage_derivatives.get("recent_update_status") == "疑似断更":
+        hard.append("近期未更新")
+    elif stage_derivatives.get("recent_update_status") == "待补":
+        missing.append("近期更新")
+    low_like = _low_like_risk_profile(
+        creator,
+        hard_rules.get("low_like_threshold"),
+        hard_rules.get("ignore_low_like_if_same_day") is not False,
+    )
+    if low_like.get("level") == "hard":
+        hard.append("近期低赞比例较高")
+    elif low_like.get("level") == "warning":
+        warning.append("存在少量低赞笔记")
+    elif low_like.get("level") == "missing":
+        missing.append("近期点赞数据")
+    required_ratio = ratio(hard_rules.get("must_have_study_content_ratio"))
+    target_ratio = content_profile.get("target_content_ratio")
+    if required_ratio is not None:
+        if target_ratio is None:
+            missing.append("学习类内容占比")
+        elif target_ratio < required_ratio:
+            hard.append(f"学习类内容占比{target_ratio:.0%}低于{required_ratio:.0%}")
+    if hard_rules.get("must_have_study_abroad_trace") and not _has_overseas_study_background(creator):
+        missing.append("留学/海外身份痕迹")
+    conflict_ratio = content_profile.get("conflict_content_ratio")
+    koc_config = _project_koc_scoring_config(project_id)
+    conflict_warning_ratio = _koc_config_number(koc_config, "detail_stage_rules", "conflict_warning_ratio", 0.5)
+    conflict_target_floor = _koc_config_number(koc_config, "detail_stage_rules", "conflict_is_hard_only_when_target_below", 0.5)
+    if conflict_ratio is not None and conflict_ratio >= conflict_warning_ratio and (target_ratio is None or target_ratio < conflict_target_floor):
+        warning.append("近期内容偏生活/vlog，需要人工确认非纯vlog")
+    return {
+        "hard": list(dict.fromkeys(hard)),
+        "warning": list(dict.fromkeys(warning)),
+        "missing": list(dict.fromkeys(missing)),
+        "low_like": low_like,
+    }
+
+
+def _koc_final_profile(
+    creator: dict[str, Any],
+    project_id: str | None,
+    stage_derivatives: dict[str, Any],
+    data_profile: dict[str, Any],
+    efficiency_profile: dict[str, Any],
+) -> dict[str, Any]:
+    content_profile = _koc_content_profiles(creator, project_id)
+    risk_result = _koc_risk_control_result(creator, project_id, stage_derivatives, content_profile)
+    read = data_profile.get("median_read") or data_profile.get("avg_read") or _creator_read_metric(creator)
+    interaction = data_profile.get("avg_interaction") or _creator_interaction_metric(creator)
+    cpe = parse_number(efficiency_profile.get("effective_cpe")) or _creator_cpe_metric(creator)
+    overseas = _has_overseas_study_background(creator)
+    stage1 = _koc_stage1_profile_from_metrics(
+        creator,
+        project_id,
+        stage_derivatives,
+        read=read,
+        interaction=interaction,
+        cpe=cpe,
+        overseas=overseas,
+    )
+    policy = _project_format_budget_policy(project_id)
+    hard_rules = _project_hard_rules_config(project_id)
+    koc_config = _project_koc_scoring_config(project_id)
+    target_required = (
+        ratio(hard_rules.get("must_have_study_content_ratio"))
+        or _koc_config_number(koc_config, "detail_stage_rules", "target_content_required_ratio", 0.5)
+    )
+    minimum_sample = _koc_config_number(koc_config, "detail_stage_rules", "minimum_sample_for_decision", 5)
+    scene_strong_ratio = _koc_config_number(koc_config, "detail_stage_rules", "product_scene_strong_ratio", 0.25)
+    good_read_min = _koc_config_number(koc_config, "final_match_thresholds", "good_read_min", 1000)
+    good_interaction_min = _koc_config_number(koc_config, "final_match_thresholds", "good_interaction_min", 100)
+    good_cpe_max = _koc_config_number(koc_config, "final_match_thresholds", "good_cpe_max", 7)
+    strong_read_min = _koc_config_number(koc_config, "final_match_thresholds", "strong_read_min", 2400)
+    strong_interaction_min = _koc_config_number(koc_config, "final_match_thresholds", "strong_interaction_min", 274)
+    strong_cpe_max = _koc_config_number(koc_config, "final_match_thresholds", "strong_cpe_max", 3.8)
+    target_ratio = content_profile.get("target_content_ratio")
+    scene_ratio = content_profile.get("product_scene_ratio")
+    missing_cooperation_note_data = not _has_cooperation_note_metrics(creator)
+    evidence_missing = bool(risk_result["missing"]) or target_ratio is None or content_profile.get("note_sample_count", 0) < minimum_sample
+    strong_data = bool(
+        read is not None
+        and read >= strong_read_min
+        and interaction is not None
+        and interaction >= strong_interaction_min
+        and (cpe is None or cpe <= strong_cpe_max)
+    )
+    good_data = bool(
+        read is not None
+        and read >= good_read_min
+        and interaction is not None
+        and interaction >= good_interaction_min
+        and (cpe is None or cpe <= good_cpe_max)
+    )
+    if risk_result["hard"]:
+        status = "Pass"
+        confidence = 0.88
+    elif missing_cooperation_note_data:
+        status = "待人工确认" if target_ratio is None or content_profile.get("note_sample_count", 0) < minimum_sample else "备选"
+        confidence = 0.58
+        risk_result["missing"] = list(dict.fromkeys([*risk_result.get("missing", []), "合作笔记核心数据"]))
+    elif evidence_missing:
+        status = "待人工确认"
+        confidence = 0.55
+    elif overseas and target_ratio >= target_required and good_data and stage_derivatives.get("format_budget_fit") != "待核":
+        status = "强推荐" if strong_data and (scene_ratio or 0) >= scene_strong_ratio and not risk_result["warning"] else "推荐"
+        confidence = 0.82 if status == "强推荐" else 0.74
+    elif target_ratio is not None and target_ratio >= target_required and good_data:
+        status = "备选"
+        confidence = 0.66
+    else:
+        status = "不推荐"
+        confidence = 0.74
+    return {
+        **stage1,
+        "project_match_status": status,
+        "project_match_confidence": confidence,
+        "final_recommend_level": status,
+        "recommended_format": _recommended_format_from_budget(stage_derivatives, policy),
+        "risk_control_result": risk_result,
+        **content_profile,
+    }
+
+
+def _creator_stage_derivatives(creator: dict[str, Any], project_id: str | None = None) -> dict[str, Any]:
+    cache_key = str(project_id or "")
+    cache = creator.get("_stage_derivatives_cache")
+    if isinstance(cache, dict) and cache_key in cache:
+        return dict(cache[cache_key])
+    policy = _project_format_budget_policy(project_id)
+    hard_rules = _project_hard_rules_config(project_id)
+    image_status, video_status, budget_fit = _format_budget_fit(creator, policy)
+    premium_exception = _premium_exception_profile(creator, policy) if policy else {"passed": False, "reason": ""}
+    note_counts = _note_format_counts(creator)
+    commercial_signal = _commercial_order_signal(creator)
+    recent_status = _recent_update_status(creator, hard_rules.get("recent_update_days"))
+    low_like_risk = _low_like_risk(
+        creator,
+        hard_rules.get("low_like_threshold"),
+        hard_rules.get("ignore_low_like_if_same_day") is not False,
+    )
+    reply = ratio(creator.get("reply_rate_48h"))
+    reply_min = ratio(hard_rules.get("reply_rate_min"))
+    pass_reasons: list[str] = []
+    detail_reasons: list[str] = []
+    if reply_min is not None and reply is not None and reply < reply_min:
+        pass_reasons.append(f"48h回复率{reply:.0%}低于{reply_min:.0%}")
+    if budget_fit == "均超预算" and not premium_exception.get("passed"):
+        pass_reasons.append("图文/视频报价均超预算")
+    elif budget_fit == "均超预算" and premium_exception.get("passed"):
+        detail_reasons.append(f"高性价比溢价例外：{premium_exception.get('reason')}")
+    if _creator_no_order_permission_signal(creator, _creator_raw_payload(creator)):
+        pass_reasons.append("无接单权限")
+    if recent_status == "疑似断更":
+        pass_reasons.append("近期未更新")
+    if low_like_risk == "低赞风险":
+        pass_reasons.append("近期笔记存在低赞风险")
+    if hard_rules.get("must_have_commercial_order") and commercial_signal == "待补":
+        detail_reasons.append("需补商单证据")
+    if note_counts["dominant"] == "待补":
+        detail_reasons.append("需补近期笔记形态")
+    if budget_fit == "待核":
+        detail_reasons.append("需补报价/合作形态")
+    if recent_status == "待补":
+        detail_reasons.append("需补近期更新")
+    if low_like_risk == "待补":
+        detail_reasons.append("需补近期点赞数据")
+    if pass_reasons:
+        stage_status = "一阶段Pass"
+    elif detail_reasons:
+        stage_status = "优先补全"
+    else:
+        stage_status = "可补全"
+    result = {
+        "image_quote_status": image_status,
+        "video_quote_status": video_status,
+        "format_budget_fit": budget_fit,
+        "premium_exception_passed": bool(premium_exception.get("passed")),
+        "premium_exception_reason": premium_exception.get("reason") or "",
+        "dominant_note_format": note_counts["dominant"],
+        "note_format_counts": json.dumps(note_counts, ensure_ascii=False),
+        "commercial_order_signal": commercial_signal,
+        "recent_update_status": recent_status,
+        "low_like_risk": low_like_risk,
+        "stage_one_status": stage_status,
+        "detail_need_reason": "；".join([*pass_reasons, *detail_reasons]),
+    }
+    if not isinstance(cache, dict):
+        cache = {}
+        creator["_stage_derivatives_cache"] = cache
+    cache[cache_key] = dict(result)
+    return result
 
 
 def _project_hard_filter_issues(project_id: str, creator: dict[str, Any]) -> list[str]:
@@ -5196,6 +6579,14 @@ def _project_hard_filter_issues(project_id: str, creator: dict[str, Any]) -> lis
     if any(hint in permission_compact for hint in ["无接单权限", "暂无接单权限", "不可接单", "不能接单", "暂不接单", "未开通接单"]):
         issues.append("接单权限：蒲公英显示无接单权限，无法发起合作")
         issues = list(dict.fromkeys(issues))
+    stage_derivatives = _creator_stage_derivatives(creator, project_id)
+    hard_rules_config = _project_hard_rules_config(project_id)
+    if stage_derivatives.get("format_budget_fit") == "均超预算" and not stage_derivatives.get("premium_exception_passed"):
+        issues.append("形态预算：图文/视频报价均超过项目预算")
+    reply_min = ratio(hard_rules_config.get("reply_rate_min"))
+    reply = ratio(creator.get("reply_rate_48h"))
+    if reply_min is not None and reply is not None and reply < reply_min:
+        issues.append(f"48h回复率：{reply:.0%}低于项目下限{reply_min:.0%}")
     screening_plan = _project_screening_plan(project_id)
     scoring_criteria = screening_plan.get("scoringCriteria") if isinstance(screening_plan.get("scoringCriteria"), dict) else {}
     hard_filters = (
@@ -5313,15 +6704,22 @@ def _project_blogger_category_match(text_blob: str, item: dict[str, Any]) -> boo
     return any(keyword.lower() in lowered for keyword in _project_blogger_category_match_terms(item))
 
 
-def generate_test_stage_score(project_id: str, creator: dict[str, Any]) -> tuple[dict[str, Any], str]:
+def generate_test_stage_score(
+    project_id: str,
+    creator: dict[str, Any],
+    *,
+    check_hard_issues: bool = True,
+) -> tuple[dict[str, Any], str]:
     score = score_values(creator, project_id=project_id)
-    issues = _project_hard_filter_issues(project_id, creator)
+    issues = _project_hard_filter_issues(project_id, creator) if check_hard_issues else []
     if issues:
         score["hard_filter_passed"] = 0
         score["initial_tier"] = _initial_tier(score["total_score"], True)
         score["detail_collection_priority"] = _detail_collection_priority(score["total_score"], score.get("bonus_score", 0), False)
         score["recommend_level"] = _recommend_level(score["total_score"], False)
         score["score_reason"] = "；".join([*issues, score["score_reason"]])
+    if _is_koc_project(project_id) and score.get("final_recommend_level"):
+        score["recommend_level"] = score.get("final_recommend_level")
     score["score_reason"] = f"【通用初筛】{score['score_reason']}"
     return score, "generated"
 
@@ -5473,6 +6871,16 @@ def _normalize_llm_score(
         total = _apply_project_fit_gate(total, creator, _project_fit_config(project_id), gate_reasons)
         total = _apply_quality_gate(total, data_profile, gate_reasons, creator, direction_profile, project_id)
         total = _apply_project_special_scoring(total, creator, data_profile, efficiency_profile, direction_profile, gate_reasons, project_id, hard_pass_bool)
+        stage_derivatives = _creator_stage_derivatives(creator, project_id)
+        if stage_derivatives.get("format_budget_fit") == "均超预算" and not stage_derivatives.get("premium_exception_passed"):
+            total = min(total, 69.0)
+            hard_pass_bool = False
+            gate_reasons.append("形态预算：图文/视频报价均超过项目预算，初评最高C档")
+        elif stage_derivatives.get("premium_exception_passed"):
+            hard_pass_bool = True
+            gate_reasons.append(f"预算溢价例外：{stage_derivatives.get('premium_exception_reason')}，进入补详情复核")
+        elif stage_derivatives.get("format_budget_fit") in {"仅图文可投", "仅视频可投"}:
+            gate_reasons.append(f"形态预算：{stage_derivatives.get('format_budget_fit')}，推荐形态需受限")
         if gate_reasons:
             reasons = "；".join([str(reasons).strip(), *gate_reasons])
         initial_tier = _initial_tier(total, hard_pass_bool)
@@ -5481,17 +6889,80 @@ def _normalize_llm_score(
             initial_tier = _initial_tier(total, hard_pass_bool)
             detail_priority = _detail_collection_priority(total, bonus_score, hard_pass_bool)
         low_reply_reasons: list[str] = []
-        total, low_reply_gate_applied = _apply_low_reply_rate_gate(total, creator, low_reply_reasons)
+        total, low_reply_gate_applied = _apply_low_reply_rate_gate(
+            total,
+            creator,
+            low_reply_reasons,
+            ratio(_project_hard_rules_config(project_id).get("reply_rate_min")),
+        )
         if low_reply_reasons:
             reasons = "；".join([str(reasons).strip(), *low_reply_reasons])
         if low_reply_gate_applied:
+            hard_pass_bool = False
             initial_tier = _initial_tier(total, hard_pass_bool)
             detail_priority = _detail_collection_priority(total, bonus_score, hard_pass_bool)
         recommend_level = _recommend_level(total, hard_pass_bool)
     cooperation_direction = _extract_cooperation_direction(result, creator or {}, str(recommend_level))
     manual_review_items = _normalize_structured_list(result.get("manualReviewItems") or result.get("manual_review_items") or [])
     evidence_quotes = _normalize_structured_list(result.get("evidenceQuotes") or result.get("evidence_quotes") or [], limit=5)
+    project_match_status = str(result.get("projectMatchStatus") or result.get("project_match_status") or "").strip()
+    format_budget_status = str(result.get("formatBudgetStatus") or result.get("format_budget_status") or "").strip()
+    recommended_format = str(result.get("recommendedFormat") or result.get("recommended_format") or "").strip()
+    implantability = str(result.get("implantability") or "").strip()
+    hard_rule_results = _normalize_structured_list(result.get("hardRuleResults") or result.get("hard_rule_results") or [], limit=8)
+    stage_summary = []
+    if project_match_status:
+        stage_summary.append(f"二阶段审号：{project_match_status}")
+    if recommended_format or format_budget_status:
+        stage_summary.append(f"推荐形态：{recommended_format or '待补'}，{format_budget_status or '待核'}")
+    if implantability:
+        stage_summary.append(f"植入空间：{implantability}")
+    if hard_rule_results:
+        stage_summary.append(f"硬性条件：{'；'.join(hard_rule_results[:3])}")
+    if stage_summary:
+        reasons = "；".join([str(reasons).strip(), *stage_summary])
     llm_confidence = parse_number(result.get("confidence") or result.get("llmConfidence") or result.get("llm_confidence"))
+    koc_profile: dict[str, Any] = {}
+    if creator and _is_koc_project(project_id):
+        data_profile = _recent_note_data_profile(creator)
+        efficiency_profile = _efficiency_profile(
+            creator,
+            data_profile.get("benchmark") or {},
+            data_profile.get("median_read") or data_profile.get("avg_read"),
+        )
+        stage_derivatives = _creator_stage_derivatives(creator, project_id)
+        koc_profile = _koc_final_profile(creator, project_id, stage_derivatives, data_profile, efficiency_profile)
+        status = str(
+            result.get("projectMatchStatus")
+            or result.get("project_match_status")
+            or koc_profile.get("project_match_status")
+            or ""
+        ).strip()
+        if status in {"Pass", "不推荐"}:
+            hard_pass_bool = False
+            total = min(total, 69.0 if status == "Pass" else 74.0)
+        elif status == "待人工确认":
+            total = min(total, 84.0)
+        elif status == "备选":
+            total = min(total, 79.0)
+        elif status == "推荐":
+            total = max(total, 80.0)
+        elif status == "强推荐":
+            total = max(total, 90.0)
+        initial_tier = _initial_tier(total, hard_pass_bool)
+        detail_priority = _detail_collection_priority(total, bonus_score, hard_pass_bool)
+        if status == "待人工确认":
+            detail_priority = min_priority_label(detail_priority, "中优先级")
+        elif status == "备选":
+            detail_priority = min_priority_label(detail_priority, "中高优先级")
+        recommend_level = status or recommend_level
+        koc_summary = []
+        if koc_profile.get("stage1_priority"):
+            koc_summary.append(f"KOC一阶段：{koc_profile.get('stage1_priority')}，{koc_profile.get('stage1_reason')}")
+        if koc_profile.get("project_match_status"):
+            koc_summary.append(f"KOC二阶段：{koc_profile.get('project_match_status')}")
+        if koc_summary:
+            reasons = "；".join([str(reasons).strip(), *koc_summary])
     return {
         "total_score": round(total, 2),
         "rule_group_score": fallback.get("rule_group_score") or fallback.get("base_score") or round(total, 2),
@@ -5510,6 +6981,19 @@ def _normalize_llm_score(
         "llm_confidence": llm_confidence,
         "llm_prompt_version": str(result.get("promptVersion") or result.get("prompt_version") or ""),
         "llm_schema_version": str(result.get("schemaVersion") or result.get("schema_version") or ""),
+        "stage1_priority": str(result.get("stage1Priority") or result.get("stage1_priority") or koc_profile.get("stage1_priority") or ""),
+        "stage1_reason": str(result.get("stage1Reason") or result.get("stage1_reason") or koc_profile.get("stage1_reason") or ""),
+        "project_match_status": str(result.get("projectMatchStatus") or result.get("project_match_status") or koc_profile.get("project_match_status") or ""),
+        "project_match_confidence": parse_number(result.get("projectMatchConfidence") or result.get("project_match_confidence")) or koc_profile.get("project_match_confidence"),
+        "final_recommend_level": str(result.get("finalRecommendLevel") or result.get("final_recommend_level") or koc_profile.get("final_recommend_level") or recommend_level),
+        "target_content_ratio": parse_number(result.get("studyContentRatioEstimate") or result.get("target_content_ratio")) if (result.get("studyContentRatioEstimate") or result.get("target_content_ratio")) not in (None, "", "待补") else koc_profile.get("target_content_ratio"),
+        "target_content_evidence": koc_profile.get("target_content_evidence") or [],
+        "product_scene_ratio": koc_profile.get("product_scene_ratio"),
+        "product_scene_evidence": koc_profile.get("product_scene_evidence") or [],
+        "conflict_content_ratio": koc_profile.get("conflict_content_ratio"),
+        "conflict_content_categories": koc_profile.get("conflict_content_categories") or [],
+        "risk_control_result": koc_profile.get("risk_control_result") or {},
+        "recommended_format": str(result.get("recommendedFormat") or result.get("recommended_format") or koc_profile.get("recommended_format") or ""),
     }
 
 
@@ -5519,7 +7003,8 @@ LLM_SCORE_MAX_WORKERS = max(1, _int_env("LLM_SCORE_MAX_WORKERS", 50))
 LLM_SCORE_RETRY_ATTEMPTS = max(1, _int_env("LLM_SCORE_RETRY_ATTEMPTS", 2))
 
 
-def _creator_score_payload(creator: dict[str, Any]) -> dict[str, Any]:
+def _creator_score_payload(creator: dict[str, Any], project_id: str | None = None) -> dict[str, Any]:
+    stage_derivatives = _creator_stage_derivatives(creator, project_id)
     return {
         "creator_id": creator.get("creator_id"),
         "nickname": creator.get("nickname"),
@@ -5531,6 +7016,19 @@ def _creator_score_payload(creator: dict[str, Any]) -> dict[str, Any]:
         "child_age": creator.get("child_age"),
         "followers_count": creator.get("followers_count"),
         "quote_price": creator.get("quote_price"),
+        "video_quote_price": creator.get("video_quote_price"),
+        "stage_derivatives": stage_derivatives,
+        "image_quote_status": stage_derivatives.get("image_quote_status"),
+        "video_quote_status": stage_derivatives.get("video_quote_status"),
+        "format_budget_fit": stage_derivatives.get("format_budget_fit"),
+        "premium_exception_passed": stage_derivatives.get("premium_exception_passed"),
+        "premium_exception_reason": stage_derivatives.get("premium_exception_reason"),
+        "dominant_note_format": stage_derivatives.get("dominant_note_format"),
+        "commercial_order_signal": stage_derivatives.get("commercial_order_signal"),
+        "recent_update_status": stage_derivatives.get("recent_update_status"),
+        "low_like_risk": stage_derivatives.get("low_like_risk"),
+        "stage_one_status": stage_derivatives.get("stage_one_status"),
+        "detail_need_reason": stage_derivatives.get("detail_need_reason"),
         "effective_cpc": creator.get("effective_cpc"),
         "effective_cpc_source": creator.get("effective_cpc_source"),
         "effective_cpe": creator.get("effective_cpe"),
@@ -5587,6 +7085,8 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
         screening_plan = {}
     scoring_criteria = screening_plan.get("scoringCriteria") if isinstance(screening_plan.get("scoringCriteria"), dict) else {}
     budget_policy = screening_plan.get("budgetPolicy") or scoring_criteria.get("budget_policy") or {}
+    format_budget_policy = screening_plan.get("formatBudgetPolicy") or scoring_criteria.get("format_budget_policy") or {}
+    hard_rules = screening_plan.get("hardRules") or scoring_criteria.get("project_hard_rules") or {}
     data_layer = screening_plan.get("dataLayerScoring") or scoring_criteria.get("data_layer_scoring") or {}
     tier_policy = screening_plan.get("tierPolicy") or scoring_criteria.get("tier_policy") or {}
     return {
@@ -5598,6 +7098,8 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
             "projectFitConfig": screening_plan.get("projectFitConfig") if isinstance(screening_plan.get("projectFitConfig"), dict) else {},
             "promotionStrategy": screening_plan.get("promotionStrategy") if isinstance(screening_plan.get("promotionStrategy"), dict) else {},
             "budgetPolicy": budget_policy,
+            "formatBudgetPolicy": format_budget_policy if isinstance(format_budget_policy, dict) else {},
+            "hardRules": hard_rules if isinstance(hard_rules, dict) else {},
             "scoringCriteria": scoring_criteria,
             "dataLayerScoring": data_layer,
             "tierPolicy": tier_policy,
@@ -5611,6 +7113,8 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
                 "model_role": "辅助解释和有限加减权，不替代规则事实层",
             },
             "scoringProtocol": [
+                "仅当 projectFitConfig.is_koc_project=true、项目配置显式选择KOC，或Brief明确提到KOC时，才启用KOC通用评分结构；不得因为预算低于2000元自动套用KOC结构。",
+                "KOC项目分两阶段：一阶段只判断入库/补详情优先级，不直接给强推荐；二阶段必须结合主页、简介、近期笔记标题/正文、数据和风险控制后输出最终推荐。",
                 "初评分只使用稳定入库字段，主公式抓5类：目标人群匹配、阅读/互动中位数、报价与阅读/互动单价、内容方向/卖点承接、执行确定性。",
                 "粉丝量只作为T级比较坐标，不作为高权重加分项；阅读/互动必须按同T级基准判断。",
                 "报价不是越低越好，必须结合报价能换来的阅读/互动总量、CPM/CPC/CPE效率、单达人参考预算和硬上限判断。",
@@ -5620,6 +7124,10 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
                 "搜索+推荐占比属于人工复核事实字段，未复核前不得自动加分、扣分或淘汰。",
                 "封顶规则必须来自当前 Brief 的明确硬性条件和 scoringCriteria；不得把某个历史项目的人群阈值套到所有项目。",
                 "必须结合 promotionStrategy 和 projectFitConfig 判断产品场景、目标用户/决策者、核心卖点、内容调性和转化场景；证据不足时输出 insufficient_evidence 含义的结论，不要硬猜。",
+                "必须读取 formatBudgetPolicy：图文报价用 quote_price，视频报价用 video_quote_price；推荐视频时必须校验视频预算，视频超预算但图文预算内只能推荐图文。",
+                "若 formatBudgetPolicy.premium_exception_policy 启用，数据达到同量级前5%且报价不超过预算1.5倍的高性价比达人，不因超预算直接Pass，应进入补详情/人工复核。",
+                "必须读取 hardRules：回复率、是否接过商单、近期更新、低赞风险、身份/内容占比要求都只能基于已采集或补全后的证据判断；缺字段输出待补/低置信，不要硬猜。",
+                "近期合作笔记形态要结合 note_type、noteType、isVideo、视频笔记/图文笔记文本和 stage_derivatives.dominant_note_format 判断。",
             ],
             "collectionSchemeSummary": [
                 {
@@ -5631,11 +7139,13 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
                 if isinstance(scheme, dict)
             ],
         },
-        "creators": [_creator_score_payload(creator) for creator in creators],
+        "creators": [_creator_score_payload(creator, project_id) for creator in creators],
         "requiredSchema": {
             "results": [
                 {
                     "creator_id": "必须原样返回",
+                    "stage1Priority": "仅KOC项目需要：P0|P1|P2|P3|不入库；一阶段入库/补详情优先级，不等于最终推荐。",
+                    "stage1Reason": "仅KOC项目需要：用预算、阅读、互动、CPE、身份弱证据说明一阶段判断。",
                     "dataLayer": "S|A|B|C；基于目标人群匹配、阅读/互动中位数、报价与CPC/CPE、T级基准得到的数据层级",
                     "baseScore": "0-100 初筛基础分；只使用稳定入库字段，优先目标人群、流量、成本效率、内容方向/卖点承接、执行确定性",
                     "bonusScore": "0-5 微加分；只奖励人群画像、数据表现、成本效率和方向匹配同时成立，不因低价或标签单独加高分",
@@ -5643,6 +7153,15 @@ def _score_batch_payload(project_id: str, creators: list[dict[str, Any]]) -> dic
                     "informationCompleteness": "0-1，当前可用证据完整度；低完整度只影响置信度和后续详情完善优先级，不等于达人质量差",
                     "initialTier": "S|A|B+|B|C；S=95-100证据充分标杆，A=80-94初筛高潜，B+=75-79次高潜，B=70-74备选观察，C<70低优先级；硬性不符也必须保留分数档位，不要输出Pass",
                     "detailCollectionPriority": "最高优先级|高优先级|中高优先级|中优先级|低优先级|数据暂缓；只让数据层级高或高潜达人进入详情页完善内容/人设信息，硬性不符用数据暂缓",
+                    "projectMatchStatus": "强推荐|推荐|备选|待人工确认|不推荐|Pass；二阶段审号结论。KOC项目证据不足时输出待人工确认或备选，不得仅凭总分强推荐",
+                    "projectMatchConfidence": "0-1，项目匹配置信度；KOC项目缺主页/笔记正文/身份证据时低于0.7",
+                    "finalRecommendLevel": "强推荐|推荐|备选|待人工确认|不推荐|Pass；最终对项目可执行推荐结论",
+                    "hardRuleResults": [{"rule": "项目硬性条件", "status": "通过|不通过|待补", "evidence": "依据字段/标题/主页/详情证据"}],
+                    "studyContentRatioEstimate": "0-1或待补；按项目目标内容占比要求估算，例如学习类内容50%以上",
+                    "dominantNoteFormat": "图文为主|视频为主|混合|待补",
+                    "recommendedFormat": "图文|视频|均可|不推荐|待补",
+                    "formatBudgetStatus": "推荐形态预算匹配|仅图文可投|仅视频可投|均超预算|待核",
+                    "implantability": "高|中|低|待补；是否有自然植入空间，必须引用内容/人设/近期笔记证据",
                     "dimensionScores": {
                         "budget": "0-100 执行确定性：蒲公英链接、报价完整、48h回复率、基础身份完整度",
                         "fans": "0-100 目标人群匹配：结合 promotionStrategy 判断使用者/决策者/受众是否匹配；粉丝量只作T级坐标",
@@ -5707,7 +7226,8 @@ def score_values_batch_with_llm(project_id: str, creators: list[dict[str, Any]])
         [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"请只输出符合 requiredSchema 的 JSON，results 数量必须等于 creators 数量：\n{json.dumps(user_payload, ensure_ascii=False)}"},
-        ]
+        ],
+        config={"model_role": "secondary"},
     )
     raw_results = result.get("results") or result.get("creators") or result.get("scores") or []
     if isinstance(raw_results, dict):
@@ -5786,14 +7306,29 @@ def _persist_creator_score(
     llm_confidence = parse_number(score.get("llm_confidence") or score.get("llmConfidence"))
     llm_prompt_version = str(score.get("llm_prompt_version") or score.get("promptVersion") or "")
     llm_schema_version = str(score.get("llm_schema_version") or score.get("schemaVersion") or "")
+    target_content_evidence = score.get("target_content_evidence")
+    product_scene_evidence = score.get("product_scene_evidence")
+    conflict_content_categories = score.get("conflict_content_categories")
+    risk_control_result = score.get("risk_control_result")
+    if not isinstance(target_content_evidence, list):
+        target_content_evidence = _normalize_structured_list(target_content_evidence or [])
+    if not isinstance(product_scene_evidence, list):
+        product_scene_evidence = _normalize_structured_list(product_scene_evidence or [])
+    if not isinstance(conflict_content_categories, list):
+        conflict_content_categories = _normalize_structured_list(conflict_content_categories or [])
+    if not isinstance(risk_control_result, dict):
+        risk_control_result = {}
     def write(handle: sqlite3.Connection) -> None:
         handle.execute(
             """
             INSERT INTO creator_scores(creator_id, total_score, rule_group_score, base_score, bonus_score, information_completeness,
             initial_tier, detail_collection_priority, budget_score, fans_score, cpe_score, traffic_score,
             persona_score, content_score, hard_filter_passed, recommend_level, score_reason, cooperation_direction,
+            stage1_priority, stage1_reason, project_match_status, project_match_confidence, final_recommend_level,
+            target_content_ratio, target_content_evidence, product_scene_ratio, product_scene_evidence,
+            conflict_content_ratio, conflict_content_categories, risk_control_result, recommended_format,
             hard_defects, warning_defects, manual_review_items, evidence_quotes, llm_confidence, llm_prompt_version, llm_schema_version, scored_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(creator_id) DO UPDATE SET total_score=excluded.total_score,
             rule_group_score=excluded.rule_group_score,
             base_score=excluded.base_score, bonus_score=excluded.bonus_score,
@@ -5804,6 +7339,13 @@ def _persist_creator_score(
             persona_score=excluded.persona_score, content_score=excluded.content_score,
             hard_filter_passed=excluded.hard_filter_passed, recommend_level=excluded.recommend_level,
             score_reason=excluded.score_reason, cooperation_direction=excluded.cooperation_direction,
+            stage1_priority=excluded.stage1_priority, stage1_reason=excluded.stage1_reason,
+            project_match_status=excluded.project_match_status, project_match_confidence=excluded.project_match_confidence,
+            final_recommend_level=excluded.final_recommend_level,
+            target_content_ratio=excluded.target_content_ratio, target_content_evidence=excluded.target_content_evidence,
+            product_scene_ratio=excluded.product_scene_ratio, product_scene_evidence=excluded.product_scene_evidence,
+            conflict_content_ratio=excluded.conflict_content_ratio, conflict_content_categories=excluded.conflict_content_categories,
+            risk_control_result=excluded.risk_control_result, recommended_format=excluded.recommended_format,
             hard_defects=excluded.hard_defects, warning_defects=excluded.warning_defects,
             manual_review_items=excluded.manual_review_items, evidence_quotes=excluded.evidence_quotes,
             llm_confidence=excluded.llm_confidence, llm_prompt_version=excluded.llm_prompt_version,
@@ -5828,6 +7370,19 @@ def _persist_creator_score(
                 score["recommend_level"],
                 score["score_reason"],
                 cooperation_direction,
+                score.get("stage1_priority") or "",
+                score.get("stage1_reason") or "",
+                score.get("project_match_status") or "",
+                parse_number(score.get("project_match_confidence")),
+                score.get("final_recommend_level") or score.get("recommend_level") or "",
+                parse_number(score.get("target_content_ratio")),
+                json.dumps(target_content_evidence, ensure_ascii=False),
+                parse_number(score.get("product_scene_ratio")),
+                json.dumps(product_scene_evidence, ensure_ascii=False),
+                parse_number(score.get("conflict_content_ratio")),
+                json.dumps(conflict_content_categories, ensure_ascii=False),
+                json.dumps(risk_control_result, ensure_ascii=False),
+                score.get("recommended_format") or "",
                 json.dumps(hard_defects, ensure_ascii=False),
                 json.dumps(warning_defects, ensure_ascii=False),
                 json.dumps(manual_review_items, ensure_ascii=False),
@@ -5886,7 +7441,7 @@ def _persist_creator_score(
     if fetch_scored:
         scored = get_creator(project_id, creator_id) or {}
     else:
-        scored = dict(creator)
+        scored = {**dict(creator), **score, "cooperation_direction": cooperation_direction}
     scored["score_source"] = source
     scored["batch_id"] = batch_id
     scored["total_score"] = score.get("total_score")
@@ -5916,38 +7471,43 @@ def _persist_creator_scores_bulk(
 def score_creator(
     project_id: str,
     creator_id: str,
-    use_llm: bool = True,
+    use_llm: bool = False,
     batch_id: str | None = None,
     trigger_source: str = "single",
     fallback_on_llm_error: bool = True,
 ) -> dict[str, Any]:
-    creator = get_creator(project_id, creator_id)
+    creator = _get_creator_for_scoring(project_id, creator_id)
     if not creator:
         raise KeyError(creator_id)
     source = "generated"
     with _scoring_batch_context():
         try:
-            score, source = score_values_with_llm(project_id, creator) if use_llm else (generate_test_stage_score(project_id, creator)[0], "rule")
+            score, source = score_values_with_llm(project_id, creator) if use_llm else (generate_test_stage_score(project_id, creator, check_hard_issues=False)[0], "rule")
         except Exception:
             if use_llm and not fallback_on_llm_error:
                 raise
-            score, source = generate_test_stage_score(project_id, creator)
+            score, source = generate_test_stage_score(project_id, creator, check_hard_issues=False)
         _attach_system_defects(project_id, [(creator, score, source)])
-    return _persist_creator_score(project_id, creator, score, source, batch_id or str(uuid.uuid4()), trigger_source)
+    return _persist_creator_score(
+        project_id,
+        creator,
+        score,
+        source,
+        batch_id or str(uuid.uuid4()),
+        trigger_source,
+        fetch_scored=False,
+    )
 
 
 def score_project(
     project_id: str,
-    use_llm: bool = True,
+    use_llm: bool = False,
     creator_ids: list[str] | None = None,
     trigger_source: str = "manual",
     fallback_on_llm_error: bool = True,
 ) -> dict[str, Any]:
     wanted_ids = list(dict.fromkeys(str(creator_id) for creator_id in (creator_ids or []) if str(creator_id or "").strip()))
-    creators = list_creators(project_id, creator_ids=wanted_ids or None)
-    if wanted_ids:
-        order = {creator_id: index for index, creator_id in enumerate(wanted_ids)}
-        creators.sort(key=lambda item: order.get(str(item.get("creator_id")), len(order)))
+    creators = _list_creators_for_scoring(project_id, wanted_ids or None)
     batch_id = str(uuid.uuid4())
     sources = {"llm": 0, "generated": 0, "rule": 0}
     llm_errors: list[str] = []
@@ -5995,10 +7555,10 @@ def score_project(
                     else:
                         error = chunk_result.get("error")
                         llm_errors.append(str(error)[:300])
-                        scored_items = [(creator, *generate_test_stage_score(project_id, creator)) for creator in chunk]
+                        scored_items = [(creator, *generate_test_stage_score(project_id, creator, check_hard_issues=False)) for creator in chunk]
                         persist_scored_items(conn, scored_items)
             else:
-                scored_items = [(creator, generate_test_stage_score(project_id, creator)[0], "rule") for creator in creators]
+                scored_items = [(creator, generate_test_stage_score(project_id, creator, check_hard_issues=False)[0], "rule") for creator in creators]
                 persist_scored_items(conn, scored_items)
 
     _run_sqlite_locked_retry(write_scores)
@@ -7018,10 +8578,14 @@ def _enrich_feishu_row(row: dict[str, Any], c: dict[str, Any], sequence: int | N
             "孩子性别": _infer_child_gender(c),
             "图文报备价": image_quote,
             "图文报备裸价": image_quote,
+            "图文报价": image_quote,
+            "图文笔记一口价": image_quote,
             "平台报价": image_quote,
             "报价": image_quote,
             "视频报备价": video_quote,
             "视频报备裸价": video_quote,
+            "视频报价": video_quote,
+            "视频笔记一口价": video_quote,
             "图文执行价\n（含平台服务费）": _price_with_service(image_quote),
             "图文执行价（含平台服务费）": _price_with_service(image_quote),
             "视频执行价\n（含平台服务费）": _price_with_service(video_quote),
@@ -7197,7 +8761,11 @@ def quality_feishu_rows(
                 "详情完善优先级": c.get("detail_collection_priority") or "",
                 "合作方向": c.get("cooperation_direction") or c.get("portfolio_role") or "",
                 "平台报价": c.get("quote_price") or "",
-                "合作价格（含服务费）": c.get("quote_price") or "",
+                "图文报价": c.get("quote_price") or "",
+                "图文笔记一口价": c.get("quote_price") or "",
+                "视频报价": c.get("video_quote_price") or "",
+                "视频笔记一口价": c.get("video_quote_price") or "",
+                "合作价格（含服务费）": _price_with_service(c.get("quote_price")) or c.get("quote_price") or "",
                 "合作形式": "合作笔记",
                 "品牌反馈": "优质候选",
                 "品牌备注": f"评分 {c.get('total_score')}，{c.get('recommend_level')}",
